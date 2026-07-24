@@ -58,10 +58,11 @@ complete OpenPlugin repositories into supported coding agents. Its published
 targets include Claude Code, Cursor, OpenAI Codex, Grok Build, Kimi Code,
 GitHub Copilot CLI, and Visual Studio Code.
 
-Install this repository:
+Install into all supported agents detected on the machine:
 
 ```bash
-npx plugins add LeonardSEO/power-platform-skills-codex
+DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 \
+  npx plugins add LeonardSEO/power-platform-skills-codex
 ```
 
 Install into Codex only:
@@ -73,13 +74,6 @@ DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 \
 
 This repository has been tested with `npx plugins discover`: all seven plugins
 are detected, including their skills, agents, hooks, and MCP configurations.
-
-Install the local repository into Codex:
-
-```bash
-DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 \
-  npx plugins add /absolute/path/to/power-platform-skills-codex --target codex
-```
 
 Inspect the repository without installing anything:
 
@@ -99,39 +93,6 @@ npx plugins add LeonardSEO/power-platform-skills-codex --target codex
 `DISABLE_TELEMETRY` and `DO_NOT_TRACK` disable the installer's anonymous usage
 telemetry. They are separate from the plugin-level telemetry hard-off described
 below.
-
-## Native Codex marketplace installation
-
-Clone or download this repository, then register its marketplace:
-
-```bash
-codex plugin marketplace add /absolute/path/to/power-platform-skills-codex
-codex plugin list
-```
-
-After publishing to GitHub, Codex can also register the Git repository directly:
-
-```bash
-codex plugin marketplace add LeonardSEO/power-platform-skills-codex --ref main
-```
-
-For Azure DevOps or another Git host, pass its HTTPS or SSH Git URL:
-
-```bash
-codex plugin marketplace add https://dev.azure.com/ORG/PROJECT/_git/power-platform-skills-codex --ref main
-```
-
-Install only the plugins you need:
-
-```bash
-codex plugin add power-automate@power-platform-skills-codex
-codex plugin add power-pages@power-platform-skills-codex
-codex plugin add model-apps@power-platform-skills-codex
-codex plugin add mcp-apps@power-platform-skills-codex
-codex plugin add canvas-apps@power-platform-skills-codex
-codex plugin add code-apps-preview@power-platform-skills-codex
-codex plugin add mobile-app@power-platform-skills-codex
-```
 
 Start a new Codex thread after installation so the new skills and MCP tools are
 loaded.
@@ -208,30 +169,6 @@ power-platform-skills-codex/
 ├── azure-pipelines.yml
 └── package.json
 ```
-
-## Publish later
-
-The folder is already initialized as a Git repository on branch `main`.
-
-GitHub:
-
-```bash
-git add .
-git commit -m "Initial Codex Power Platform marketplace"
-git remote add origin git@github.com:LeonardSEO/power-platform-skills-codex.git
-git push -u origin main
-```
-
-Azure DevOps:
-
-```bash
-git add .
-git commit -m "Initial Codex Power Platform marketplace"
-git remote add origin https://dev.azure.com/ORG/PROJECT/_git/power-platform-skills-codex
-git push -u origin main
-```
-
-Replace `ORG` and `PROJECT` before using the Azure DevOps example.
 
 ## Updating from Microsoft upstream
 
