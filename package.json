@@ -1,0 +1,20 @@
+{
+  "name": "power-platform-skills-codex",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Unofficial Codex adaptation of Microsoft Power Platform Skills.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LeonardSEO/power-platform-skills-codex.git"
+  },
+  "homepage": "https://github.com/LeonardSEO/power-platform-skills-codex#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "sync:upstream": "bash scripts/sync-upstream.sh",
+    "validate": "node scripts/validate-repository.mjs",
+    "test": "npm run validate"
+  }
+}

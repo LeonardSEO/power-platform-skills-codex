@@ -1,0 +1,16 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+node_modules/
+coverage/
+dist/
+*.log
+*.tmp
+*.zip
+.cache/
+.upstream-source/
+.power-platform-skills/
+authProfile.json

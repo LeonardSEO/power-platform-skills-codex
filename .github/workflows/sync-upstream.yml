@@ -1,0 +1,114 @@
+name: Sync Microsoft upstream
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-microsoft-power-platform-skills
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      POWER_PLATFORM_SKILLS_IKEY_JSON: ${{ github.workspace }}/config/telemetry-disabled.json
+      POWER_PLATFORM_SKILLS_TELEMETRY_POWER_PAGES_OPTOUT: "1"
+      POWER_PLATFORM_SKILLS_TELEMETRY_MODEL_APPS_OPTOUT: "1"
+      POWER_PLATFORM_SKILLS_TELEMETRY_MCP_APPS_OPTOUT: "1"
+      POWER_PLATFORM_SKILLS_TELEMETRY_CANVAS_APPS_OPTOUT: "1"
+      POWER_PLATFORM_SKILLS_TELEMETRY_CODE_APPS_PREVIEW_OPTOUT: "1"
+      POWER_PLATFORM_SKILLS_TELEMETRY_MOBILE_APP_OPTOUT: "1"
+      POWER_PLATFORM_SKILLS_TELEMETRY_POWER_AUTOMATE_OPTOUT: "1"
+
+    steps:
+      - name: Check out Codex marketplace
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Check out Microsoft upstream
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/power-platform-skills
+          ref: main
+          path: .upstream-source
+          fetch-depth: 1
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Synchronize and validate
+        id: synchronize
+        shell: bash
+        run: |
+          upstream_commit="$(git -C .upstream-source rev-parse HEAD)"
+          echo "upstream_commit=$upstream_commit" >> "$GITHUB_OUTPUT"
+          bash scripts/sync-upstream.sh \
+            "$GITHUB_WORKSPACE/.upstream-source" \
+            "$upstream_commit"
+          rm -rf .upstream-source
+
+      - name: Create or update synchronization pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_COMMIT: ${{ steps.synchronize.outputs.upstream_commit }}
+        shell: bash
+        run: |
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "Already synchronized with $UPSTREAM_COMMIT."
+            exit 0
+          fi
+
+          branch="automation/sync-microsoft-power-platform-skills"
+          short_commit="${UPSTREAM_COMMIT:0:12}"
+          body_file="$RUNNER_TEMP/upstream-sync-pr.md"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add -A
+          git commit -m "chore: sync Microsoft Power Platform Skills ($short_commit)"
+          git push --force origin "$branch"
+
+          {
+            echo "## Microsoft upstream sync"
+            echo
+            echo "Synchronizes this Codex marketplace with:"
+            echo
+            echo "- Repository: \`microsoft/power-platform-skills\`"
+            echo "- Commit: \`$UPSTREAM_COMMIT\`"
+            echo
+            echo "Codex manifests, compatibility fixes, and the telemetry hard-off"
+            echo "were reapplied automatically. \`npm test\` passed before this PR"
+            echo "was created."
+          } > "$body_file"
+
+          existing_pr="$(
+            gh pr list \
+              --head "$branch" \
+              --base main \
+              --state open \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+
+          if [[ -n "$existing_pr" ]]; then
+            gh pr edit "$existing_pr" \
+              --title "chore: sync Microsoft Power Platform Skills" \
+              --body-file "$body_file"
+          else
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "chore: sync Microsoft Power Platform Skills" \
+              --body-file "$body_file"
+          fi

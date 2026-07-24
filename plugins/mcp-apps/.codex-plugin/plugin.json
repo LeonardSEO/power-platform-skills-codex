@@ -1,0 +1,33 @@
+{
+  "name": "mcp-apps",
+  "version": "1.0.0+codex.010dfdd53b99",
+  "description": "Generate interactive HTML widgets for MCP tools using the MCP Apps protocol.",
+  "author": {
+    "name": "LeonardSEO",
+    "url": "https://github.com/LeonardSEO"
+  },
+  "homepage": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "repository": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "license": "MIT",
+  "keywords": [
+    "mcp-apps",
+    "mcp",
+    "widgets",
+    "html",
+    "fluent-ui"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "MCP Apps for Codex",
+    "shortDescription": "Generate interactive widgets for MCP tools.",
+    "longDescription": "Codex adaptation of Microsoft's skills for creating self-contained HTML widgets that visualize and interact with MCP tool results.",
+    "developerName": "LeonardSEO",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
+    "defaultPrompt": "Generate an interactive widget for my MCP tool."
+  }
+}

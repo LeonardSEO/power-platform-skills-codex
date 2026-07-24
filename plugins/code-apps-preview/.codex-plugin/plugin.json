@@ -1,0 +1,34 @@
+{
+  "name": "code-apps-preview",
+  "version": "1.0.0+codex.010dfdd53b99",
+  "description": "Build and deploy Power Apps code apps using React, Vite, and Power Platform connectors.",
+  "author": {
+    "name": "LeonardSEO",
+    "url": "https://github.com/LeonardSEO"
+  },
+  "homepage": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "repository": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "license": "MIT",
+  "keywords": [
+    "power-apps",
+    "code-apps",
+    "react",
+    "vite",
+    "dataverse",
+    "pac-cli"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Code Apps Preview for Codex",
+    "shortDescription": "Build Power Apps code apps with React.",
+    "longDescription": "Codex adaptation of Microsoft's skills for creating and deploying React and Vite Power Apps code apps connected to Power Platform services.",
+    "developerName": "LeonardSEO",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
+    "defaultPrompt": "Build a Power Apps code app."
+  }
+}

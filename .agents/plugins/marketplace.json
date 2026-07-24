@@ -1,0 +1,92 @@
+{
+  "name": "power-platform-skills-codex",
+  "interface": {
+    "displayName": "Power Platform Skills for Codex"
+  },
+  "plugins": [
+    {
+      "name": "power-pages",
+      "source": {
+        "source": "local",
+        "path": "./plugins/power-pages"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "model-apps",
+      "source": {
+        "source": "local",
+        "path": "./plugins/model-apps"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "mcp-apps",
+      "source": {
+        "source": "local",
+        "path": "./plugins/mcp-apps"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "canvas-apps",
+      "source": {
+        "source": "local",
+        "path": "./plugins/canvas-apps"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "code-apps-preview",
+      "source": {
+        "source": "local",
+        "path": "./plugins/code-apps-preview"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "mobile-app",
+      "source": {
+        "source": "local",
+        "path": "./plugins/mobile-app"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "power-automate",
+      "source": {
+        "source": "local",
+        "path": "./plugins/power-automate"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
