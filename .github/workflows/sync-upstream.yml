@@ -57,7 +57,7 @@ jobs:
             "$upstream_commit"
           rm -rf .upstream-source
 
-      - name: Create or update synchronization pull request
+      - name: Create, update, and merge synchronization pull request
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_COMMIT: ${{ steps.synchronize.outputs.upstream_commit }}
@@ -111,4 +111,21 @@ jobs:
               --head "$branch" \
               --title "chore: sync Microsoft Power Platform Skills" \
               --body-file "$body_file"
+            existing_pr="$(
+              gh pr list \
+                --head "$branch" \
+                --base main \
+                --state open \
+                --json number \
+                --jq '.[0].number // empty'
+            )"
           fi
+
+          if [[ -z "$existing_pr" ]]; then
+            echo "Unable to resolve the synchronization pull request."
+            exit 1
+          fi
+
+          gh pr merge "$existing_pr" \
+            --squash \
+            --match-head-commit "$(git rev-parse HEAD)"

@@ -214,23 +214,17 @@ const mobileSampleDataSkill = readFileSync(
 ).replace(/\r?\npps\.\r?\n/, "\n");
 writeFileSync(mobileSampleDataSkillPath, mobileSampleDataSkill, "utf8");
 
-writeJson(
-  join(
-    repositoryRoot,
-    "plugins",
-    "power-pages",
-    "scripts",
-    "lib",
-    "telemetry",
-    "ikey.json",
-  ),
-  {
+const telemetryFiles = walkFiles(join(repositoryRoot, "plugins")).filter(
+  (path) => path.endsWith("/telemetry/ikey.json"),
+);
+for (const telemetryFile of telemetryFiles) {
+  writeJson(telemetryFile, {
     event_stream_name: "Disabled",
     disabled: true,
     default_region: "none",
     regions: {},
-  },
-);
+  });
+}
 
 writeJson(join(repositoryRoot, "config", "plugin-inventory.json"), inventory);
 writeJson(

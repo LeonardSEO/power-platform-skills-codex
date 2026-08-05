@@ -181,7 +181,7 @@ Microsoft changes the source, the workflow:
 - keeps telemetry hard-disabled and strips production telemetry routing;
 - refreshes plugin versions and skill counts;
 - runs the full validation suite;
-- opens or updates a pull request instead of writing directly to `main`.
+- opens or updates a pull request and squash-merges it after validation passes.
 
 The workflow can also be started manually from the GitHub Actions tab. See
 [`UPSTREAM.md`](UPSTREAM.md) for the exact mappings and local sync command.

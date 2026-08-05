@@ -21,10 +21,13 @@ The workflow:
 8. runs `npm test`;
 9. creates or updates
    `automation/sync-microsoft-power-platform-skills` as a pull request against
-   `main`.
+   `main`;
+10. squash-merges that pull request after the synchronization validation has
+    passed.
 
-The Action never commits upstream changes directly to `main`. Review and merge
-the generated pull request after its validation checks pass.
+The Action never pushes upstream changes directly to `main`. The generated pull
+request provides an audit trail and is merged automatically only after the sync
+job has successfully run `npm test`. A failed synchronization remains unmerged.
 
 ## Manual synchronization
 
@@ -51,8 +54,8 @@ The synchronization scripts preserve or regenerate:
 - `globalThis.require=require` in `plugins/power-automate/.mcp.json`;
 - valid YAML frontmatter in
   `plugins/mobile-app/skills/add-sample-data/SKILL.md`;
-- `"disabled": true` and no production routing values in
-  `plugins/power-pages/scripts/lib/telemetry/ikey.json`;
+- `"disabled": true` and no production routing values in every
+  `plugins/**/telemetry/ikey.json` file;
 - `config/plugin-inventory.json`;
 - `.upstream/power-platform-skills.json`;
 - README skill counts.
