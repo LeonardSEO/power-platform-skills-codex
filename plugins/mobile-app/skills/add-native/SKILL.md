@@ -16,7 +16,7 @@ Generate a one-file typed wrapper under `src/native/` for a native device capabi
 
 1. **Never run `npx expo install`, `npm install`, or `yarn add` for a native module.** The set of native modules in `package.json` is fixed by the upstream template. Adding a new one breaks the rewrap pipeline (the customer's binary is built from a pre-built base, not from their `package.json`).
 2. **Never edit `app.config.js`** — plugins, `ios.infoPlist`, `android.permissions`, or anything else. All native config the template ships is intentional and signed off; arbitrary additions cannot be honored at rewrap time.
-3. **Never edit `package.json` `dependencies` for native modules** (anything starting with `expo-`, `react-native-`, or that ships an iOS/Android folder). Generic JS-only libraries (e.g., `date-fns`, `zod`, `@tanstack/react-query`) are not native modules and remain fine to install via `npx expo install <pkg>` from other skills — this rule scopes only to packages with a config plugin or native code.
+3. **Never edit `package.json` `dependencies` for native modules.** Native means the package ships platform source/projects, a podspec, codegen, an Expo module/config plugin, or `react-native.config.js`; a package-name prefix alone is not proof. Pure-JavaScript dependencies are out of scope for `/add-native` and are installed from an approved `JavaScript Dependencies` plan by `/create-mobile-app` or `/edit-app`.
 4. **If the requested module isn't actually present in `package.json` — STOP.** That means the upstream template hasn't shipped it yet; do not work around by installing it.
 
 ## Routing — `/add-native` is the public entry point
@@ -43,8 +43,8 @@ Before adding any native control or wrapper, apply every gate: classify the inte
 
 | User intent | Add/use | Required package or control | Do not use / fallback |
 |---|---|---|---|
-| Form field bound to a Dataverse File column | Host `<FilePicker>` in screen JSX | `power-apps-native-host` host control | Do not generate document-picker/file-system/sharing wrappers for this field |
-| Form field bound to a Dataverse Image column | Host `<ImagePicker>` in screen JSX | `power-apps-native-host` host control | Do not use camera/image-picker wrappers for normal form-bound image fields |
+| Form field bound to a Dataverse File column | Host `<FilePicker>` in screen JSX | `@microsoft/power-apps-native-host` host control | Do not generate document-picker/file-system/sharing wrappers for this field |
+| Form field bound to a Dataverse Image column | Host `<ImagePicker>` in screen JSX | `@microsoft/power-apps-native-host` host control | Do not use camera/image-picker wrappers for normal form-bound image fields |
 | Dedicated photo/gallery/scanner workflow | `/add-native camera`, `image-picker`, or `barcode-scanner` | `expo-camera` and/or `expo-image-picker` present | If packages are absent, stop with missing-package guidance |
 | Pick/import/upload a user-selected PDF/document | `/add-native document-picker`, or host `<FilePicker>` for Dataverse File fields | `expo-document-picker` present, or host File control | Do not treat this as `pdf-report` or native PDF viewer |
 | Generate/export/print an app-owned report PDF | `/add-native pdf-report` | `expo-print` present | If `expo-print` is absent, do not add PDF report capability |
@@ -65,17 +65,17 @@ There are two different cases:
 
 | Case | Correct implementation | Owner |
 |---|---|---|
-| Dataverse `File` column | Use `<FilePicker>` from `power-apps-native-host` | screen-builder JSX rule, documented here |
-| Dataverse `Image` column | Use `<ImagePicker>` from `power-apps-native-host` | screen-builder JSX rule, documented here |
+| Dataverse `File` column | Use `<FilePicker>` from `@microsoft/power-apps-native-host` | screen-builder JSX rule, documented here |
+| Dataverse `Image` column | Use `<ImagePicker>` from `@microsoft/power-apps-native-host` | screen-builder JSX rule, documented here |
 | Local device document/file workflow not bound to a Dataverse column | Generate/use `src/native/documentPicker.ts`, `src/native/fileSystem.ts`, and/or `src/native/sharing.ts` wrappers | `/add-native` |
 | App-generated PDF report workflow | `/add-native` routes internally to `add-pdf-report`; uses `expo-print` and optionally `expo-sharing` only if present | `/add-native` |
 | Camera capture, gallery image selection, barcode scanner, or QR scanner workflow | `/add-native` routes internally to `add-camera` | `/add-native` |
 
-**Dataverse File/Image columns use host controls, not raw Expo modules and not app-specific native wrappers.** When a form field binds to a Dataverse **File** column (`FileAttributeMetadata`), render `<FilePicker>` from `power-apps-native-host`. When it binds to a Dataverse **Image** column (`ImageAttributeMetadata`), render `<ImagePicker>` from `power-apps-native-host`. These controls read accent, surface, and text colors from `PowerAppsProvider` / `ThemeProvider` and produce Dataverse-compatible payloads.
+**Dataverse File/Image columns use host controls, not raw Expo modules and not app-specific native wrappers.** When a form field binds to a Dataverse **File** column (`FileAttributeMetadata`), render `<FilePicker>` from `@microsoft/power-apps-native-host`. When it binds to a Dataverse **Image** column (`ImageAttributeMetadata`), render `<ImagePicker>` from `@microsoft/power-apps-native-host`. These controls read accent, surface, and text colors from `PowerAppsProvider` / `ThemeProvider` and produce Dataverse-compatible payloads.
 
 ```tsx
-import { FilePicker, ImagePicker } from 'power-apps-native-host';
-import type { PickedFileInfo, PickedImageInfo } from 'power-apps-native-host';
+import { FilePicker, ImagePicker } from '@microsoft/power-apps-native-host';
+import type { PickedFileInfo, PickedImageInfo } from '@microsoft/power-apps-native-host';
 
 // Image column — seed preview from Dataverse bytes/base64 and capture upload-ready payload.
 <ImagePicker
@@ -137,7 +137,6 @@ Apply the Native capability gate above. This table is a known capability-to-pack
 | `secure-store` | `expo-secure-store` | `src/native/secureStore.ts` | |
 | `file-system` | `expo-file-system` | `src/native/fileSystem.ts` | |
 | `sharing` | `expo-sharing` | `src/native/sharing.ts` | |
-| `calendar-management-view` | `react-native-calendars` | None | UI library for calendar/agenda screens. No wrapper, no permissions, no `/add-native` execution; screen-builder imports directly when present in `package.json`. |
 | `location` | `expo-location` | `src/native/location.ts` | One-shot/foreground fix only. For continuous background tracking with Dataverse sync, use `geolocation` (`@microsoft/power-apps-native-bglocation`). Use only when the current template package contains `expo-location` |
 | `biometrics`, `local-authentication` | `expo-local-authentication` | `src/native/biometrics.ts` | Use only when the current template package contains `expo-local-authentication` |
 | `clipboard` | `expo-clipboard` | `src/native/clipboard.ts` | Use only when the current template package contains `expo-clipboard` |
@@ -149,7 +148,6 @@ Apply the Native capability gate above. This table is a known capability-to-pack
 | `screen-orientation` | `expo-screen-orientation` | `src/native/screenOrientation.ts` | Use only when package is present; do not edit native config |
 | `device-info` | `expo-device` / `expo-application` / `expo-cellular` | `src/native/deviceInfo.ts` | Read-only device/app/cellular metadata wrappers |
 | `date-time-picker` | `@react-native-community/datetimepicker` | screen-level component usage | Use directly in form screens per screen-builder rules; no `/add-native` wrapper required |
-| `calendar-ui` | `react-native-calendars` | screen-level component usage | JS calendar UI only; not a native permissioned capability |
 
 ### PDF / pen routing rules
 
@@ -195,8 +193,6 @@ When the user asks for "location" or "GPS", disambiguate by intent: continuous/b
 
 If the user names something not in the supported table, apply the Native capability gate: resolve the relevant package from `package.json`, continue only when present and not runtime-banned, otherwise stop with a transparency note.
 
-If the resolved capability is `calendar-management-view`, STOP after verifying `react-native-calendars` is present in `package.json`: no wrapper is generated because it is a UI library, not a device API. The screen-builder owns importing `Calendar`, `CalendarProvider`, `ExpandableCalendar`, `AgendaList`, `Agenda`, or `CalendarList` directly from `react-native-calendars` based on the approved screen spec.
-
 ### Step 3 — Route to nested helpers or inline wrappers
 
 For normalized `camera`, `image-picker`, `barcode-scanner`, `qr-scanner`, `pdf-report`, `pdf-viewer`, `pen-input`, or `geolocation`, do not fall through to the generic wrapper flow and do not tell the user to run another slash command. Read the nested helper and follow its steps inside this `/add-native` invocation:
@@ -241,7 +237,7 @@ Each wrapper exports:
 - All wrappers return a discriminated-union result (`{ ok: true, ... } | { ok: false, reason, message? }`) — **never throw**
 - Unsupported runtime/platform states gracefully degrade or return `{ ok: false, reason: 'unsupported' }` — **never crash**
 - Branch by supported native platform when a capability differs between iOS and Android
-- Screens import these wrappers only for non-Dataverse native workflows. Dataverse File/Image fields use `power-apps-native-host` controls from the File/Image Picker Ownership section above.
+- Screens import these wrappers only for non-Dataverse native workflows. Dataverse File/Image fields use `@microsoft/power-apps-native-host` controls from the File/Image Picker Ownership section above.
 
 **Coding the wrapper:** consult the module's published API docs (linked from its npm page) for method signatures and permission patterns. Use the secure-store skeleton below as the canonical example of the discriminated-union shape — then translate to the target module's API.
 
@@ -325,4 +321,4 @@ Sample usage:
 
 - This skill never modifies `package.json`, `app.config.js`, `src/playerConfig.ts`, `src/generated/`, or any screen file.
 - For capabilities not in the supported table (`expo-notifications`, Bluetooth, NFC, BLE, AR — until the template adds them), tell the user the template doesn't ship them yet — file a request at the upstream template repo. Do NOT attempt to install or configure anything yourself.
-- Generic JS-only libraries (`date-fns`, `zod`, `@tanstack/react-query`, etc.) are out of scope for this skill but remain fine to install via `npx expo install <pkg>` in other contexts — the prohibition above applies only to native modules with a config plugin or platform code.
+- Pure-JavaScript libraries are out of scope for this skill. `/create-mobile-app` or `/edit-app` selects and installs them through [`shared/references/javascript-dependency-planning.md`](${CLAUDE_SKILL_DIR}/../../shared/references/javascript-dependency-planning.md); no native wrapper or Android/iOS rebuild is needed. The prohibition above applies only to packages with native source/config.

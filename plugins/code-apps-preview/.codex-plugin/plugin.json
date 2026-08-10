@@ -1,6 +1,6 @@
 {
   "name": "code-apps-preview",
-  "version": "1.0.0+codex.010dfdd53b99",
+  "version": "1.1.0+codex.a5f31e69ad5c",
   "description": "Build and deploy Power Apps code apps using React, Vite, and Power Platform connectors.",
   "author": {
     "name": "LeonardSEO",
