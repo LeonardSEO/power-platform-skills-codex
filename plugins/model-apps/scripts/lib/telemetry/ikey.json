@@ -1,0 +1,6 @@
+{
+  "event_stream_name": "Disabled",
+  "disabled": true,
+  "default_region": "none",
+  "regions": {}
+}

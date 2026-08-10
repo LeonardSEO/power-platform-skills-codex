@@ -16,14 +16,14 @@ upstream skills, scripts, templates, references, and MCP servers.
 | Plugin | Skills | Purpose |
 | --- | ---: | --- |
 | `power-pages` | 32 | Build and deploy Power Pages code sites |
-| `model-apps` | 2 | Build generative pages for model-driven apps |
+| `model-apps` | 4 | Build generative pages for model-driven apps |
 | `mcp-apps` | 2 | Generate interactive MCP App widgets |
-| `canvas-apps` | 5 | Author Canvas Apps through the Canvas Authoring MCP server |
-| `code-apps-preview` | 14 | Build React and Vite Power Apps code apps |
+| `canvas-apps` | 4 | Author Canvas Apps through the Canvas Authoring MCP server |
+| `code-apps-preview` | 15 | Build React and Vite Power Apps code apps |
 | `mobile-app` | 28 | Build Expo and React Native Power Apps |
 | `power-automate` | 10 | Build, edit, publish, run, and debug cloud flows |
 
-Total: **93 Codex skills**.
+Total: **95 Codex skills**.
 
 ## Codex-specific changes
 
