@@ -1,51 +1,51 @@
 {
   "generatedFrom": {
     "repository": "microsoft/power-platform-skills",
-    "commit": "a5f31e69ad5ccc6205a9948b348dcbf8abf3834e"
+    "commit": "556f03ea5936e105b7fbe9adfa24a39d46b83646"
   },
   "plugins": {
     "power-pages": {
       "upstreamPath": "plugins/power-pages",
       "upstreamVersion": "2.6.3",
-      "codexVersion": "2.6.3+codex.a5f31e69ad5c",
-      "skills": 32
+      "codexVersion": "2.6.3+codex.556f03ea5936",
+      "skills": 33
     },
     "model-apps": {
       "upstreamPath": "plugins/model-apps",
-      "upstreamVersion": "2.4.2",
-      "codexVersion": "2.4.2+codex.a5f31e69ad5c",
+      "upstreamVersion": "2.4.4",
+      "codexVersion": "2.4.4+codex.556f03ea5936",
       "skills": 4
     },
     "mcp-apps": {
       "upstreamPath": "plugins/mcp-apps",
       "upstreamVersion": "1.0.0",
-      "codexVersion": "1.0.0+codex.a5f31e69ad5c",
+      "codexVersion": "1.0.0+codex.556f03ea5936",
       "skills": 2
     },
     "canvas-apps": {
       "upstreamPath": "plugins/canvas-apps",
-      "upstreamVersion": "2.2.2",
-      "codexVersion": "2.2.2+codex.a5f31e69ad5c",
+      "upstreamVersion": "3.0.2",
+      "codexVersion": "3.0.2+codex.556f03ea5936",
       "skills": 4
     },
     "code-apps-preview": {
       "upstreamPath": "plugins/code-apps",
       "upstreamVersion": "1.1.0",
-      "codexVersion": "1.1.0+codex.a5f31e69ad5c",
+      "codexVersion": "1.1.0+codex.556f03ea5936",
       "skills": 15
     },
     "mobile-app": {
       "upstreamPath": "plugins/mobile-apps",
       "upstreamVersion": "0.2.0",
-      "codexVersion": "0.2.0+codex.a5f31e69ad5c",
+      "codexVersion": "0.2.0+codex.556f03ea5936",
       "skills": 28
     },
     "power-automate": {
       "upstreamPath": "plugins/power-automate",
-      "upstreamVersion": "2.5.0",
-      "codexVersion": "2.5.0+codex.a5f31e69ad5c",
+      "upstreamVersion": "3.0.1",
+      "codexVersion": "3.0.1+codex.556f03ea5936",
       "skills": 10
     }
   },
-  "totalSkills": 95
+  "totalSkills": 96
 }
