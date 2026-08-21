@@ -53,35 +53,67 @@ the author and copyright holder of the upstream content; see `NOTICE.md` and
 Individual plugins can have additional requirements documented in their own
 `README.md`, `AGENTS.md`, or setup skill.
 
-## Universal installer (`npx plugins`)
+## Install the complete suite
 
-The [Vercel Labs `plugins` CLI](https://github.com/vercel-labs/plugins) installs
-complete OpenPlugin repositories into supported coding agents. Its published
-targets include Claude Code, Cursor, OpenAI Codex, Grok Build, Kimi Code,
-GitHub Copilot CLI, and Visual Studio Code.
+The repository is one marketplace containing all seven Power Platform plugins.
+Use either the native Codex CLI or the universal `plugins` installer. Both
+routes install the complete suite, including its 96 skills and bundled MCP
+servers.
 
-Install into all supported agents detected on the machine:
+### [Native Codex CLI](https://developers.openai.com/codex/developer-commands#codex-plugin) (recommended)
+
+Add this repository as a Codex marketplace:
 
 ```bash
-DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 \
-  npx plugins add LeonardSEO/power-platform-skills-codex
+codex plugin marketplace add LeonardSEO/power-platform-skills-codex
 ```
 
-Install into Codex only:
+Codex does not currently have an `install-all` marketplace command. Install the
+complete suite with this single terminal block:
 
 ```bash
-DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 \
-  npx plugins add LeonardSEO/power-platform-skills-codex --target codex
+for plugin in power-pages model-apps mcp-apps canvas-apps code-apps-preview mobile-app power-automate; do
+  codex plugin add "$plugin@power-platform-skills-codex"
+done
 ```
 
-This repository has been tested with `npx plugins discover`: all seven plugins
-are detected, including their skills, agents, hooks, and MCP configurations.
+PowerShell:
 
-Inspect the repository without installing anything:
+```powershell
+codex plugin marketplace add LeonardSEO/power-platform-skills-codex
+
+$plugins = @(
+  "power-pages",
+  "model-apps",
+  "mcp-apps",
+  "canvas-apps",
+  "code-apps-preview",
+  "mobile-app",
+  "power-automate"
+)
+
+foreach ($plugin in $plugins) {
+  codex plugin add "$plugin@power-platform-skills-codex"
+}
+```
+
+Confirm that all seven plugins are installed:
+
+```bash
+codex plugin list
+```
+
+You can also start `codex`, enter `/plugins`, select the
+`power-platform-skills-codex` marketplace, and inspect the installed entries.
+
+### [Universal installer](https://www.npmjs.com/package/plugins) (`npx plugins`)
+
+Install the complete suite into Codex with one command:
 
 ```bash
 DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 \
-  npx plugins discover LeonardSEO/power-platform-skills-codex
+  npx plugins@latest add LeonardSEO/power-platform-skills-codex \
+  --target codex --scope user --yes
 ```
 
 PowerShell:
@@ -89,15 +121,30 @@ PowerShell:
 ```powershell
 $env:DISABLE_TELEMETRY = "1"
 $env:DO_NOT_TRACK = "1"
-npx plugins add LeonardSEO/power-platform-skills-codex --target codex
+npx plugins@latest add LeonardSEO/power-platform-skills-codex `
+  --target codex --scope user --yes
 ```
+
+To install the complete suite into every supported coding agent detected on the
+machine, omit `--target codex`:
+
+```bash
+DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 \
+  npx plugins@latest add LeonardSEO/power-platform-skills-codex \
+  --scope user --yes
+```
+
+The current `plugins` CLI supports Claude Code, Cursor, Codex, Grok Build, Kimi
+Code, GitHub Copilot CLI, and Visual Studio Code. This repository has been
+verified with `plugins discover`: all seven marketplace entries and their
+skills, agents, hooks, and MCP configurations are detected.
 
 `DISABLE_TELEMETRY` and `DO_NOT_TRACK` disable the installer's anonymous usage
 telemetry. They are separate from the plugin-level telemetry hard-off described
 below.
 
-Start a new Codex thread after installation so the new skills and MCP tools are
-loaded.
+Start a new Codex chat or CLI session after installation so the new skills and
+MCP tools are loaded.
 
 ## Example prompts
 
