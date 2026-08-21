@@ -1,6 +1,6 @@
 {
   "name": "mobile-app",
-  "version": "0.2.0+codex.556f03ea5936",
+  "version": "0.2.0+codex.4689385b480b",
   "description": "Build Power Apps mobile code apps with Expo, React Native, and Power Platform connectors.",
   "author": {
     "name": "LeonardSEO",
@@ -17,7 +17,7 @@
     "connectors"
   ],
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json",
+  "mcpServers": "./.codex.mcp.json",
   "interface": {
     "displayName": "Mobile Apps for Codex",
     "shortDescription": "Build Power Apps mobile apps with Expo.",

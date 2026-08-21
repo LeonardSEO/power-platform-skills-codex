@@ -1,6 +1,6 @@
 {
   "name": "power-pages",
-  "version": "2.6.3+codex.556f03ea5936",
+  "version": "2.6.3+codex.4689385b480b",
   "description": "Create and deploy Power Pages code sites and manage Power Platform ALM.",
   "author": {
     "name": "LeonardSEO",
@@ -17,7 +17,7 @@
     "alm"
   ],
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json",
+  "mcpServers": "./.codex.mcp.json",
   "interface": {
     "displayName": "Power Pages for Codex",
     "shortDescription": "Build and deploy modern Power Pages sites.",

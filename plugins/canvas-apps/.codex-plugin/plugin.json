@@ -1,6 +1,6 @@
 {
   "name": "canvas-apps",
-  "version": "3.0.2+codex.556f03ea5936",
+  "version": "3.0.3+codex.4689385b480b",
   "description": "Build Power Apps Canvas Apps with PA YAML and the Canvas Authoring MCP server.",
   "author": {
     "name": "LeonardSEO",
@@ -17,7 +17,7 @@
     "power-platform"
   ],
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json",
+  "mcpServers": "./.codex.mcp.json",
   "interface": {
     "displayName": "Canvas Apps for Codex",
     "shortDescription": "Build Canvas Apps with PA YAML.",

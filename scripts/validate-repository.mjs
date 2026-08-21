@@ -147,11 +147,21 @@ for (const [pluginName, expectedCount] of expectedSkills) {
   }
 
   if (manifest.mcpServers) {
+    if (manifest.mcpServers !== "./.codex.mcp.json") {
+      fail(
+        `Codex manifest for ${pluginName} must reference ./.codex.mcp.json`,
+      );
+    }
     const mcpPath = resolve(pluginRoot, manifest.mcpServers);
     if (!existsSync(mcpPath)) {
       fail(`Missing MCP configuration for ${pluginName}: ${mcpPath}`);
     }
-    readJson(mcpPath);
+    const mcpConfig = readJson(mcpPath);
+    if (mcpConfig.mcpServers || mcpConfig.mcp_servers) {
+      fail(
+        `Codex MCP configuration for ${pluginName} must be a direct server map`,
+      );
+    }
   }
 
   const skillsRoot = join(pluginRoot, "skills");
@@ -197,8 +207,10 @@ if (globalKillSwitch.disabled !== true) {
 }
 
 const powerAutomateRoot = join(repositoryRoot, "plugins", "power-automate");
-const powerAutomateMcp = readJson(join(powerAutomateRoot, ".mcp.json"));
-const flowAgent = powerAutomateMcp.mcpServers?.flowagent;
+const powerAutomateMcp = readJson(
+  join(powerAutomateRoot, ".codex.mcp.json"),
+);
+const flowAgent = powerAutomateMcp.flowagent;
 if (!flowAgent || flowAgent.command !== "node") {
   fail("Power Automate FlowAgent MCP configuration is missing");
 }
@@ -216,6 +228,26 @@ if (
   fail("Power Automate Node.js 22 compatibility bootstrap is missing");
 }
 
+const initializeRequest = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  method: "initialize",
+  params: {
+    protocolVersion: "2025-03-26",
+    capabilities: {},
+    clientInfo: { name: "codex-adapter-validator", version: "1.0.0" },
+  },
+});
+const initializedNotification = JSON.stringify({
+  jsonrpc: "2.0",
+  method: "notifications/initialized",
+});
+const toolsListRequest = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 2,
+  method: "tools/list",
+  params: {},
+});
 const smokeTest = spawnSync("node", ["-e", bootstrap], {
   cwd: powerAutomateRoot,
   env: {
@@ -227,7 +259,7 @@ const smokeTest = spawnSync("node", ["-e", bootstrap], {
       "telemetry-disabled.json",
     ),
   },
-  input: "",
+  input: `${initializeRequest}\n${initializedNotification}\n${toolsListRequest}\n`,
   encoding: "utf8",
   timeout: 10_000,
 });
@@ -242,6 +274,29 @@ if (
   )
 ) {
   fail("FlowAgent smoke test did not report a successful start");
+}
+const responses = smokeTest.stdout
+  .split(/\r?\n/)
+  .filter(Boolean)
+  .map((line) => {
+    try {
+      return JSON.parse(line);
+    } catch (error) {
+      fail(`FlowAgent returned invalid JSON-RPC output: ${error.message}`);
+    }
+  });
+const initializeResponse = responses.find((response) => response.id === 1);
+if (initializeResponse?.result?.serverInfo?.name !== "flowagent-mcp") {
+  fail("FlowAgent MCP initialize handshake failed");
+}
+const toolsResponse = responses.find((response) => response.id === 2);
+const toolNames = new Set(
+  (toolsResponse?.result?.tools || []).map((tool) => tool.name),
+);
+for (const requiredTool of ["list_flows", "create_flow", "publish_flow"]) {
+  if (!toolNames.has(requiredTool)) {
+    fail(`FlowAgent MCP is missing required tool: ${requiredTool}`);
+  }
 }
 
 const powerPagesHooksPath = join(

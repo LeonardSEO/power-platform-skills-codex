@@ -37,6 +37,31 @@ function writeJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+function createCodexMcpConfig(pluginName, sourceConfig) {
+  const servers = sourceConfig.mcpServers;
+  if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+    fail(`Upstream MCP configuration for ${pluginName} has no mcpServers map`);
+  }
+
+  return Object.fromEntries(
+    Object.entries(servers).map(([serverName, serverConfig]) => {
+      if (
+        !serverConfig ||
+        typeof serverConfig !== "object" ||
+        Array.isArray(serverConfig)
+      ) {
+        fail(`Invalid MCP server ${serverName} in ${pluginName}`);
+      }
+
+      const codexConfig = { ...serverConfig };
+      if (codexConfig.url && ["http", "sse"].includes(codexConfig.type)) {
+        delete codexConfig.type;
+      }
+      return [serverName, codexConfig];
+    }),
+  );
+}
+
 function walkFiles(directory) {
   const files = [];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -213,6 +238,27 @@ const mobileSampleDataSkill = readFileSync(
   "utf8",
 ).replace(/\r?\npps\.\r?\n/, "\n");
 writeFileSync(mobileSampleDataSkillPath, mobileSampleDataSkill, "utf8");
+
+for (const [pluginName] of pluginMappings) {
+  const pluginRoot = join(repositoryRoot, "plugins", pluginName);
+  const sourceMcpPath = join(pluginRoot, ".mcp.json");
+  if (!existsSync(sourceMcpPath)) continue;
+
+  const codexMcpPath = join(pluginRoot, ".codex.mcp.json");
+  writeJson(
+    codexMcpPath,
+    createCodexMcpConfig(pluginName, readJson(sourceMcpPath)),
+  );
+
+  const codexManifestPath = join(
+    pluginRoot,
+    ".codex-plugin",
+    "plugin.json",
+  );
+  const codexManifest = readJson(codexManifestPath);
+  codexManifest.mcpServers = "./.codex.mcp.json";
+  writeJson(codexManifestPath, codexManifest);
+}
 
 const telemetryFiles = walkFiles(join(repositoryRoot, "plugins")).filter(
   (path) => path.endsWith("/telemetry/ikey.json"),

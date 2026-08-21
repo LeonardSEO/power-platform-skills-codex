@@ -29,6 +29,8 @@ Total: **96 Codex skills**.
 
 - Added `.codex-plugin/plugin.json` to every plugin.
 - Added a repository marketplace at `.agents/plugins/marketplace.json`.
+- Added Codex-native `.codex.mcp.json` adapters. The upstream `.mcp.json`
+  files remain available for Claude Code and GitHub Copilot CLI.
 - Added a Node.js 22 compatibility fix to the bundled Power Automate FlowAgent
   launcher.
 - Corrected one invalid YAML frontmatter entry in the mobile app skills.
@@ -145,9 +147,9 @@ Validation checks:
 
 - marketplace structure and all seven entries;
 - all Codex plugin manifests;
-- all 93 skill entrypoints;
-- MCP manifest references;
-- the Power Automate FlowAgent launch under Node.js;
+- all 96 skill entrypoints;
+- Codex-native MCP schemas and manifest references;
+- the Power Automate FlowAgent initialize and tool-list handshake under Node.js;
 - the telemetry hard-off contract.
 
 ## Repository layout

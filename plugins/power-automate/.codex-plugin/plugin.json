@@ -1,6 +1,6 @@
 {
   "name": "power-automate",
-  "version": "3.0.1+codex.556f03ea5936",
+  "version": "3.0.1+codex.4689385b480b",
   "description": "Build, edit, run, publish, and debug Power Automate cloud flows through FlowAgent.",
   "author": {
     "name": "LeonardSEO",
@@ -17,7 +17,7 @@
     "power-platform"
   ],
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json",
+  "mcpServers": "./.codex.mcp.json",
   "interface": {
     "displayName": "Power Automate for Codex",
     "shortDescription": "Build and manage complete cloud flows.",

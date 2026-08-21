@@ -1,6 +1,6 @@
 {
   "name": "model-apps",
-  "version": "2.4.4+codex.556f03ea5936",
+  "version": "2.4.4+codex.4689385b480b",
   "description": "Build and deploy generative pages for Power Apps model-driven apps.",
   "author": {
     "name": "LeonardSEO",
@@ -17,7 +17,7 @@
     "pac-cli"
   ],
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json",
+  "mcpServers": "./.codex.mcp.json",
   "interface": {
     "displayName": "Model Apps for Codex",
     "shortDescription": "Build generative pages for model-driven apps.",
