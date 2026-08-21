@@ -1,0 +1,40 @@
+{
+  "name": "power-platform-skills-codex",
+  "owner": {
+    "name": "LeonardSEO"
+  },
+  "metadata": {
+    "description": "Power Platform plugins optimized for Codex with native Claude Code compatibility",
+    "pluginRoot": "."
+  },
+  "plugins": [
+    {
+      "name": "power-pages",
+      "source": "./plugins/power-pages"
+    },
+    {
+      "name": "model-apps",
+      "source": "./plugins/model-apps"
+    },
+    {
+      "name": "mcp-apps",
+      "source": "./plugins/mcp-apps"
+    },
+    {
+      "name": "canvas-apps",
+      "source": "./plugins/canvas-apps"
+    },
+    {
+      "name": "code-apps-preview",
+      "source": "./plugins/code-apps-preview"
+    },
+    {
+      "name": "mobile-app",
+      "source": "./plugins/mobile-app"
+    },
+    {
+      "name": "power-automate",
+      "source": "./plugins/power-automate"
+    }
+  ]
+}

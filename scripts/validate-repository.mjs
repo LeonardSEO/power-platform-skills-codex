@@ -10,6 +10,11 @@ const marketplacePath = join(
   "plugins",
   "marketplace.json",
 );
+const claudeMarketplacePath = join(
+  repositoryRoot,
+  ".claude-plugin",
+  "marketplace.json",
+);
 const inventoryPath = join(repositoryRoot, "config", "plugin-inventory.json");
 const upstreamStatePath = join(
   repositoryRoot,
@@ -67,6 +72,9 @@ function containsRoutingValue(value) {
 }
 
 if (!existsSync(marketplacePath)) fail("Missing Codex marketplace manifest");
+if (!existsSync(claudeMarketplacePath)) {
+  fail("Missing Claude Code marketplace manifest");
+}
 if (!existsSync(inventoryPath)) fail("Missing generated plugin inventory");
 if (!existsSync(upstreamStatePath)) fail("Missing upstream synchronization state");
 
@@ -100,6 +108,9 @@ const marketplace = readJson(marketplacePath);
 if (marketplace.name !== "power-platform-skills-codex") {
   fail(`Unexpected marketplace name: ${marketplace.name}`);
 }
+if (!marketplace.interface?.displayName) {
+  fail("Codex marketplace is missing interface.displayName");
+}
 if (!Array.isArray(marketplace.plugins)) {
   fail("Marketplace plugins must be an array");
 }
@@ -121,17 +132,61 @@ const entries = new Map(
   }),
 );
 
+const claudeMarketplace = readJson(claudeMarketplacePath);
+if (claudeMarketplace.name !== "power-platform-skills-codex") {
+  fail(`Unexpected Claude marketplace name: ${claudeMarketplace.name}`);
+}
+if (
+  claudeMarketplace.owner?.name !== "LeonardSEO" ||
+  claudeMarketplace.metadata?.pluginRoot !== "."
+) {
+  fail("Claude marketplace metadata is incomplete");
+}
+if (!Array.isArray(claudeMarketplace.plugins)) {
+  fail("Claude marketplace plugins must be an array");
+}
+const claudeEntries = new Map(
+  claudeMarketplace.plugins.map((entry) => {
+    if (!entry?.name) fail("Claude marketplace entry is missing a name");
+    if (entry.source !== `./plugins/${entry.name}`) {
+      fail(`Claude plugin ${entry.name} has an unexpected source path`);
+    }
+    return [entry.name, entry];
+  }),
+);
+
 if (entries.size !== expectedSkills.size) {
   fail(
     `Expected ${expectedSkills.size} marketplace plugins, found ${entries.size}`,
+  );
+}
+if (claudeEntries.size !== expectedSkills.size) {
+  fail(
+    `Expected ${expectedSkills.size} Claude marketplace plugins, found ${claudeEntries.size}`,
   );
 }
 
 let totalSkills = 0;
 for (const [pluginName, expectedCount] of expectedSkills) {
   if (!entries.has(pluginName)) fail(`Marketplace is missing ${pluginName}`);
+  if (!claudeEntries.has(pluginName)) {
+    fail(`Claude marketplace is missing ${pluginName}`);
+  }
 
   const pluginRoot = join(repositoryRoot, "plugins", pluginName);
+  const claudeManifestPath = join(
+    pluginRoot,
+    ".claude-plugin",
+    "plugin.json",
+  );
+  if (!existsSync(claudeManifestPath)) {
+    fail(`Missing Claude manifest for ${pluginName}`);
+  }
+  const claudeManifest = readJson(claudeManifestPath);
+  if (claudeManifest.name !== pluginName) {
+    fail(`Claude manifest name mismatch for ${pluginName}`);
+  }
+
   const manifestPath = join(pluginRoot, ".codex-plugin", "plugin.json");
   if (!existsSync(manifestPath)) fail(`Missing Codex manifest for ${pluginName}`);
 
@@ -144,6 +199,9 @@ for (const [pluginName, expectedCount] of expectedSkills) {
   }
   if (!manifest.description || !manifest.author?.name || !manifest.interface) {
     fail(`Incomplete Codex manifest for ${pluginName}`);
+  }
+  if (manifest.skills !== "./skills/") {
+    fail(`Codex manifest for ${pluginName} must reference ./skills/`);
   }
 
   if (manifest.mcpServers) {
@@ -211,21 +269,38 @@ const powerAutomateMcp = readJson(
   join(powerAutomateRoot, ".codex.mcp.json"),
 );
 const flowAgent = powerAutomateMcp.flowagent;
+const claudePowerAutomateMcp = readJson(
+  join(powerAutomateRoot, ".mcp.json"),
+);
+const claudeFlowAgent = claudePowerAutomateMcp.mcpServers?.flowagent;
 if (!flowAgent || flowAgent.command !== "node") {
   fail("Power Automate FlowAgent MCP configuration is missing");
 }
+if (!claudeFlowAgent || claudeFlowAgent.command !== "node") {
+  fail("Power Automate Claude FlowAgent MCP configuration is missing");
+}
 if (
   flowAgent.env?.FLOWAGENT_TELEMETRY !== "off" ||
-  flowAgent.env?.POWER_PLATFORM_SKILLS_TELEMETRY !== "off"
+  flowAgent.env?.POWER_PLATFORM_SKILLS_TELEMETRY !== "off" ||
+  claudeFlowAgent.env?.FLOWAGENT_TELEMETRY !== "off" ||
+  claudeFlowAgent.env?.POWER_PLATFORM_SKILLS_TELEMETRY !== "off"
 ) {
   fail("Power Automate FlowAgent telemetry must be explicitly disabled");
 }
 const bootstrap = flowAgent.args?.[1];
+const claudeBootstrap = claudeFlowAgent.args?.[1];
 if (
   typeof bootstrap !== "string" ||
   !bootstrap.includes("globalThis.require=require")
 ) {
   fail("Power Automate Node.js 22 compatibility bootstrap is missing");
+}
+if (
+  typeof claudeBootstrap !== "string" ||
+  !claudeBootstrap.includes("globalThis.require=require") ||
+  !claudeBootstrap.includes("CLAUDE_PLUGIN_ROOT")
+) {
+  fail("Power Automate Claude FlowAgent compatibility bootstrap is missing");
 }
 
 const initializeRequest = JSON.stringify({
@@ -248,56 +323,69 @@ const toolsListRequest = JSON.stringify({
   method: "tools/list",
   params: {},
 });
-const smokeTest = spawnSync("node", ["-e", bootstrap], {
-  cwd: powerAutomateRoot,
-  env: {
-    ...process.env,
-    PLUGIN_ROOT: powerAutomateRoot,
-    POWER_PLATFORM_SKILLS_IKEY_JSON: join(
-      repositoryRoot,
-      "config",
-      "telemetry-disabled.json",
-    ),
-  },
-  input: `${initializeRequest}\n${initializedNotification}\n${toolsListRequest}\n`,
-  encoding: "utf8",
-  timeout: 10_000,
-});
-if (smokeTest.status !== 0) {
-  fail(
-    `FlowAgent smoke test failed:\n${smokeTest.stdout}\n${smokeTest.stderr}`,
-  );
-}
-if (
-  !`${smokeTest.stdout}\n${smokeTest.stderr}`.includes(
-    "FlowAgent MCP server running on stdio",
-  )
-) {
-  fail("FlowAgent smoke test did not report a successful start");
-}
-const responses = smokeTest.stdout
-  .split(/\r?\n/)
-  .filter(Boolean)
-  .map((line) => {
-    try {
-      return JSON.parse(line);
-    } catch (error) {
-      fail(`FlowAgent returned invalid JSON-RPC output: ${error.message}`);
-    }
+function validateFlowAgent(bootstrapSource, rootEnvironment, clientName) {
+  const smokeTest = spawnSync("node", ["-e", bootstrapSource], {
+    cwd: powerAutomateRoot,
+    env: {
+      ...process.env,
+      ...rootEnvironment,
+      POWER_PLATFORM_SKILLS_IKEY_JSON: join(
+        repositoryRoot,
+        "config",
+        "telemetry-disabled.json",
+      ),
+    },
+    input: `${initializeRequest}\n${initializedNotification}\n${toolsListRequest}\n`,
+    encoding: "utf8",
+    timeout: 10_000,
   });
-const initializeResponse = responses.find((response) => response.id === 1);
-if (initializeResponse?.result?.serverInfo?.name !== "flowagent-mcp") {
-  fail("FlowAgent MCP initialize handshake failed");
-}
-const toolsResponse = responses.find((response) => response.id === 2);
-const toolNames = new Set(
-  (toolsResponse?.result?.tools || []).map((tool) => tool.name),
-);
-for (const requiredTool of ["list_flows", "create_flow", "publish_flow"]) {
-  if (!toolNames.has(requiredTool)) {
-    fail(`FlowAgent MCP is missing required tool: ${requiredTool}`);
+  if (smokeTest.status !== 0) {
+    fail(
+      `${clientName} FlowAgent smoke test failed:\n${smokeTest.stdout}\n${smokeTest.stderr}`,
+    );
+  }
+  if (
+    !`${smokeTest.stdout}\n${smokeTest.stderr}`.includes(
+      "FlowAgent MCP server running on stdio",
+    )
+  ) {
+    fail(`${clientName} FlowAgent smoke test did not report a successful start`);
+  }
+  const responses = smokeTest.stdout
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch (error) {
+        fail(
+          `${clientName} FlowAgent returned invalid JSON-RPC output: ${error.message}`,
+        );
+      }
+    });
+  const initializeResponse = responses.find((response) => response.id === 1);
+  if (initializeResponse?.result?.serverInfo?.name !== "flowagent-mcp") {
+    fail(`${clientName} FlowAgent MCP initialize handshake failed`);
+  }
+  const toolsResponse = responses.find((response) => response.id === 2);
+  const toolNames = new Set(
+    (toolsResponse?.result?.tools || []).map((tool) => tool.name),
+  );
+  for (const requiredTool of ["list_flows", "create_flow", "publish_flow"]) {
+    if (!toolNames.has(requiredTool)) {
+      fail(
+        `${clientName} FlowAgent MCP is missing required tool: ${requiredTool}`,
+      );
+    }
   }
 }
+
+validateFlowAgent(bootstrap, { PLUGIN_ROOT: powerAutomateRoot }, "Codex");
+validateFlowAgent(
+  claudeBootstrap,
+  { CLAUDE_PLUGIN_ROOT: powerAutomateRoot },
+  "Claude Code",
+);
 
 const powerPagesHooksPath = join(
   repositoryRoot,

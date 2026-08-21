@@ -124,6 +124,22 @@ const inventory = {
   totalSkills: 0,
 };
 
+const claudeMarketplace = {
+  name: "power-platform-skills-codex",
+  owner: {
+    name: "LeonardSEO",
+  },
+  metadata: {
+    description:
+      "Power Platform plugins optimized for Codex with native Claude Code compatibility",
+    pluginRoot: ".",
+  },
+  plugins: [...pluginMappings.keys()].map((pluginName) => ({
+    name: pluginName,
+    source: `./plugins/${pluginName}`,
+  })),
+};
+
 for (const [codexName, upstreamName] of pluginMappings) {
   const pluginRoot = join(repositoryRoot, "plugins", codexName);
   const upstreamManifest = readJson(
@@ -274,6 +290,10 @@ for (const telemetryFile of telemetryFiles) {
 
 writeJson(join(repositoryRoot, "config", "plugin-inventory.json"), inventory);
 writeJson(
+  join(repositoryRoot, ".claude-plugin", "marketplace.json"),
+  claudeMarketplace,
+);
+writeJson(
   join(repositoryRoot, ".upstream", "power-platform-skills.json"),
   {
     repository: "microsoft/power-platform-skills",
@@ -295,8 +315,8 @@ for (const [pluginName, details] of Object.entries(inventory.plugins)) {
   readme = readme.replace(rowPattern, `$1${details.skills}$2`);
 }
 readme = readme.replace(
-  /Total: \*\*\d+ Codex skills\*\*\./,
-  `Total: **${inventory.totalSkills} Codex skills**.`,
+  /\*\*Total: \d+ plugins and \d+ skill definitions\.\*\*/,
+  `**Total: ${pluginMappings.size} plugins and ${inventory.totalSkills} skill definitions.**`,
 );
 writeFileSync(readmePath, readme, "utf8");
 

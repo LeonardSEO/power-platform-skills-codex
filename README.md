@@ -65,9 +65,21 @@ installation with:
 codex plugin list
 ```
 
+### Claude Code
+
+Run these commands inside Claude Code:
+
+```text
+/plugin marketplace add LeonardSEO/power-platform-skills-codex
+/plugin
+```
+
+Install the desired plugins from `power-platform-skills-codex`, then run
+`/reload-plugins`.
+
 ## Requirements
 
-- Codex CLI with plugin support
+- Codex CLI with plugin support or Claude Code
 - Node.js 18 or newer
 - Azure CLI (`az`) for Microsoft authentication
 - Power Platform CLI (`pac`) for Power Platform operations
@@ -102,6 +114,7 @@ This distribution adds and maintains the Codex-specific integration layer:
 
 - `.codex-plugin/plugin.json` manifests for all seven plugins
 - A Codex marketplace at `.agents/plugins/marketplace.json`
+- A native Claude Code marketplace at `.claude-plugin/marketplace.json`
 - Direct `.codex.mcp.json` server maps for Codex
 - Original `.mcp.json` files for Claude Code and GitHub Copilot CLI
 - A Node.js 22 and 24 compatibility bootstrap for Power Automate FlowAgent
@@ -138,10 +151,10 @@ npm test
 
 The validation suite checks:
 
-- All seven marketplace entries and Codex manifests
+- All seven Codex and Claude Code marketplace entries and manifests
 - All 96 skill definitions
-- Codex-native MCP schemas and manifest references
-- The FlowAgent MCP startup, initialization, and tool-list handshake
+- Codex- and Claude-native MCP schemas and manifest references
+- The Codex and Claude FlowAgent startup, initialization, and tool-list handshake
 - The telemetry hard-off contract
 - Consistency with the recorded Microsoft upstream commit
 
