@@ -3,13 +3,13 @@
 [![Validate](https://github.com/LeonardSEO/power-platform-skills-codex/actions/workflows/validate.yml/badge.svg)](https://github.com/LeonardSEO/power-platform-skills-codex/actions/workflows/validate.yml)
 [![Sync Microsoft upstream](https://github.com/LeonardSEO/power-platform-skills-codex/actions/workflows/sync-upstream.yml/badge.svg)](https://github.com/LeonardSEO/power-platform-skills-codex/actions/workflows/sync-upstream.yml)
 
-An unofficial Codex adaptation of Microsoft's
-[`power-platform-skills`](https://github.com/microsoft/power-platform-skills)
-marketplace.
+A Codex-optimized distribution of Microsoft's
+[`power-platform-skills`](https://github.com/microsoft/power-platform-skills).
+It packages the complete Power Platform marketplace for Codex while preserving
+compatibility with the upstream Claude Code and GitHub Copilot CLI formats.
 
-The upstream project targets Claude Code and GitHub Copilot CLI. This repository
-adds Codex-native plugin manifests and a Codex marketplace while preserving the
-upstream skills, scripts, templates, references, and MCP servers.
+This is an independent, unofficial adaptation. Microsoft remains the author and
+copyright holder of the upstream content.
 
 ## Included plugins
 
@@ -23,44 +23,11 @@ upstream skills, scripts, templates, references, and MCP servers.
 | `mobile-app` | 28 | Build Expo and React Native Power Apps |
 | `power-automate` | 10 | Build, edit, publish, run, and debug cloud flows |
 
-Total: **96 Codex skills**.
+**Total: 7 plugins and 96 skill definitions.**
 
-## Codex-specific changes
+## Installation
 
-- Added `.codex-plugin/plugin.json` to every plugin.
-- Added a repository marketplace at `.agents/plugins/marketplace.json`.
-- Added Codex-native `.codex.mcp.json` adapters. The upstream `.mcp.json`
-  files remain available for Claude Code and GitHub Copilot CLI.
-- Added a Node.js 22 compatibility fix to the bundled Power Automate FlowAgent
-  launcher.
-- Corrected one invalid YAML frontmatter entry in the mobile app skills.
-- Hard-disabled Power Pages 1DS telemetry and removed the upstream production
-  instrumentation keys from this distribution.
-- Added local and CI validation without adding runtime dependencies.
-
-This repository is not an official Microsoft Codex distribution. Microsoft is
-the author and copyright holder of the upstream content; see `NOTICE.md` and
-`LICENSE`.
-
-## Requirements
-
-- Codex CLI with plugin support
-- Node.js 18 or newer
-- Power Platform CLI (`pac`) for Power Platform operations
-- Azure CLI (`az`) for plugins that authenticate through Azure
-- .NET `dnx` for the Canvas Authoring MCP server
-
-Individual plugins can have additional requirements documented in their own
-`README.md`, `AGENTS.md`, or setup skill.
-
-## Install the complete suite
-
-The repository is one marketplace containing all seven Power Platform plugins.
-Use either the native Codex CLI or the universal `plugins` installer. Both
-routes install the complete suite, including its 96 skills and bundled MCP
-servers.
-
-### [Native Codex CLI](https://developers.openai.com/codex/developer-commands#codex-plugin) (recommended)
+### Codex CLI
 
 Add this repository as a Codex marketplace:
 
@@ -68,121 +35,100 @@ Add this repository as a Codex marketplace:
 codex plugin marketplace add LeonardSEO/power-platform-skills-codex
 ```
 
-Codex does not currently have an `install-all` marketplace command. Install the
-complete suite with this single terminal block:
+Install all seven plugins:
 
 ```bash
-for plugin in power-pages model-apps mcp-apps canvas-apps code-apps-preview mobile-app power-automate; do
-  codex plugin add "$plugin@power-platform-skills-codex"
-done
+codex plugin add power-pages@power-platform-skills-codex
+codex plugin add model-apps@power-platform-skills-codex
+codex plugin add mcp-apps@power-platform-skills-codex
+codex plugin add canvas-apps@power-platform-skills-codex
+codex plugin add code-apps-preview@power-platform-skills-codex
+codex plugin add mobile-app@power-platform-skills-codex
+codex plugin add power-automate@power-platform-skills-codex
 ```
 
-PowerShell:
+### Universal installer
 
-```powershell
-codex plugin marketplace add LeonardSEO/power-platform-skills-codex
+Install the complete suite into Codex with one command:
 
-$plugins = @(
-  "power-pages",
-  "model-apps",
-  "mcp-apps",
-  "canvas-apps",
-  "code-apps-preview",
-  "mobile-app",
-  "power-automate"
-)
-
-foreach ($plugin in $plugins) {
-  codex plugin add "$plugin@power-platform-skills-codex"
-}
+```bash
+DO_NOT_TRACK=1 npx plugins@latest add LeonardSEO/power-platform-skills-codex --target codex --scope user --yes
 ```
 
-Confirm that all seven plugins are installed:
+`DO_NOT_TRACK=1` disables the universal installer's anonymous installation
+telemetry. It is separate from this distribution's telemetry safeguards.
+
+Start a new Codex chat or CLI session after installation. Confirm the
+installation with:
 
 ```bash
 codex plugin list
 ```
 
-You can also start `codex`, enter `/plugins`, select the
-`power-platform-skills-codex` marketplace, and inspect the installed entries.
+## Requirements
 
-### [Universal installer](https://www.npmjs.com/package/plugins) (`npx plugins`)
+- Codex CLI with plugin support
+- Node.js 18 or newer
+- Azure CLI (`az`) for Microsoft authentication
+- Power Platform CLI (`pac`) for Power Platform operations
+- .NET `dnx` for the Canvas Authoring MCP server
 
-Install the complete suite into Codex with one command:
+Some plugins have additional setup instructions in their own `README.md`,
+`AGENTS.md`, or setup skill.
 
-```bash
-DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 \
-  npx plugins@latest add LeonardSEO/power-platform-skills-codex \
-  --target codex --scope user --yes
-```
+## Usage
 
-PowerShell:
-
-```powershell
-$env:DISABLE_TELEMETRY = "1"
-$env:DO_NOT_TRACK = "1"
-npx plugins@latest add LeonardSEO/power-platform-skills-codex `
-  --target codex --scope user --yes
-```
-
-To install the complete suite into every supported coding agent detected on the
-machine, omit `--target codex`:
-
-```bash
-DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 \
-  npx plugins@latest add LeonardSEO/power-platform-skills-codex \
-  --scope user --yes
-```
-
-The current `plugins` CLI supports Claude Code, Cursor, Codex, Grok Build, Kimi
-Code, GitHub Copilot CLI, and Visual Studio Code. This repository has been
-verified with `plugins discover`: all seven marketplace entries and their
-skills, agents, hooks, and MCP configurations are detected.
-
-`DISABLE_TELEMETRY` and `DO_NOT_TRACK` disable the installer's anonymous usage
-telemetry. They are separate from the plugin-level telemetry hard-off described
-below.
-
-Start a new Codex chat or CLI session after installation so the new skills and
-MCP tools are loaded.
-
-## Example prompts
+Build and publish a Power Automate cloud flow:
 
 ```text
 Use power-automate:build-flow to build and publish a complete cloud flow.
 ```
 
+Create a React and Vite Power Apps code app:
+
 ```text
 Use code-apps-preview:create-code-app to create a Power Apps code app.
 ```
+
+Build and deploy a Power Pages site:
 
 ```text
 Use power-pages:create-site to create a Power Pages code site.
 ```
 
-## Telemetry posture
+## Codex compatibility
 
-Telemetry is hard-disabled in this Codex distribution:
+This distribution adds and maintains the Codex-specific integration layer:
 
-- `plugins/power-pages/scripts/lib/telemetry/ikey.json` contains
-  `"disabled": true`.
-- Power Pages telemetry hooks are removed; its non-telemetry validation hook is
-  preserved.
-- Power Automate FlowAgent is forced to telemetry mode `off`, including its
-  otherwise-default local telemetry log.
-- No Microsoft production instrumentation keys or collector URLs are included.
-- `config/telemetry-disabled.json` can be used as an additional global kill
-  switch:
+- `.codex-plugin/plugin.json` manifests for all seven plugins
+- A Codex marketplace at `.agents/plugins/marketplace.json`
+- Direct `.codex.mcp.json` server maps for Codex
+- Original `.mcp.json` files for Claude Code and GitHub Copilot CLI
+- A Node.js 22 and 24 compatibility bootstrap for Power Automate FlowAgent
+- Automatic validation of plugin manifests, skills, MCP configuration, and
+  telemetry safeguards
 
-```bash
-export POWER_PLATFORM_SKILLS_IKEY_JSON="$PWD/config/telemetry-disabled.json"
-export POWER_PLATFORM_SKILLS_TELEMETRY_POWER_PAGES_OPTOUT=1
-```
+### Power Automate FlowAgent
 
-The repository validator fails if telemetry is enabled or if an actual
-instrumentation key or collector URL is added to an active `ikey.json`.
+The bundled FlowAgent MCP server is wired through a dedicated Codex-native MCP
+configuration. Repository validation starts the server, completes the MCP
+`initialize` handshake, requests `tools/list`, and confirms essential tools such
+as `list_flows`, `create_flow`, and `publish_flow`.
 
-## Validate
+## Telemetry
+
+Microsoft Power Platform telemetry is hard-disabled in this distribution:
+
+- Power Pages 1DS telemetry hooks are removed
+- Microsoft production instrumentation keys and collector URLs are removed
+- Power Automate FlowAgent is forced into telemetry mode `off`
+- `config/telemetry-disabled.json` provides a repository-wide kill switch
+- CI fails if telemetry is re-enabled or a production telemetry route returns
+
+These safeguards apply to the installed Power Platform plugins. External tools
+such as the optional `npx plugins` installer have their own telemetry settings.
+
+## Validation
 
 No package installation is required:
 
@@ -190,52 +136,33 @@ No package installation is required:
 npm test
 ```
 
-Validation checks:
+The validation suite checks:
 
-- marketplace structure and all seven entries;
-- all Codex plugin manifests;
-- all 96 skill entrypoints;
-- Codex-native MCP schemas and manifest references;
-- the Power Automate FlowAgent initialize and tool-list handshake under Node.js;
-- the telemetry hard-off contract.
+- All seven marketplace entries and Codex manifests
+- All 96 skill definitions
+- Codex-native MCP schemas and manifest references
+- The FlowAgent MCP startup, initialization, and tool-list handshake
+- The telemetry hard-off contract
+- Consistency with the recorded Microsoft upstream commit
 
-## Repository layout
-
-```text
-power-platform-skills-codex/
-├── .agents/plugins/marketplace.json
-├── .github/workflows/validate.yml
-├── config/telemetry-disabled.json
-├── plugins/
-│   ├── canvas-apps/
-│   ├── code-apps-preview/
-│   ├── mcp-apps/
-│   ├── mobile-app/
-│   ├── model-apps/
-│   ├── power-automate/
-│   └── power-pages/
-├── scripts/validate-repository.mjs
-├── azure-pipelines.yml
-└── package.json
-```
-
-## Updating from Microsoft upstream
+## Microsoft upstream synchronization
 
 The scheduled [Sync Microsoft upstream](.github/workflows/sync-upstream.yml)
-GitHub Action checks `microsoft/power-platform-skills@main` every Monday. When
-Microsoft changes the source, the workflow:
+workflow checks `microsoft/power-platform-skills@main` every Monday. When the
+upstream repository changes, the workflow:
 
-- synchronizes additions, edits, and deletions;
-- reapplies the Codex manifests and compatibility fixes;
-- keeps telemetry hard-disabled and strips production telemetry routing;
-- refreshes plugin versions and skill counts;
-- runs the full validation suite;
-- opens or updates a pull request and squash-merges it after validation passes.
+1. Synchronizes upstream additions, edits, and deletions.
+2. Reapplies the Codex manifests, MCP adapters, and compatibility fixes.
+3. Keeps telemetry hard-disabled.
+4. Refreshes plugin versions and skill counts.
+5. Runs the complete validation suite.
+6. Opens or updates a pull request and squash-merges it after validation.
 
-The workflow can also be started manually from the GitHub Actions tab. See
-[`UPSTREAM.md`](UPSTREAM.md) for the exact mappings and local sync command.
+See [`UPSTREAM.md`](UPSTREAM.md) for the plugin mappings and local synchronization
+procedure.
 
 ## License
 
 The upstream source is licensed under the MIT License. The original Microsoft
-copyright and license notice are preserved in [`LICENSE`](LICENSE).
+copyright and license notice are preserved in [`LICENSE`](LICENSE). See
+[`NOTICE.md`](NOTICE.md) for attribution and adaptation details.
