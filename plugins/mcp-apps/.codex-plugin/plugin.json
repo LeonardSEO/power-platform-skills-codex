@@ -1,6 +1,6 @@
 {
   "name": "mcp-apps",
-  "version": "1.0.0+codex.4689385b480b",
+  "version": "1.0.0+codex.524eda536067",
   "description": "Generate interactive HTML widgets for MCP tools using the MCP Apps protocol.",
   "author": {
     "name": "LeonardSEO",
