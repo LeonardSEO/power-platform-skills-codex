@@ -103,9 +103,12 @@ function applyPowerAutomateFlowDesign() {
     if (!skill.includes(insertionPoint)) {
       fail(`${skillName} is missing the flow-design insertion point`);
     }
+    const designInstructions = skillName === "build-flow"
+      ? `Follow [flow-readability.md](../../references/flow-readability.md) and apply these rules directly when building the flow:\n\n${guide.replace(/^# [^\n]+\n\n/, "")}`
+      : "For Dutch customer handover, follow [flow-readability.md](../../references/flow-readability.md) when designing and reviewing the flow. Visible, explainable business steps take priority over action count, template compactness, and generation speed. A complex expression is acceptable inside a block with one clear purpose.\n";
     skill = skill.replace(
       insertionPoint,
-      `${heading}\n\nFor Dutch customer handover, follow [flow-readability.md](../../references/flow-readability.md) when designing and reviewing the flow. Visible, explainable business steps take priority over action count, template compactness, and generation speed. A complex expression is acceptable inside a block with one clear purpose.\n\n${insertionPoint}`,
+      `${heading}\n\n${designInstructions}\n${insertionPoint}`,
     );
     if (skillName === "build-flow") {
       skill = skill.replace(

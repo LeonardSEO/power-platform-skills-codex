@@ -283,6 +283,12 @@ for (const skillName of ["build-flow", "create-flow"]) {
   if (!skill.includes("../../references/flow-readability.md")) {
     fail(`${skillName} does not require the customer-readable flow design guide`);
   }
+  if (
+    skillName === "build-flow" &&
+    !skill.includes("Geef de flow, acties, voorwaarden, lussen en scopes duidelijke Nederlandse")
+  ) {
+    fail("build-flow is missing the Dutch per-action design rules");
+  }
   if (skill.includes("fewer than 8 tool calls")) {
     fail(`${skillName} still prioritizes generation speed over readability`);
   }
