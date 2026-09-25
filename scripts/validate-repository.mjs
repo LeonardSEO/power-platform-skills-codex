@@ -269,6 +269,16 @@ const flowDesign = readFileSync(
   join(repositoryRoot, "config", "power-automate-flow-design.md"),
   "utf8",
 );
+for (const path of [
+  "references/custom-connectors.md",
+  "skills/build-custom-connector/SKILL.md",
+]) {
+  const source = join(repositoryRoot, "config", "power-automate-overrides", path);
+  const target = join(powerAutomateRoot, path);
+  if (readFileSync(source, "utf8") !== readFileSync(target, "utf8")) {
+    fail(`Power Automate custom connector overlay differs: ${path}`);
+  }
+}
 if (
   readFileSync(join(powerAutomateRoot, "references", "flow-readability.md"), "utf8") !==
   flowDesign
@@ -283,6 +293,12 @@ for (const skillName of ["build-flow", "create-flow"]) {
   if (!skill.includes("../../references/flow-readability.md")) {
     fail(`${skillName} does not require the customer-readable flow design guide`);
   }
+  if (!skill.includes("../../references/custom-connectors.md")) {
+    fail(`${skillName} does not require custom connector discovery`);
+  }
+  if (!skill.includes("WebSearch, WebFetch")) {
+    fail(`${skillName} cannot search connector examples on the web`);
+  }
   if (
     skillName === "build-flow" &&
     !skill.includes("Geef de flow, acties, voorwaarden, lussen en scopes duidelijke Nederlandse")
@@ -292,6 +308,12 @@ for (const skillName of ["build-flow", "create-flow"]) {
   if (skill.includes("fewer than 8 tool calls")) {
     fail(`${skillName} still prioritizes generation speed over readability`);
   }
+}
+if (
+  readFileSync(join(powerAutomateRoot, "skills", "build-flow", "SKILL.md"), "utf8")
+    .includes("prefer the **AI Builder prompt** pattern")
+) {
+  fail("build-flow still forces AI Builder over the user's Foundry preference");
 }
 const powerAutomateMcp = readJson(
   join(powerAutomateRoot, ".codex.mcp.json"),

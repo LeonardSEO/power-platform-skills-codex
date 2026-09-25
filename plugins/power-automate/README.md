@@ -58,3 +58,7 @@ error if the bundle is missing. That file is a single self-contained ESM bundle
 
 Auth uses Azure CLI (`az login`) plus MSAL for connectivity endpoints — see
 `CLAUDE.md` and `references/connection-patterns.md` in this folder.
+
+## Custom connectors for flows
+
+The [build-custom-connector skill](skills/build-custom-connector/SKILL.md) discovers existing connectors and Microsoft's [example folders](https://github.com/microsoft/PowerPlatformConnectors/tree/dev/custom-connectors), then prepares a connector from OpenAPI when needed. `build-flow` and `create-flow` check connector options before choosing AI Builder or HTTP actions.

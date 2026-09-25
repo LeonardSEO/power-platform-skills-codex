@@ -51,7 +51,9 @@ npm run sync:upstream -- /absolute/path/to/power-platform-skills \
 
 This imports only `plugins/power-automate`, restores the Codex FlowAgent MCP
 launcher and telemetry settings, and reapplies the Dutch flow design guide to
-`build-flow` and `create-flow`. The selected upstream commit is recorded on the
+`build-flow` and `create-flow`. It also restores custom connector discovery and
+the `build-custom-connector` skill from `config/power-automate-overrides/`.
+The selected upstream commit is recorded on the
 Power Automate entry in `config/plugin-inventory.json`. The repository-wide
 commit in `.upstream/power-platform-skills.json` still identifies the last
 complete marketplace sync.
@@ -76,7 +78,8 @@ The synchronization scripts preserve or regenerate:
 - `.upstream/power-platform-skills.json`;
 - README skill counts.
 - the Power Automate flow design rules from
-  `config/power-automate-flow-design.md`.
+  `config/power-automate-flow-design.md` and the custom connector overlays from
+  `config/power-automate-overrides/`.
 
 If Microsoft adds or removes a marketplace plugin, synchronization fails
 intentionally. Review that plugin and extend both mappings before accepting it.

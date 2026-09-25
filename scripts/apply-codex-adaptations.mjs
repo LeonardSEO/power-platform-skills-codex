@@ -1,5 +1,6 @@
 import {
   existsSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   writeFileSync,
@@ -83,9 +84,11 @@ function applyPowerAutomateFlowDesign() {
   const pluginRoot = join(repositoryRoot, "plugins", "power-automate");
   const pluginReadmePath = join(pluginRoot, "README.md");
   const pluginReadme = readFileSync(pluginReadmePath, "utf8");
+  const connectorReadme = "## Custom connectors for flows\n\nThe [build-custom-connector skill](skills/build-custom-connector/SKILL.md) discovers existing connectors and Microsoft's [example folders](https://github.com/microsoft/PowerPlatformConnectors/tree/dev/custom-connectors), then prepares a connector from OpenAPI when needed. `build-flow` and `create-flow` check connector options before choosing AI Builder or HTTP actions.\n";
   writeFileSync(
     pluginReadmePath,
-    pluginReadme.replace("It needs only Node.js 18+", "It needs Node.js 20+"),
+    pluginReadme.replace("It needs only Node.js 18+", "It needs Node.js 20+") +
+      (pluginReadme.includes("## Custom connectors for flows") ? "" : `\n${connectorReadme}`),
     "utf8",
   );
   const guide = readFileSync(
@@ -93,12 +96,32 @@ function applyPowerAutomateFlowDesign() {
     "utf8",
   );
   writeFileSync(join(pluginRoot, "references", "flow-readability.md"), guide);
+  for (const path of [
+    "references/custom-connectors.md",
+    "skills/build-custom-connector/SKILL.md",
+  ]) {
+    const target = join(pluginRoot, path);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(
+      target,
+      readFileSync(join(repositoryRoot, "config", "power-automate-overrides", path), "utf8"),
+      "utf8",
+    );
+  }
 
   for (const skillName of ["build-flow", "create-flow"]) {
     const skillPath = join(pluginRoot, "skills", skillName, "SKILL.md");
     let skill = readFileSync(skillPath, "utf8");
     const heading = "## Customer-readable flow design";
     if (skill.includes(heading)) continue;
+    const baseTools = "allowed-tools: Bash, Read, Write, Glob, Grep,";
+    if (!skill.includes(baseTools)) {
+      fail(`${skillName} tool list changed upstream; review web discovery access`);
+    }
+    skill = skill.replace(
+      baseTools,
+      "allowed-tools: Bash, Read, Write, Glob, Grep, WebSearch, WebFetch,",
+    );
     const insertionPoint = skillName === "build-flow" ? "## Critical Rules" : "## Steps";
     if (!skill.includes(insertionPoint)) {
       fail(`${skillName} is missing the flow-design insertion point`);
@@ -106,9 +129,10 @@ function applyPowerAutomateFlowDesign() {
     const designInstructions = skillName === "build-flow"
       ? `Follow [flow-readability.md](../../references/flow-readability.md) and apply these rules directly when building the flow:\n\n${guide.replace(/^# [^\n]+\n\n/, "")}`
       : "For Dutch customer handover, follow [flow-readability.md](../../references/flow-readability.md) when designing and reviewing the flow. Visible, explainable business steps take priority over action count, template compactness, and generation speed. A complex expression is acceptable inside a block with one clear purpose.\n";
+    const connectorInstructions = "## Custom connector discovery\n\nBefore selecting actions, actively search the chosen environment and the official example folders as described in [custom-connectors.md](../../references/custom-connectors.md). Compare existing actions, custom connectors, and a new connector when they can make the flow clearer. If the user prefers Microsoft Foundry/Azure OpenAI pay-as-you-go, preserve that choice rather than silently using AI Builder credits. Use `build-custom-connector` to prepare a missing connector; FlowAgent cannot create one.\n\n";
     skill = skill.replace(
       insertionPoint,
-      `${heading}\n\n${designInstructions}\n${insertionPoint}`,
+      `${heading}\n\n${designInstructions}\n${connectorInstructions}${insertionPoint}`,
     );
     if (skillName === "build-flow") {
       skill = skill.replace(
@@ -118,6 +142,14 @@ function applyPowerAutomateFlowDesign() {
       skill = skill.replace(
         "This is the fastest path.",
         "Review and restructure the template for readability before creating the flow.",
+      );
+      const aiBuilderDefault = "When the user asks for AI/GPT/LLM/summarize/prompt functionality, prefer the **AI Builder prompt** pattern over raw HTTP calls to Azure OpenAI. It uses Copilot credits and requires no API keys.";
+      if (!skill.includes(aiBuilderDefault)) {
+        fail("build-flow AI Builder default changed upstream; review the connector choice rule");
+      }
+      skill = skill.replace(
+        aiBuilderDefault,
+        "When the user asks for AI/GPT/LLM/summarize/prompt functionality, follow custom connector discovery first. AI Builder is an option when the user wants Copilot credits and has the required prompt and licensing. When the user specifies Microsoft Foundry/Azure OpenAI pay-as-you-go, look for an existing or reusable custom connector and prepare one if needed; do not substitute AI Builder. Verify the target API, model, credentials, licensing, and usage billing before creating the flow.",
       );
     }
     writeFileSync(skillPath, skill);
@@ -177,6 +209,7 @@ if (scope === "power-automate") {
   writeJson(mcpPath, mcp);
   writeJson(join(pluginRoot, ".codex.mcp.json"), createCodexMcpConfig(scope, mcp));
 
+  applyPowerAutomateFlowDesign();
   const inventoryPath = join(repositoryRoot, "config", "plugin-inventory.json");
   const inventory = readJson(inventoryPath);
   const previousSkills = inventory.plugins?.[scope]?.skills;
@@ -207,7 +240,6 @@ if (scope === "power-automate") {
       ),
     "utf8",
   );
-  applyPowerAutomateFlowDesign();
   console.log(`Applied Codex adaptations for ${scope} from ${upstreamCommit.slice(0, 12)}.`);
   process.exit(0);
 }
@@ -235,6 +267,7 @@ if (missingPlugins.length) {
 }
 
 const shortCommit = upstreamCommit.slice(0, 12);
+applyPowerAutomateFlowDesign();
 const inventory = {
   generatedFrom: {
     repository: "microsoft/power-platform-skills",
@@ -439,8 +472,6 @@ readme = readme.replace(
   `**Total: ${pluginMappings.size} plugins and ${inventory.totalSkills} skill definitions.**`,
 );
 writeFileSync(readmePath, readme, "utf8");
-
-applyPowerAutomateFlowDesign();
 
 console.log(
   `Applied Codex adaptations for upstream ${shortCommit}: ` +

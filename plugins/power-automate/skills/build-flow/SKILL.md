@@ -4,7 +4,7 @@ description: Autonomously build a complete Power Automate flow from a descriptio
 user-invocable: true
 argument-hint: "<description>"
 context: fork
-allowed-tools: Bash, Read, Write, Glob, Grep, mcp__flowagent__list_environments, mcp__flowagent__set_current_env, mcp__flowagent__get_current_env, mcp__flowagent__resolve_environment, mcp__flowagent__list_flows, mcp__flowagent__get_flow, mcp__flowagent__create_flow, mcp__flowagent__update_flow, mcp__flowagent__edit_flow, mcp__flowagent__copy_flow, mcp__flowagent__publish_flow, mcp__flowagent__disable_flow, mcp__flowagent__delete_flow, mcp__flowagent__run_flow, mcp__flowagent__get_run_history, mcp__flowagent__get_run_details, mcp__flowagent__get_run_actions, mcp__flowagent__get_run_action_repetitions, mcp__flowagent__cancel_run, mcp__flowagent__cancel_all_runs, mcp__flowagent__resubmit_run, mcp__flowagent__diagnose_run, mcp__flowagent__list_connections, mcp__flowagent__list_connectors, mcp__flowagent__get_connector, mcp__flowagent__search_operations, mcp__flowagent__get_operation_details, mcp__flowagent__pick_or_create_connection, mcp__flowagent__resolve_refs, mcp__flowagent__resolve_params, mcp__flowagent__scaffold_flow, mcp__flowagent__list_templates, mcp__flowagent__validate_flow, mcp__flowagent__preflight_flow, mcp__flowagent__smoke_test, mcp__flowagent__get_expression_help, mcp__flowagent__list_desktop_flows, mcp__flowagent__list_machine_groups, mcp__flowagent__run_desktop_flow, mcp__flowagent__get_flow_context, mcp__flowagent__set_current_flow, mcp__flowagent__clear_current_flow, mcp__flowagent__invoke_operation, mcp__flowagent__get_past_trigger_inputs, mcp__flowagent__test_connection, mcp__flowagent__fix_connection, mcp__flowagent__delete_connection, mcp__flowagent__preview_update, mcp__flowagent__get_backup, mcp__flowagent__list_backups, mcp__flowagent__restore_backup, mcp__flowagent__list_trigger_emulators, mcp__flowagent__resolve_entity, mcp__flowagent__list_datasets, mcp__flowagent__list_tables, mcp__flowagent__whoami, mcp__flowagent__doctor, mcp__flowagent__reconnect, mcp__flowagent__list_accounts, mcp__flowagent__switch_account
+allowed-tools: Bash, Read, Write, Glob, Grep, WebSearch, WebFetch, mcp__flowagent__list_environments, mcp__flowagent__set_current_env, mcp__flowagent__get_current_env, mcp__flowagent__resolve_environment, mcp__flowagent__list_flows, mcp__flowagent__get_flow, mcp__flowagent__create_flow, mcp__flowagent__update_flow, mcp__flowagent__edit_flow, mcp__flowagent__copy_flow, mcp__flowagent__publish_flow, mcp__flowagent__disable_flow, mcp__flowagent__delete_flow, mcp__flowagent__run_flow, mcp__flowagent__get_run_history, mcp__flowagent__get_run_details, mcp__flowagent__get_run_actions, mcp__flowagent__get_run_action_repetitions, mcp__flowagent__cancel_run, mcp__flowagent__cancel_all_runs, mcp__flowagent__resubmit_run, mcp__flowagent__diagnose_run, mcp__flowagent__list_connections, mcp__flowagent__list_connectors, mcp__flowagent__get_connector, mcp__flowagent__search_operations, mcp__flowagent__get_operation_details, mcp__flowagent__pick_or_create_connection, mcp__flowagent__resolve_refs, mcp__flowagent__resolve_params, mcp__flowagent__scaffold_flow, mcp__flowagent__list_templates, mcp__flowagent__validate_flow, mcp__flowagent__preflight_flow, mcp__flowagent__smoke_test, mcp__flowagent__get_expression_help, mcp__flowagent__list_desktop_flows, mcp__flowagent__list_machine_groups, mcp__flowagent__run_desktop_flow, mcp__flowagent__get_flow_context, mcp__flowagent__set_current_flow, mcp__flowagent__clear_current_flow, mcp__flowagent__invoke_operation, mcp__flowagent__get_past_trigger_inputs, mcp__flowagent__test_connection, mcp__flowagent__fix_connection, mcp__flowagent__delete_connection, mcp__flowagent__preview_update, mcp__flowagent__get_backup, mcp__flowagent__list_backups, mcp__flowagent__restore_backup, mcp__flowagent__list_trigger_emulators, mcp__flowagent__resolve_entity, mcp__flowagent__list_datasets, mcp__flowagent__list_tables, mcp__flowagent__whoami, mcp__flowagent__doctor, mcp__flowagent__reconnect, mcp__flowagent__list_accounts, mcp__flowagent__switch_account
 model: opus
 ---
 
@@ -82,6 +82,10 @@ Bijvoorbeeld bij mailbijlagen: `Doorloop_de_bijlagen` →
 `Controleer_of_bijlage_een_PDF_is` → `Sla_de_PDF_op` →
 `Leg_het_resultaat_vast`. De werkelijke acties hangen af van de connector en
 de gewenste uitkomst.
+
+## Custom connector discovery
+
+Before selecting actions, actively search the chosen environment and the official example folders as described in [custom-connectors.md](../../references/custom-connectors.md). Compare existing actions, custom connectors, and a new connector when they can make the flow clearer. If the user prefers Microsoft Foundry/Azure OpenAI pay-as-you-go, preserve that choice rather than silently using AI Builder credits. Use `build-custom-connector` to prepare a missing connector; FlowAgent cannot create one.
 
 ## Critical Rules
 
@@ -161,7 +165,7 @@ validated function reference. Common patterns:
 
 ## AI Builder Prompt Actions
 
-When the user asks for AI/GPT/LLM/summarize/prompt functionality, prefer the **AI Builder prompt** pattern over raw HTTP calls to Azure OpenAI. It uses Copilot credits and requires no API keys.
+When the user asks for AI/GPT/LLM/summarize/prompt functionality, follow custom connector discovery first. AI Builder is an option when the user wants Copilot credits and has the required prompt and licensing. When the user specifies Microsoft Foundry/Azure OpenAI pay-as-you-go, look for an existing or reusable custom connector and prepare one if needed; do not substitute AI Builder. Verify the target API, model, credentials, licensing, and usage billing before creating the flow.
 
 **Two approaches:**
 

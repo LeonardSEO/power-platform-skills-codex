@@ -21,9 +21,9 @@ copyright holder of the upstream content.
 | `canvas-apps` | 4 | Author Canvas Apps through the Canvas Authoring MCP server |
 | `code-apps-preview` | 15 | Build React and Vite Power Apps code apps |
 | `mobile-app` | 28 | Build Expo and React Native Power Apps |
-| `power-automate` | 10 | Build, edit, publish, run, and debug cloud flows |
+| `power-automate` | 11 | Build, edit, publish, run, and debug cloud flows |
 
-**Total: 7 plugins and 96 skill definitions.**
+**Total: 7 plugins and 97 skill definitions.**
 
 ## Installation
 
@@ -136,6 +136,12 @@ explainable action. Action count and generation speed do not take priority over
 readability. Complex expressions remain possible inside an action with one
 clear purpose.
 
+For API and AI flows, the skills also [search for custom connectors](config/power-automate-overrides/references/custom-connectors.md)
+in the target environment and Microsoft's example folders. A separate
+`build-custom-connector` skill prepares a reusable connector from OpenAPI when
+needed. A stated Microsoft Foundry pay-as-you-go preference is preserved;
+connector creation in an environment remains a separate authorized step.
+
 ## Telemetry
 
 Microsoft Power Platform telemetry is hard-disabled in this distribution:
@@ -160,7 +166,7 @@ npm test
 The validation suite checks:
 
 - All seven Codex and Claude Code marketplace entries and manifests
-- All 96 skill definitions
+- All 97 skill definitions
 - Codex- and Claude-native MCP schemas and manifest references
 - The Codex and Claude FlowAgent startup, initialization, and tool-list handshake
 - The telemetry hard-off contract
