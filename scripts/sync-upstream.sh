@@ -5,9 +5,10 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 upstream_root="${1:-}"
 upstream_commit="${2:-}"
+scope="${3:-all}"
 
 if [[ -z "$upstream_root" || -z "$upstream_commit" ]]; then
-  echo "Usage: scripts/sync-upstream.sh <upstream-checkout> <40-char-commit>"
+  echo "Usage: scripts/sync-upstream.sh <upstream-checkout> <40-char-commit> [all|power-automate]"
   exit 2
 fi
 
@@ -18,6 +19,11 @@ fi
 
 if [[ ! "$upstream_commit" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Invalid upstream commit: expected a 40-character lowercase SHA."
+  exit 2
+fi
+
+if [[ "$scope" != "all" && "$scope" != "power-automate" ]]; then
+  echo "Invalid scope: expected all or power-automate."
   exit 2
 fi
 
@@ -41,6 +47,9 @@ plugin_mappings=(
 for mapping in "${plugin_mappings[@]}"; do
   upstream_name="${mapping%%:*}"
   codex_name="${mapping##*:}"
+  if [[ "$scope" != "all" && "$codex_name" != "$scope" ]]; then
+    continue
+  fi
   source_path="$upstream_root/plugins/$upstream_name/"
   destination_path="$repository_root/plugins/$codex_name/"
 
@@ -65,6 +74,7 @@ done
 
 node "$repository_root/scripts/apply-codex-adaptations.mjs" \
   "$upstream_root" \
-  "$upstream_commit"
+  "$upstream_commit" \
+  "$scope"
 
 npm --prefix "$repository_root" test

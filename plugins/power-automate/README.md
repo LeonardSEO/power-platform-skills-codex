@@ -53,7 +53,7 @@ From a Claude Code or GitHub Copilot CLI session:
 loads it from the bundled engine at `server/mcp.mjs` via a small Node bootstrap
 that resolves the plugin's installation directory and reports an actionable
 error if the bundle is missing. That file is a single self-contained ESM bundle
-(stdio transport, all 50+ tools, deps inlined). It needs only Node.js 18+ — no
+(stdio transport, all 50+ tools, deps inlined). It needs Node.js 20+ — no
 `npx`, no published npm package, no remote host.
 
 Auth uses Azure CLI (`az login`) plus MSAL for connectivity endpoints — see

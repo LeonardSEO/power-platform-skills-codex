@@ -42,8 +42,9 @@
     },
     "power-automate": {
       "upstreamPath": "plugins/power-automate",
-      "upstreamVersion": "3.0.1",
-      "codexVersion": "3.0.1+codex.524eda536067",
+      "upstreamVersion": "3.1.0",
+      "codexVersion": "3.1.0+codex.68788a24bd47",
+      "upstreamCommit": "68788a24bd47056e5cca49a4fc5a0382ff612afe",
       "skills": 10
     }
   },

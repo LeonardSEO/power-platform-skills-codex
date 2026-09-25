@@ -4,7 +4,7 @@ description: Autonomously build a complete Power Automate flow from a descriptio
 user-invocable: true
 argument-hint: "<description>"
 context: fork
-allowed-tools: Bash, Read, Write, Glob, Grep, mcp__flowagent__list_environments, mcp__flowagent__set_current_env, mcp__flowagent__get_current_env, mcp__flowagent__resolve_environment, mcp__flowagent__list_flows, mcp__flowagent__get_flow, mcp__flowagent__create_flow, mcp__flowagent__update_flow, mcp__flowagent__edit_flow, mcp__flowagent__copy_flow, mcp__flowagent__publish_flow, mcp__flowagent__disable_flow, mcp__flowagent__delete_flow, mcp__flowagent__run_flow, mcp__flowagent__get_run_history, mcp__flowagent__get_run_details, mcp__flowagent__get_run_actions, mcp__flowagent__get_run_action_repetitions, mcp__flowagent__cancel_run, mcp__flowagent__cancel_all_runs, mcp__flowagent__resubmit_run, mcp__flowagent__diagnose_run, mcp__flowagent__list_connections, mcp__flowagent__list_connectors, mcp__flowagent__get_connector, mcp__flowagent__search_operations, mcp__flowagent__get_operation_details, mcp__flowagent__pick_or_create_connection, mcp__flowagent__resolve_refs, mcp__flowagent__resolve_params, mcp__flowagent__scaffold_flow, mcp__flowagent__list_templates, mcp__flowagent__validate_flow, mcp__flowagent__preflight_flow, mcp__flowagent__smoke_test, mcp__flowagent__get_expression_help, mcp__flowagent__list_desktop_flows, mcp__flowagent__list_machine_groups, mcp__flowagent__run_desktop_flow, mcp__flowagent__get_flow_context, mcp__flowagent__set_current_flow, mcp__flowagent__clear_current_flow, mcp__flowagent__invoke_operation, mcp__flowagent__get_past_trigger_inputs, mcp__flowagent__test_connection, mcp__flowagent__fix_connection, mcp__flowagent__delete_connection, mcp__flowagent__preview_update, mcp__flowagent__get_backup, mcp__flowagent__list_backups, mcp__flowagent__restore_backup, mcp__flowagent__list_trigger_emulators, mcp__flowagent__resolve_entity, mcp__flowagent__list_datasets, mcp__flowagent__list_tables
+allowed-tools: Bash, Read, Write, Glob, Grep, mcp__flowagent__list_environments, mcp__flowagent__set_current_env, mcp__flowagent__get_current_env, mcp__flowagent__resolve_environment, mcp__flowagent__list_flows, mcp__flowagent__get_flow, mcp__flowagent__create_flow, mcp__flowagent__update_flow, mcp__flowagent__edit_flow, mcp__flowagent__copy_flow, mcp__flowagent__publish_flow, mcp__flowagent__disable_flow, mcp__flowagent__delete_flow, mcp__flowagent__run_flow, mcp__flowagent__get_run_history, mcp__flowagent__get_run_details, mcp__flowagent__get_run_actions, mcp__flowagent__get_run_action_repetitions, mcp__flowagent__cancel_run, mcp__flowagent__cancel_all_runs, mcp__flowagent__resubmit_run, mcp__flowagent__diagnose_run, mcp__flowagent__list_connections, mcp__flowagent__list_connectors, mcp__flowagent__get_connector, mcp__flowagent__search_operations, mcp__flowagent__get_operation_details, mcp__flowagent__pick_or_create_connection, mcp__flowagent__resolve_refs, mcp__flowagent__resolve_params, mcp__flowagent__scaffold_flow, mcp__flowagent__list_templates, mcp__flowagent__validate_flow, mcp__flowagent__preflight_flow, mcp__flowagent__smoke_test, mcp__flowagent__get_expression_help, mcp__flowagent__list_desktop_flows, mcp__flowagent__list_machine_groups, mcp__flowagent__run_desktop_flow, mcp__flowagent__get_flow_context, mcp__flowagent__set_current_flow, mcp__flowagent__clear_current_flow, mcp__flowagent__invoke_operation, mcp__flowagent__get_past_trigger_inputs, mcp__flowagent__test_connection, mcp__flowagent__fix_connection, mcp__flowagent__delete_connection, mcp__flowagent__preview_update, mcp__flowagent__get_backup, mcp__flowagent__list_backups, mcp__flowagent__restore_backup, mcp__flowagent__list_trigger_emulators, mcp__flowagent__resolve_entity, mcp__flowagent__list_datasets, mcp__flowagent__list_tables, mcp__flowagent__whoami, mcp__flowagent__doctor, mcp__flowagent__reconnect, mcp__flowagent__list_accounts, mcp__flowagent__switch_account
 model: opus
 ---
 
@@ -44,6 +44,10 @@ MCP tools are present.
 | `publish_flow` | Enable the flow |
 | `scaffold_flow` | Generate from a built-in template |
 
+## Customer-readable flow design
+
+For Dutch customer handover, follow [flow-readability.md](../../references/flow-readability.md) when designing and reviewing the flow. Visible, explainable business steps take priority over action count, template compactness, and generation speed. A complex expression is acceptable inside a block with one clear purpose.
+
 ## Critical Rules
 
 1. **ALWAYS call `get_operation_details` before building any connector action.** Never guess parameter names, enum values, or action types. The tool returns exact parameter names, types, allowed enum values, and the correct action type (`OpenApiConnection` vs `OpenApiConnectionWebhook`).
@@ -76,9 +80,9 @@ MCP tools are present.
 
 ## Workflow
 
-**Target: common 2-3 action flows should complete in under 60 seconds / fewer than 8 tool calls.**
+Build as many actions as needed to show the business process clearly in the designer. Do not optimize for a target action count or generation time.
 
-1. **Check for templates FIRST**: Call `list_templates`. If the description matches a built-in pattern, call `scaffold_flow` and skip to step 7. This is the fastest path.
+1. **Check for templates FIRST**: Call `list_templates`. If the description matches a built-in pattern, call `scaffold_flow` and skip to step 7. Review and restructure the template for readability before creating the flow.
 
 2. **Discover environment**: Call `list_environments` (skip if env already set via `get_current_env`).
 

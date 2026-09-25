@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const upstreamRoot = resolve(process.argv[2] || "");
 const upstreamCommit = process.argv[3] || "";
+const scope = process.argv[4] || "all";
 
 const pluginMappings = new Map([
   ["power-pages", "power-pages"],
@@ -78,6 +79,48 @@ function countSkills(pluginRoot) {
   ).length;
 }
 
+function applyPowerAutomateFlowDesign() {
+  const pluginRoot = join(repositoryRoot, "plugins", "power-automate");
+  const pluginReadmePath = join(pluginRoot, "README.md");
+  const pluginReadme = readFileSync(pluginReadmePath, "utf8");
+  writeFileSync(
+    pluginReadmePath,
+    pluginReadme.replace("It needs only Node.js 18+", "It needs Node.js 20+"),
+    "utf8",
+  );
+  const guide = readFileSync(
+    join(repositoryRoot, "config", "power-automate-flow-design.md"),
+    "utf8",
+  );
+  writeFileSync(join(pluginRoot, "references", "flow-readability.md"), guide);
+
+  for (const skillName of ["build-flow", "create-flow"]) {
+    const skillPath = join(pluginRoot, "skills", skillName, "SKILL.md");
+    let skill = readFileSync(skillPath, "utf8");
+    const heading = "## Customer-readable flow design";
+    if (skill.includes(heading)) continue;
+    const insertionPoint = skillName === "build-flow" ? "## Critical Rules" : "## Steps";
+    if (!skill.includes(insertionPoint)) {
+      fail(`${skillName} is missing the flow-design insertion point`);
+    }
+    skill = skill.replace(
+      insertionPoint,
+      `${heading}\n\nFor Dutch customer handover, follow [flow-readability.md](../../references/flow-readability.md) when designing and reviewing the flow. Visible, explainable business steps take priority over action count, template compactness, and generation speed. A complex expression is acceptable inside a block with one clear purpose.\n\n${insertionPoint}`,
+    );
+    if (skillName === "build-flow") {
+      skill = skill.replace(
+        "**Target: common 2-3 action flows should complete in under 60 seconds / fewer than 8 tool calls.**",
+        "Build as many actions as needed to show the business process clearly in the designer. Do not optimize for a target action count or generation time.",
+      );
+      skill = skill.replace(
+        "This is the fastest path.",
+        "Review and restructure the template for readability before creating the flow.",
+      );
+    }
+    writeFileSync(skillPath, skill);
+  }
+}
+
 function upstreamMarketplaceNames() {
   const marketplace = readJson(join(upstreamRoot, "marketplace.json"));
   if (!Array.isArray(marketplace.plugins)) {
@@ -92,6 +135,80 @@ if (!existsSync(join(upstreamRoot, "marketplace.json"))) {
 if (!/^[0-9a-f]{40}$/.test(upstreamCommit)) {
   fail("Upstream commit must be a full lowercase SHA");
 }
+
+if (scope === "power-automate") {
+  if (!upstreamMarketplaceNames().has(scope)) {
+    fail(`Upstream marketplace is missing ${scope}`);
+  }
+
+  const pluginRoot = join(repositoryRoot, "plugins", scope);
+  const upstreamManifest = readJson(
+    join(upstreamRoot, "plugins", scope, ".plugin", "plugin.json"),
+  );
+  const upstreamVersion = String(upstreamManifest.version || "").split("+")[0];
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(upstreamVersion)) {
+    fail(`Upstream ${scope} has invalid SemVer: ${upstreamVersion}`);
+  }
+
+  const codexManifestPath = join(pluginRoot, ".codex-plugin", "plugin.json");
+  const codexManifest = readJson(codexManifestPath);
+  if (codexManifest.name !== scope) fail(`Codex manifest name mismatch for ${scope}`);
+  codexManifest.version = `${upstreamVersion}+codex.${upstreamCommit.slice(0, 12)}`;
+  codexManifest.mcpServers = "./.codex.mcp.json";
+  writeJson(codexManifestPath, codexManifest);
+
+  const mcpPath = join(pluginRoot, ".mcp.json");
+  const mcp = readJson(mcpPath);
+  const flowAgent = mcp.mcpServers?.flowagent;
+  if (!Array.isArray(flowAgent?.args) || typeof flowAgent.args[1] !== "string") {
+    fail("Power Automate FlowAgent bootstrap is missing");
+  }
+  if (!flowAgent.args[1].includes("globalThis.require=require")) {
+    flowAgent.args[1] = `globalThis.require=require;${flowAgent.args[1]}`;
+  }
+  flowAgent.env = {
+    ...flowAgent.env,
+    FLOWAGENT_TELEMETRY: "off",
+    POWER_PLATFORM_SKILLS_TELEMETRY: "off",
+  };
+  writeJson(mcpPath, mcp);
+  writeJson(join(pluginRoot, ".codex.mcp.json"), createCodexMcpConfig(scope, mcp));
+
+  const inventoryPath = join(repositoryRoot, "config", "plugin-inventory.json");
+  const inventory = readJson(inventoryPath);
+  const previousSkills = inventory.plugins?.[scope]?.skills;
+  if (!Number.isInteger(previousSkills)) fail(`Inventory is missing ${scope}`);
+  const skills = countSkills(pluginRoot);
+  inventory.plugins[scope] = {
+    upstreamPath: `plugins/${scope}`,
+    upstreamVersion,
+    codexVersion: codexManifest.version,
+    upstreamCommit,
+    skills,
+  };
+  inventory.totalSkills += skills - previousSkills;
+  writeJson(inventoryPath, inventory);
+
+  const readmePath = join(repositoryRoot, "README.md");
+  const readme = readFileSync(readmePath, "utf8");
+  if (!/\| `power-automate` \| \d+ \|/.test(readme)) {
+    fail("README power-automate table row was not found");
+  }
+  writeFileSync(
+    readmePath,
+    readme
+      .replace(/(\| `power-automate` \| )\d+( \|)/, `$1${skills}$2`)
+      .replace(
+        /\*\*Total: \d+ plugins and \d+ skill definitions\.\*\*/,
+        `**Total: ${Object.keys(inventory.plugins).length} plugins and ${inventory.totalSkills} skill definitions.**`,
+      ),
+    "utf8",
+  );
+  applyPowerAutomateFlowDesign();
+  console.log(`Applied Codex adaptations for ${scope} from ${upstreamCommit.slice(0, 12)}.`);
+  process.exit(0);
+}
+if (scope !== "all") fail(`Unsupported sync scope: ${scope}`);
 
 const mappedMarketplaceNames = new Set(pluginMappings.keys());
 const discoveredUpstreamNames = upstreamMarketplaceNames();
@@ -319,6 +436,8 @@ readme = readme.replace(
   `**Total: ${pluginMappings.size} plugins and ${inventory.totalSkills} skill definitions.**`,
 );
 writeFileSync(readmePath, readme, "utf8");
+
+applyPowerAutomateFlowDesign();
 
 console.log(
   `Applied Codex adaptations for upstream ${shortCommit}: ` +

@@ -40,6 +40,22 @@ npm run sync:upstream -- /absolute/path/to/power-platform-skills \
 
 Review the diff and run `npm test` before committing.
 
+To update only Power Automate while another upstream plugin is awaiting
+mapping review, pass `power-automate` as the third argument:
+
+```bash
+npm run sync:upstream -- /absolute/path/to/power-platform-skills \
+  "$(git -C /absolute/path/to/power-platform-skills rev-parse HEAD)" \
+  power-automate
+```
+
+This imports only `plugins/power-automate`, restores the Codex FlowAgent MCP
+launcher and telemetry settings, and reapplies the Dutch flow design guide to
+`build-flow` and `create-flow`. The selected upstream commit is recorded on the
+Power Automate entry in `config/plugin-inventory.json`. The repository-wide
+commit in `.upstream/power-platform-skills.json` still identifies the last
+complete marketplace sync.
+
 ## Mapping and preservation rules
 
 The renamed Codex destinations are:
@@ -59,6 +75,8 @@ The synchronization scripts preserve or regenerate:
 - `config/plugin-inventory.json`;
 - `.upstream/power-platform-skills.json`;
 - README skill counts.
+- the Power Automate flow design rules from
+  `config/power-automate-flow-design.md`.
 
 If Microsoft adds or removes a marketplace plugin, synchronization fails
 intentionally. Review that plugin and extend both mappings before accepting it.

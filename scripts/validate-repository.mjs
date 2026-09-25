@@ -265,6 +265,28 @@ if (globalKillSwitch.disabled !== true) {
 }
 
 const powerAutomateRoot = join(repositoryRoot, "plugins", "power-automate");
+const flowDesign = readFileSync(
+  join(repositoryRoot, "config", "power-automate-flow-design.md"),
+  "utf8",
+);
+if (
+  readFileSync(join(powerAutomateRoot, "references", "flow-readability.md"), "utf8") !==
+  flowDesign
+) {
+  fail("Power Automate flow design guide was not restored after sync");
+}
+for (const skillName of ["build-flow", "create-flow"]) {
+  const skill = readFileSync(
+    join(powerAutomateRoot, "skills", skillName, "SKILL.md"),
+    "utf8",
+  );
+  if (!skill.includes("../../references/flow-readability.md")) {
+    fail(`${skillName} does not require the customer-readable flow design guide`);
+  }
+  if (skill.includes("fewer than 8 tool calls")) {
+    fail(`${skillName} still prioritizes generation speed over readability`);
+  }
+}
 const powerAutomateMcp = readJson(
   join(powerAutomateRoot, ".codex.mcp.json"),
 );
@@ -371,7 +393,9 @@ function validateFlowAgent(bootstrapSource, rootEnvironment, clientName) {
   const toolNames = new Set(
     (toolsResponse?.result?.tools || []).map((tool) => tool.name),
   );
-  for (const requiredTool of ["list_flows", "create_flow", "publish_flow"]) {
+  for (const requiredTool of [
+    "list_flows", "create_flow", "publish_flow", "list_accounts", "switch_account",
+  ]) {
     if (!toolNames.has(requiredTool)) {
       fail(
         `${clientName} FlowAgent MCP is missing required tool: ${requiredTool}`,

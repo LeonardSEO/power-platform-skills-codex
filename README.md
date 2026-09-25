@@ -87,6 +87,7 @@ Install the desired plugins from `power-platform-skills-codex`, then run
 
 Some plugins have additional setup instructions in their own `README.md`,
 `AGENTS.md`, or setup skill.
+Power Automate FlowAgent 3.1 requires Node.js 20 or newer.
 
 ## Usage
 
@@ -128,6 +129,13 @@ configuration. Repository validation starts the server, completes the MCP
 `initialize` handshake, requests `tools/list`, and confirms essential tools such
 as `list_flows`, `create_flow`, and `publish_flow`.
 
+For flows handed over to Dutch-speaking customers, `build-flow` and
+`create-flow` follow the [flow design guide](config/power-automate-flow-design.md):
+name visible steps in Dutch and show each meaningful business decision as an
+explainable action. Action count and generation speed do not take priority over
+readability. Complex expressions remain possible inside an action with one
+clear purpose.
+
 ## Telemetry
 
 Microsoft Power Platform telemetry is hard-disabled in this distribution:
@@ -157,6 +165,10 @@ The validation suite checks:
 - The Codex and Claude FlowAgent startup, initialization, and tool-list handshake
 - The telemetry hard-off contract
 - Consistency with the recorded Microsoft upstream commit
+
+The Power Automate plugin can also be synchronized separately. Its upstream
+commit is recorded in `config/plugin-inventory.json`; the repository-wide
+commit in `.upstream/power-platform-skills.json` remains the last full sync.
 
 ## Microsoft upstream synchronization
 
