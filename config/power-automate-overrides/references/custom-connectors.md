@@ -5,6 +5,10 @@ the required API as clear, named actions in the Power Automate designer. Do this
 especially for Azure AI, Microsoft Foundry, Azure OpenAI, and APIs that would
 otherwise require repeated HTTP actions or large opaque expressions.
 
+Use the local [example sketches](../examples/custom-connectors/README.md) to
+show what an Azure AI action block or a grouped utilities connector could look
+like. They are illustrative and cannot be imported as connectors.
+
 1. Inspect connectors and operations in the **selected environment** with
    `list_connectors`, `search_operations`, `get_connector`, and
    `get_operation_details`. Check for an existing usable custom connector and

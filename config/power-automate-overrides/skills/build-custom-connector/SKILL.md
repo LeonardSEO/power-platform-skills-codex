@@ -12,6 +12,9 @@ Follow [custom-connectors.md](../../references/custom-connectors.md) to search
 the selected environment and Microsoft's example folders first. An existing
 connector or suitable example can be adapted; do not generate a duplicate by
 default.
+The local [example sketches](../../examples/custom-connectors/README.md)
+illustrate Azure AI/Foundry action blocks and a Symbis Utilities connector;
+they contain no deployable connector definition.
 
 ## Prepare
 

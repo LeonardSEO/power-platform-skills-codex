@@ -272,6 +272,9 @@ const flowDesign = readFileSync(
 for (const path of [
   "references/custom-connectors.md",
   "skills/build-custom-connector/SKILL.md",
+  "examples/custom-connectors/README.md",
+  "examples/custom-connectors/azure-ai-foundry.md",
+  "examples/custom-connectors/symbis-utilities.md",
 ]) {
   const source = join(repositoryRoot, "config", "power-automate-overrides", path);
   const target = join(powerAutomateRoot, path);

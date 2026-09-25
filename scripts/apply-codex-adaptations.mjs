@@ -84,7 +84,7 @@ function applyPowerAutomateFlowDesign() {
   const pluginRoot = join(repositoryRoot, "plugins", "power-automate");
   const pluginReadmePath = join(pluginRoot, "README.md");
   const pluginReadme = readFileSync(pluginReadmePath, "utf8");
-  const connectorReadme = "## Custom connectors for flows\n\nThe [build-custom-connector skill](skills/build-custom-connector/SKILL.md) discovers existing connectors and Microsoft's [example folders](https://github.com/microsoft/PowerPlatformConnectors/tree/dev/custom-connectors), then prepares a connector from OpenAPI when needed. `build-flow` and `create-flow` check connector options before choosing AI Builder or HTTP actions.\n";
+  const connectorReadme = "## Custom connectors for flows\n\nThe [build-custom-connector skill](skills/build-custom-connector/SKILL.md) discovers existing connectors and Microsoft's [example folders](https://github.com/microsoft/PowerPlatformConnectors/tree/dev/custom-connectors), then prepares a connector from OpenAPI when needed. `build-flow` and `create-flow` check connector options before choosing AI Builder or HTTP actions. The local [example sketches](examples/custom-connectors/README.md) show an Azure AI block and Symbis Utilities actions without claiming they are deployable connectors.\n";
   writeFileSync(
     pluginReadmePath,
     pluginReadme.replace("It needs only Node.js 18+", "It needs Node.js 20+") +
@@ -99,6 +99,9 @@ function applyPowerAutomateFlowDesign() {
   for (const path of [
     "references/custom-connectors.md",
     "skills/build-custom-connector/SKILL.md",
+    "examples/custom-connectors/README.md",
+    "examples/custom-connectors/azure-ai-foundry.md",
+    "examples/custom-connectors/symbis-utilities.md",
   ]) {
     const target = join(pluginRoot, path);
     mkdirSync(dirname(target), { recursive: true });

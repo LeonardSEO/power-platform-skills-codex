@@ -141,6 +141,9 @@ in the target environment and Microsoft's example folders. A separate
 `build-custom-connector` skill prepares a reusable connector from OpenAPI when
 needed. A stated Microsoft Foundry pay-as-you-go preference is preserved;
 connector creation in an environment remains a separate authorized step.
+The [example sketches](config/power-automate-overrides/examples/custom-connectors/README.md)
+show an Azure AI action block and a grouped Symbis Utilities connector without
+bundling a customer endpoint or a deployable connector.
 
 ## Telemetry
 

@@ -61,4 +61,4 @@ Auth uses Azure CLI (`az login`) plus MSAL for connectivity endpoints — see
 
 ## Custom connectors for flows
 
-The [build-custom-connector skill](skills/build-custom-connector/SKILL.md) discovers existing connectors and Microsoft's [example folders](https://github.com/microsoft/PowerPlatformConnectors/tree/dev/custom-connectors), then prepares a connector from OpenAPI when needed. `build-flow` and `create-flow` check connector options before choosing AI Builder or HTTP actions.
+The [build-custom-connector skill](skills/build-custom-connector/SKILL.md) discovers existing connectors and Microsoft's [example folders](https://github.com/microsoft/PowerPlatformConnectors/tree/dev/custom-connectors), then prepares a connector from OpenAPI when needed. `build-flow` and `create-flow` check connector options before choosing AI Builder or HTTP actions. The local [example sketches](examples/custom-connectors/README.md) show an Azure AI block and Symbis Utilities actions without claiming they are deployable connectors.
