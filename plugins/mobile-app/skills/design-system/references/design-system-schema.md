@@ -9,9 +9,18 @@ This file documents the exact shape of `brand/design-system.md` that `/design-sy
 ├── brand/
 │   ├── design-system.md     ← this schema
 │   ├── tokens.ts            ← importable Tamagui tokens
+│   ├── tokens.dark.ts       ← optional approved custom-dark palette
 │   ├── design-system.html   ← visual gallery (optional)
 │   └── .history/            ← version snapshots
 ```
+
+`brand/tokens.dark.ts` is optional, not a prerequisite for default dark mode.
+When custom dark is approved, use the named `darkTokens` export and complete
+color contract in
+[Approved dark palette](./tamagui-integration.md#approved-dark-palette-conditional).
+Its presence alone does not authorize wiring it. Refresh and rollback use the
+[snapshot contract](./refresh-flow.md#snapshot-contract) to retain exact spec and
+token contents plus dark artifact presence/absence and approved selection.
 
 ## Full schema
 
@@ -238,35 +247,19 @@ Missing sections → skill surfaces error, asks user to re-run.
 
 ## How Tamagui Integration Uses tokens.ts
 
-`brand/tokens.ts` is a plain TypeScript export. `/create-mobile-app` Step 9b imports it into `tamagui.config.ts` using [`tamagui-integration.md`](./tamagui-integration.md) and its `withSemanticAliases` helper:
+`brand/tokens.ts` is a plain TypeScript export. `/create-mobile-app` Step 9b and
+`/edit-app` Step 5 must follow the authoritative
+[`tamagui-integration.md`](./tamagui-integration.md) implementation rather than
+maintaining a second config example here:
 
-```ts
-// CUSTOMIZATION START - DO NOT REMOVE OR RENAME
-import { createTokens } from '@tamagui/core';
-import { animations } from '@tamagui/config/v5-rn';
-import { tokens as brandTokens } from './brand/tokens';
-
-const tokens = createTokens({
-  ...defaultConfig.tokens,
-  space: { ...defaultConfig.tokens.space, ...brandTokens.space },
-  size: { ...defaultConfig.tokens.size, ...brandTokens.size },
-  radius: { ...defaultConfig.tokens.radius, ...brandTokens.radius },
-});
-
-const themes = {
-  ...defaultConfig.themes,
-  light: withSemanticAliases(defaultConfig.themes.light, brandTokens.color),
-  dark: withSemanticAliases(defaultConfig.themes.dark, {
-    primary: brandTokens.color.primary,
-    accent: brandTokens.color.accent,
-  }),
-};
-
-const customConfig = {
-  ...defaultConfig,
-  animations,
-  tokens,
-  themes,
-};
-// CUSTOMIZATION END - DO NOT REMOVE OR RENAME
-```
+- **Default dark:** use [Brand Import](./tamagui-integration.md#brand-import).
+  Keep Config v5 dark surfaces/text with brand accents/statuses; no dark artifact
+  or import is required.
+- **Approved custom dark:** also apply
+  [Approved dark palette](./tamagui-integration.md#approved-dark-palette-conditional).
+  `appDarkTheme` consumes `darkTokens.color`, including approved surfaces/text,
+  instead of the base accent-only override.
+- **Both branches:** apply
+  [Root Provider Wiring](./tamagui-integration.md#root-provider-wiring), mapping
+  the resolved `appDarkTheme` into `brandedDarkTheme`. After rollback, choose the
+  branch from the restored approved state, not a newer plan or file presence.

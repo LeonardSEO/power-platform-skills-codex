@@ -15,6 +15,6 @@
   "scripts": {
     "sync:upstream": "bash scripts/sync-upstream.sh",
     "validate": "node scripts/validate-repository.mjs",
-    "test": "npm run validate"
+    "test": "node --test scripts/tests/*.test.mjs && npm run validate"
   }
 }

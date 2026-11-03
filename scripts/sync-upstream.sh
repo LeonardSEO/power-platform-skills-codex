@@ -42,6 +42,9 @@ plugin_mappings=(
   "code-apps:code-apps-preview"
   "mobile-apps:mobile-app"
   "power-automate:power-automate"
+  "pcf:pcf"
+  "power-apps-mobile-extension:power-apps-mobile-extension"
+  "process-intelligence:process-intelligence"
 )
 
 for mapping in "${plugin_mappings[@]}"; do

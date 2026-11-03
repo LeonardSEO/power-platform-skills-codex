@@ -16,6 +16,9 @@
 //
 // PURE: no I/O, no network. The CLI wrapper (scripts/write-page-plan.js) owns writing the file.
 
+const path = require('node:path');
+const { pageFileProblems } = require('./page-file-targets.js');
+
 // Per-page fields required by references/plan-schema.md -> `## Per-Page Specifications`.
 // Kept as a constant so the tests (and any future validator) assert against one list.
 const REQUIRED_PAGE_FIELDS = [
@@ -95,6 +98,43 @@ function pageFile(p) {
   return existing || `${pageKey(p)}.tsx`;
 }
 
+// Where the plan says a page lives. An intent page is written at pageFile(p). An implemented page is
+// listed for the navigation graph only (no worker writes it), and its codeFile is shown in the one
+// spelling the page-file rule accepts: `pages\home.tsx` and `pages/../pages/report.tsx` — which the
+// spec gate accepts — become `pages/home.tsx` and `pages/report.tsx`, so the plan still passes the
+// schema validator that polices this same rule.
+function normalizePageFile(f) {
+  return path.posix.normalize(String(f).trim().replace(/\\/g, '/'));
+}
+function planFile(p) {
+  const implemented = p.source && p.source.kind === 'tsx' && p.source.codeFile;
+  return implemented ? normalizePageFile(implemented) : pageFile(p);
+}
+
+// The rule is lib/page-file-targets.js, shared with /genpage's pre-dispatch gate and the plan
+// validator. No working directory is passed: this module is PURE, so only the lexical and collision
+// checks run here — the realpath check is I/O and belongs to check-page-files.js, which the genpage
+// flow runs before it dispatches workers. Collisions are named apart because they involve two pages.
+//
+// Only a page a worker will WRITE (an intent page) is held to the whole rule. An implemented page is in
+// the plan for the navigation graph only, and its codeFile already passed the spec gate's own
+// confinement check (codeFileConfined, app-spec.js), which accepts the Windows spelling `pages\home.tsx`
+// — refusing that here blocked /app-builder for a spec the gate had accepted. Implemented files are
+// passed as `built`: normalized, checked first by the lexical rules and for collisions, so a new page is
+// never written over one — but not by the write-target rules, such as the `.tsx` extension.
+function validatePageTargets(pages) {
+  const targets = pages.map((p) => {
+    const implemented = Boolean(p.source && p.source.kind === 'tsx' && p.source.codeFile);
+    return { key: pageKey(p), file: planFile(p), implemented };
+  });
+  const [problem] = pageFileProblems(targets.filter((t) => !t.implemented).map((t) => t.file),
+    { built: targets.filter((t) => t.implemented).map((t) => t.file) });
+  if (!problem) return;
+  if (problem.code === 'collision') throw new Error(`buildPagePlan: case-insensitive page file collision — ${problem.message}`);
+  const owner = targets.find((t) => String(t.file).trim() === problem.file);
+  throw new Error(`buildPagePlan: unsafe page file for "${owner ? owner.key : problem.file}" — ${problem.message}`);
+}
+
 /** Entities a page reads, as the plan's comma-separated logical names (or the literal "mock data").
  *  Logical names flow into `--data-sources` on the generate-types command line, so they are held to
  *  the identifier contract rather than merely escaped. */
@@ -126,9 +166,11 @@ function navTargets(p) {
 // Project the App Spec's `design` contract into the plan's `## Design Preferences` section.
 //
 // The canonical field set is fixed and validated (app-spec.js rejects unknown keys):
-// `accentColor`, `density`, `cornerRadius`, `darkMode`, `layout`. These are the tokens the user
+// `accentColor`, `density`, `cornerRadius`, `darkMode`, `layout`, `style`. The first five are tokens the user
 // approved during authoring, so every generated page must apply them — a page that ignores them is
-// visually inconsistent with the rest of the app and with the model-driven shell.
+// visually inconsistent with the rest of the app and with the model-driven shell. `style` is the maker's own
+// look in words (AB#6320143): it leads the line as `Maker-requested:`, which the page-builder applies instead of
+// the default model-driven look (references/rules.md, "Maker-requested styling"); without it the pages keep that look.
 // Values are sanitised because `design` is author-supplied (and download-derived on an edit).
 function designPreferences(design) {
   const d = design && typeof design === 'object' ? design : {};
@@ -140,13 +182,16 @@ function designPreferences(design) {
   ]
     .filter(([, v]) => v != null && String(v).trim())
     .map(([label, v]) => `${label}: ${mdText(v)}`);
+  const style = typeof d.style === 'string' ? mdText(d.style) : '';
 
   return {
     // Always name Fluent UI V9 — it is the required component library, not a preference — then
     // append the approved tokens so the worker has a single authoritative styling line.
-    styling: tokens.length
-      ? `Fluent UI V9 tokens — ${tokens.join('; ')}`
-      : 'Fluent UI V9 defaults; clean, content-first layout',
+    styling: style
+      ? `Maker-requested: ${style}${tokens.length ? ` (Fluent UI V9 components; also ${tokens.join('; ')})` : ' (Fluent UI V9 components)'}`
+      : tokens.length
+        ? `Fluent UI V9 tokens — ${tokens.join('; ')}`
+        : 'Fluent UI V9 defaults; clean, content-first layout',
     layout: d.layout ? `${mdText(d.layout)} layout, responsive` : null,
     features: 'Search, sorting and filtering where the page lists records',
     accessibility: 'WCAG AA (ARIA labels, keyboard navigation, semantic HTML)',
@@ -163,6 +208,7 @@ function buildPagePlan(spec, opts = {}) {
   const s = spec || {};
   const pages = (s.pages || []).filter(Boolean);
   if (!pages.length) throw new Error('buildPagePlan: the App Spec declares no pages[]');
+  validatePageTargets(pages);
 
   const workingDir = opts.workingDir || '.';
   const pluginRoot = opts.pluginRoot || '${PLUGIN_ROOT}';
@@ -194,7 +240,7 @@ function buildPagePlan(spec, opts = {}) {
   out.push('| Page | Key | File | Purpose | Entities |');
   out.push('|------|-----|------|---------|----------|');
   for (const p of pages) {
-    out.push(`| ${mdText(p.name, pageKey(p))} | ${pageKey(p)} | ${mdText(pageFile(p))} | ${mdText(p.purpose, 'Generative page')} | ${mdText(pageEntities(p))} |`);
+    out.push(`| ${mdText(p.name, pageKey(p))} | ${pageKey(p)} | ${mdText(planFile(p))} | ${mdText(p.purpose, 'Generative page')} | ${mdText(pageEntities(p))} |`);
   }
   out.push('');
 
@@ -215,6 +261,11 @@ function buildPagePlan(spec, opts = {}) {
   // guarantees no connector code is generated here.
   out.push('## Connector Bindings');
   out.push('No connector bindings.', '');
+
+  // /app-builder does not author Custom API calls either. The section is still mandatory: an absent
+  // section means the planner forgot part of the contract, while this exact sentinel means "none".
+  out.push('## Custom API Bindings');
+  out.push('No custom API bindings.', '');
 
   out.push('## Design Preferences');
   out.push(`- Styling: ${design.styling}`);
@@ -242,7 +293,7 @@ function buildPagePlan(spec, opts = {}) {
     const nav = navTargets(p);
     out.push(`### ${mdText(p.name, pageKey(p))}`);
     out.push(`- **Key:** ${pageKey(p)}`);
-    out.push(`- **File:** ${mdText(pageFile(p))}`);
+    out.push(`- **File:** ${mdText(planFile(p))}`);
     out.push(`- **Purpose:** ${mdText(p.purpose, 'Generative page')}`);
     out.push(`- **Entities:** ${mdText(pageEntities(p))}`);
     out.push(`- **Needs caching:** ${needsCaching(p)}`);
@@ -253,8 +304,21 @@ function buildPagePlan(spec, opts = {}) {
     out.push(`- **Interactions:** ${nav.length
       ? `Navigate to ${nav.map((k) => `"PAGEREF_${k}"`).join(', ')} via Xrm.Navigation.navigateTo (pageType "generative"); custom ids go in data:`
       : 'In-page interactions only (no cross-page navigation)'}`);
-    if (p.pageInput !== undefined) {
+    // Gate on the DECLARED KEYS, not on `pageInput` being present. `pageInput: { data: {} }` is a
+    // page that takes no caller-supplied context, so "direct entry" is not a distinct mode for it —
+    // and App Spec validation only demands `directEntry` when at least one key is declared
+    // (see app-spec.js, the `inputKeys.length` guard). Keying off presence alone made the plan
+    // describe a direct-entry state the contract never required the author to answer for.
+    if (Object.keys((p.pageInput && p.pageInput.data) || {}).length) {
       out.push('- **Page Input:** reads `pageInput` (caller-supplied context)');
+      // The page is sitemap-placed, so it is ALSO reachable straight from the app navigation with
+      // no input at all. The generator has to be told what that renders, or it writes a page that
+      // reads `undefined` context on a path a user can reach by clicking the nav entry.
+      const de = p.directEntry || {};
+      const behavior = de.behavior === 'selector'
+        ? 'render a picker/list so the user can choose the record, then show it'
+        : 'render an explanatory empty state (do NOT render a broken/blank detail)';
+      out.push(`- **Direct entry (no input):** the page is in the sitemap, so it can be opened from the nav with no \`pageInput\` — ${behavior}.${de.note ? ` ${de.note}` : ''}`);
     }
     out.push('');
   }
@@ -268,6 +332,7 @@ module.exports = {
   mdText,
   pageKey,
   pageFile,
+  planFile,
   pageEntities,
   pageDataMode,
   needsCaching,

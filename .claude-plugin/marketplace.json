@@ -35,6 +35,22 @@
     {
       "name": "power-automate",
       "source": "./plugins/power-automate"
+    },
+    {
+      "name": "pcf",
+      "source": "./plugins/pcf"
+    },
+    {
+      "name": "power-apps-mobile-extension",
+      "source": "./plugins/power-apps-mobile-extension"
+    },
+    {
+      "name": "process-intelligence",
+      "source": "./plugins/process-intelligence"
+    },
+    {
+      "name": "dataverse",
+      "source": "./plugins/dataverse"
     }
   ]
 }

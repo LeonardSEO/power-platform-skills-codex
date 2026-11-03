@@ -7,6 +7,7 @@ Formula patterns for state, events, reusable logic, and mock data.
 - State management
 - Conditional logic
 - String operations
+- Table operations
 - Date and time formatting
 - Event handling
 - Named formulas and user defined functions
@@ -67,6 +68,19 @@ Visible: =selectedOption = "Option1"
 Any value containing `: ` must be quoted at the YAML level — see
 `${PLUGIN_ROOT}/references/YamlSyntax.md`.
 
+## Table operations
+
+`&` concatenates text; it does not combine tables. To prepend or append a record
+to an existing table, pass the record and table to `Table()` in the desired order:
+
+```powerfx
+Table({FieldName: "Value"}, ExistingTable)
+Table(ExistingTable, {FieldName: "Value"})
+```
+
+The added record must use the table's expected column names and types. `Table()`
+returns a table; it does not modify the existing table or collection.
+
 ## Date and time formatting
 
 Format specifiers are lower case (`mm` for month, not `MM`):
@@ -79,7 +93,65 @@ Text: =Text(varDate, "dddd, mmmm d, yyyy")
 Text: =Text(Now(), "hh:mm:ss")
 ```
 
+### Sort by time semantics, not display text
+
+Do not sort user-facing time strings directly. Lexicographic ordering puts values such as
+`"2:00 PM"` before `"9:00 AM"` and allows padded, non-padded, 12-hour, 24-hour, and blank
+values to mix silently.
+
+Prefer a typed Date/Time column and sort that field directly. When a local/mock source must
+store text, validate the same input that is written and persist a separate zero-padded
+24-hour sort key. One direct form uses an outer blank guard and an `IfError` whose successful
+expression writes `Text(TimeValue(the same input), "HH:mm")` to the declared source field.
+When using staged variables or other control flow, trace the same live input through
+validation, normalization, the field write and the sort binding; unrelated parsing tokens
+are not evidence of correct ordering.
+
+```yaml
+OnSelect: |-
+  =If(
+    IsBlank(Trim(txtStart.Text)),
+    Notify("Time is required"),
+    IfError(
+      Patch(
+        colMeetings,
+        First(colMeetings),
+        {StartSortKey: Text(TimeValue(Trim(txtStart.Text)), "HH:mm")}
+      ),
+      Notify("Enter a valid time")
+    )
+  )
+
+Items: =SortByColumns(colMeetings, "StartSortKey", SortOrder.Ascending)
+```
+
+Keep the original display value separate when the requested presentation is 12-hour time.
+The plan must name accepted input forms and the visible invalid/blank behavior. Do not
+claim free-form time input is valid merely because one seed format sorts correctly.
+
 ## Event handling
+
+### Platform confirmation with Confirm
+
+`Confirm(message [, options])` displays a platform-provided confirmation dialog from a behavior formula such as `OnSelect`. It returns `true` when the user confirms and `false` when the user cancels. The message is required. The options record and each of its text fields (`Title`, `Subtitle`, `ConfirmButton`, `CancelButton`) are optional:
+
+```powerfx
+Confirm("Remove this item?")
+
+Confirm(
+    "Remove this item?",
+    {
+        Title: "Remove confirmation",
+        Subtitle: "This action can't be undone.",
+        ConfirmButton: "Remove",
+        CancelButton: "Cancel"
+    }
+)
+```
+
+Use the result as the condition of `If`: put the mutation only in the affirmative branch, and leave canonical data unchanged on cancellation. Capture the target's stable identity before prompting so the confirmed action uses the same target named in the dialog. Confirmation is consent to attempt the operation, not evidence that the mutation succeeded.
+
+This is a Power Fx capability, not a control to discover with `describe_control`. It does not require a custom modal container, overlay stacking, or app-authored focus-trap state. Consult this section before declaring confirmation infeasible from control descriptions alone. Do not infer target-player support, keyboard dismissal, focus trapping, or focus return from a clean compile; keep unobserved runtime behavior explicitly unverified.
 
 ### Guard clauses
 
@@ -101,7 +173,7 @@ OnSelect: |-
   Set(currentPlayer, If(currentPlayer = "X", "O", "X"))
 ```
 
-### Confirm data changes and derive validation from current values
+### Close every data mutation loop
 
 An action that changes data must say so, and must leave the form in a clean state. Two
 defects show up constantly in generated apps: a quantity silently changes with no
@@ -110,13 +182,28 @@ about was successfully saved.
 
 ```yaml
 OnSelect: |-
-  =Patch(colInventory, ThisItem, {Quantity: ThisItem.Quantity - varAdjustBy});
-  Notify("Issued " & varAdjustBy & " units", NotificationType.Success);
-  Set(varAdjustBy, 0)
+  =With(
+    {
+      targetId: ThisItem.ID,
+      nextQuantity: ThisItem.Quantity - varAdjustBy
+    },
+    Set(
+      varLastInventoryMutation,
+      Patch(
+        colInventory,
+        LookUp(colInventory, ID = targetId),
+        {Quantity: nextQuantity}
+      )
+    );
+    Set(varInventoryReceiptVisible, true);
+    Set(varAdjustBy, 0)
+  )
 ```
 
-- Use `Notify(...)` or a transient in-screen message after every create, update, or delete.
-- Reset inputs after a successful action.
+- Capture the returned record, changed stable ID, or deletion snapshot before resetting inputs or navigating. Bind an in-screen receipt to that captured value.
+- Use `Notify(...)` only as supplemental feedback. It does not prove persistence or the resulting values.
+- Reset inputs only after the successful source operation and captured receipt state.
+- Read the target record from the source by immutable ID. Do not patch by display name and do not inspect a stale `ThisItem` after mutation.
 - Derive validation text and submit availability directly from the current input values:
 
   ```yaml
@@ -131,6 +218,106 @@ OnSelect: |-
   the current invalid expression: `Visible: =varSubmitAttempted && IsBlank(...)`. Do not
   maintain separate validity flags or clear them from every input's `OnChange`; correcting
   the input must make the formula false declaratively.
+
+### Canonical local-collection mutation patterns
+
+Create and capture the record before resetting inputs:
+
+```yaml
+OnSelect: |-
+  =If(
+    !IsBlank(Trim(txtName.Value)),
+    Set(
+      varLastRecord,
+      Patch(
+        colRecords,
+        Defaults(colRecords),
+        {
+          ID: GUID(),
+          Name: Trim(txtName.Value),
+          Category: varSelectedCategory,
+          Status: "Pending"
+        }
+      )
+    );
+    Set(varLastAction, "Created");
+    Set(varReceiptVisible, true);
+    Reset(txtName)
+  )
+```
+
+Edit the selected stable ID and preserve fields not present in the change record:
+
+```yaml
+OnSelect: |-
+  =Set(
+    varLastRecord,
+    Patch(
+      colRecords,
+      LookUp(colRecords, ID = varEditRecordId),
+      {
+        Name: Trim(txtName.Value),
+        Category: varSelectedCategory
+      }
+    )
+  );
+  Set(varLastAction, "Updated");
+  Set(varReceiptVisible, true);
+  Set(varEditMode, false)
+```
+
+Apply an eligible status transition and capture the resulting record:
+
+```yaml
+OnSelect: |-
+  =With(
+    {targetId: ThisItem.ID},
+    If(
+      LookUp(colRecords, ID = targetId).Status = "Pending",
+      Set(
+        varLastRecord,
+        Patch(
+          colRecords,
+          LookUp(colRecords, ID = targetId),
+          {Status: "Approved"}
+        )
+      );
+      Set(varLastAction, "Approved");
+      Set(varReceiptVisible, true)
+    )
+  )
+```
+
+Capture a deletion snapshot before removing the source row:
+
+```yaml
+OnSelect: |-
+  =With(
+    {targetId: ThisItem.ID},
+    Set(varDeletedRecord, LookUp(colRecords, ID = targetId));
+    RemoveIf(colRecords, ID = targetId);
+    Set(varLastAction, "Deleted");
+    Set(varDeleteReceiptVisible, true)
+  )
+```
+
+The receipt renders the captured identity, action, and proof-set values. The list, badge, filter, metric, or leaderboard separately reads `colRecords`, so the immediate proof and downstream state agree.
+
+### Selector and filter bindings
+
+Treat a selector as four coupled formulas: option source, visible option text, committed selected value, and consumer predicate. Use the exact selected-value property returned by `describe_control`; do not guess it.
+
+For six or fewer static choices, prefer visible choice buttons or radio controls. They avoid an inaccessible or uncommitted dropdown state and make the active filter visible. A category filter can set `varCategoryFilter` directly, while the gallery reads:
+
+```yaml
+Items: |-
+  =Filter(
+    colRecords,
+    varCategoryFilter = "All" || Category = varCategoryFilter
+  )
+```
+
+The clear action restores `"All"`. Seed or create at least two matching records and one non-matching record so the planned Given/When/Then scenario can prove inclusion, exclusion, and reset.
 
 ### Toggle once, report the same next value
 
@@ -196,6 +383,28 @@ Items: |-
 Use an `App.OnStart` collection when several screens share the records or interactions
 add, edit or remove rows. Never `ClearCollect` fixed display data in a screen's
 `OnVisible`; that couples rendering to navigation and reruns the seed every visit.
+
+When a collection must exist with a known record type but start empty, create one typed
+record and clear it immediately:
+
+```yaml
+OnStart: |-
+  =ClearCollect(
+    colTasks,
+    {
+      ID: GUID(),
+      Title: "",
+      Hours: 0
+    }
+  );
+  Clear(colTasks)
+```
+
+Use this recipe only when downstream formulas require an empty collection with stable
+field types before any real record is created or loaded. `ClearCollect(colTasks, {})`
+does not establish the intended field schema, while `ClearCollect` establishes concrete
+`GUID`, `Text`, and `Number` fields and `Clear(colTasks)` then leaves the typed
+collection empty.
 
 **Keep mock data compact.** `App.OnStart` runs before the first screen paints and its
 entire text is serialized into the saved app, so oversized seed data slows startup and

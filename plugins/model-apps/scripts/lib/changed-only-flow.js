@@ -26,13 +26,18 @@ const { classifyChanges } = require('./classify-changes.js');
 const snap = require('./apply-snapshot.js');
 const store = require('./apply-snapshot-store.js');
 const { indexArtifacts } = require('./apply-snapshot-index.js');
+const { ownValue } = require('./own-keys.js');
 const { odataLit } = require('./odata.js');
+// The app's build lease (lib/app-operation-lease.js), and the one derivation of the app's unique name it is keyed by.
+const { withAppBuildLease, applyWorkspaceOf } = require('./app-operation-lease.js');
+const { appUniqueName } = require('./sdk-build.js');
 
 // ---- PURE decision ------------------------------------------------------------------------------------
 
-// Decide fast vs full vs noop from the annotated spec, the persisted snapshot, and the live identity.
+// Decide fast vs full vs noop from the annotated spec, the persisted snapshot, and the live identity. `distrust` is the
+// workspace's distrust markers (store.readDistrust), or null.
 // Returns { decision:'fast'|'full'|'noop', reason, classify, pageKeys?, gateReason }.
-function decideChangedOnly({ annotatedSpec, snapshot, live }) {
+function decideChangedOnly({ annotatedSpec, snapshot, live, distrust = null }) {
   const prior = snapshot ? snapshot.priorSpec : null;
   const classify = classifyChanges(annotatedSpec, prior);
   const gate = snap.isFastPathEligible(snapshot, live);
@@ -40,6 +45,11 @@ function decideChangedOnly({ annotatedSpec, snapshot, live }) {
   // No prior snapshot → this run establishes the changed-only baseline via a full build.
   if (!snapshot) {
     return { decision: 'full', reason: 'no snapshot — establishing the changed-only baseline via a full build', classify, gateReason: 'no snapshot' };
+  }
+  // An earlier run found the workspace changed under it and could not invalidate the snapshot it found (distrustWorkspace
+  // below): that snapshot may certify a state the run since changed, so however eligible it reads, it is not trusted.
+  if (distrust) {
+    return { decision: 'full', reason: `full build — an earlier run found the workspace changed under it and could not invalidate the snapshot (${distrust.reason})`, classify, gateReason: 'distrusted' };
   }
   // Snapshot exists but is not fast-eligible (identity mismatch / tombstoned / invalidated / carries
   // debt) → full build (fail-closed). The full build then re-persists the snapshot (with sticky debt).
@@ -52,7 +62,7 @@ function decideChangedOnly({ annotatedSpec, snapshot, live }) {
   }
   // Eligible + EVERY change is the wired page-content shape → pages-only fast apply. Requires a live appId
   // (the fast path seeds result.created.app from it to satisfy pages-requires-app); a null appId would
-  // otherwise HALT, so fall back to a full build instead (M6). identityMatches already guarantees a live
+  // otherwise HALT, so fall back to a full build instead. identityMatches already guarantees a live
   // appId when the snapshot recorded one, so this is a belt-and-suspenders guard for a legacy no-appId
   // snapshot.
   if (classify.verdict === 'fast' && classify.fastChanges.length > 0 && classify.fastChanges.every((c) => c.shape === 'page')) {
@@ -86,28 +96,40 @@ async function resolveLiveIdentity({ sdk, envUrl, appUniqueName, whoAmI }) {
   } catch { return null; }
   if (!orgId) return null;
   let appId = null;
+  let appIdKnown = true;
   try {
     // App discovery by unique name (same appmodule query fetchSitemap uses). appId is a SECONDARY identity
     // signal — a fresh baseline (app not yet created) legitimately resolves null, so a miss is tolerated;
     // identityMatches only compares appId when BOTH the snapshot and live carry one.
     const apps = await sdk.queryRecords('appmodule', { select: ['appmoduleid'], filter: `uniquename eq '${odataLit(appUniqueName)}'`, top: 1 });
     appId = (apps && apps[0] && apps[0].appmoduleid) || null;
-  } catch { appId = null; }
-  return { orgId, envUrl, appUniqueName, appId };
+  } catch {
+    // A FAILED READ is not a proven absence. Both used to collapse to `appId: null`, and the caller
+    // reads that as "the app did not exist when this flow started" — which is the single fact that
+    // certifies a fresh, ELIGIBLE changed-only baseline. So a transient app-query error against a
+    // PRE-EXISTING app minted an eligible baseline for an additive build that may not have converged,
+    // and a later page edit then took the fast path on the strength of it.
+    //
+    // `appIdKnown: false` keeps the tolerated-miss behaviour for identity MATCHING (an absent id is
+    // still not compared) while letting the caller refuse to certify what it could not read.
+    appId = null;
+    appIdKnown = false;
+  }
+  return { orgId, envUrl, appUniqueName, appId, appIdKnown };
 }
 
 // ---- snapshot assembly (post-apply) -------------------------------------------------------------------
 
 // Assemble the baseline snapshot to persist after a FULL apply. Two fail-closed rules:
-//  1. FRESH-CREATE-ONLY eligibility (Sol #7 / Opus H2): a full `--apply` is ADDITIVE — on a PRE-EXISTING
+//  1. FRESH-CREATE-ONLY eligibility: a full `--apply` is ADDITIVE — on a PRE-EXISTING
 //     app it re-SKIPS diverged chart/command/dashboard/web-resource-content edits, so the deployed state may
 //     not match the spec even though the build "succeeded". We can only PROVE convergence when the app was
 //     CREATED fresh this run (it did not exist when the flow started: appPreExisted=false). If the app
 //     pre-existed, the baseline is recorded INELIGIBLE with an `uncertified-baseline` debt — a page edit then
 //     stays on the full-build path until a clean teardown+rebuild recreates everything fresh. This also
-//     subsumes the AI/data-model divergence concern (Sol #8): any full-build-triggering edit on an existing
+//     subsumes the AI/data-model divergence concern: any full-build-triggering edit on an existing
 //     app yields an ineligible baseline, regardless of the specific phase.
-//  2. STICKY debt (Sol build-time note): new snapshot debt = prior debt UNION this build's classify debt;
+//  2. STICKY debt: new snapshot debt = prior debt UNION this build's classify debt;
 //     eligible only when empty. A plain full rebuild never self-heals debt (the additive engine re-skips a
 //     stale artifact); debt clears only when a clean teardown DELETES the snapshot and it is recreated fresh.
 function assembleBaselineSnapshot({ annotatedSpec, created, live, prior, appPreExisted, sampleDataApplied }) {
@@ -137,8 +159,8 @@ function assembleBaselineSnapshot({ annotatedSpec, created, live, prior, appPreE
 // Refresh the snapshot after a pages-only FAST apply: keep the eligible envelope, update priorSpec and the
 // re-uploaded pages' hashes. sourceSha is the spec's on-disk hash; deployedSha is the MEASURED hash of the
 // bytes actually uploaded (created.pageDeployedShas[key] — differs from source when PAGEREF nav is resolved,
-// so it must never be assumed equal to the source hash; Sol #2/#3). Only the SELECTED (re-uploaded) keys are
-// refreshed — an unchanged page keeps its recorded hashes. Re-checks empty debt via markEligible (Opus L8)
+// so it must never be assumed equal to the source hash). Only the SELECTED (re-uploaded) keys are
+// refreshed — an unchanged page keeps its recorded hashes. Re-checks empty debt via markEligible
 // and bumps the generation for the CAS write.
 function assembleFastSnapshot({ snapshot, annotatedSpec, created, pageKeys, generation }) {
   const env = snap.parseEnvelope(snap.serializeEnvelope(snapshot)); // deep clone
@@ -146,14 +168,19 @@ function assembleFastSnapshot({ snapshot, annotatedSpec, created, pageKeys, gene
   if (!env.artifacts) env.artifacts = {};
   if (!env.artifacts.pages) env.artifacts.pages = {};
   const selected = new Set(pageKeys || []);
+  // Each map is read by the page's key as an OWN entry (lib/own-keys.js): a key can be `constructor`, which a plain object — the
+  // snapshot's parsed JSON, or the `{}` of a build that measured no deployed hash — answers with the Object function, and that
+  // function would be recorded as the page's id or deployed hash (and then dropped from the JSON written to disk).
   const deployedShas = (created && created.pageDeployedShas) || {};
   for (const p of annotatedSpec.pages || []) {
     if (!p || typeof p !== 'object') continue;
     const key = p.key || p.name;
     if (!selected.has(key)) continue; // only refresh the pages we actually re-uploaded
     const sourceSha = p.__contentSha != null ? p.__contentSha : null;
-    const deployedSha = deployedShas[key] != null ? deployedShas[key] : sourceSha;
-    const pageId = (created && created.pages && created.pages[key]) || (env.artifacts.pages[key] && env.artifacts.pages[key].pageId) || null;
+    const measured = ownValue(deployedShas, key);
+    const deployedSha = measured != null ? measured : sourceSha;
+    const recorded = ownValue(env.artifacts.pages, key);
+    const pageId = ownValue(created && created.pages, key) || (recorded && recorded.pageId) || null;
     env.artifacts.pages[key] = { pageId, sourceSha, deployedSha };
   }
   snap.bumpGeneration(env, generation);
@@ -163,34 +190,142 @@ function assembleFastSnapshot({ snapshot, annotatedSpec, created, pageKeys, gene
   return env;
 }
 
+// The pages a snapshot records as deployed by the last verified apply: the keys whose record holds a page id (apply-snapshot-index.js `indexArtifacts`, assembleFastSnapshot). A record without one proves
+// no page, and a snapshot that records none (an older one) names none — so the build checks every navigation target, as it always did.
+function deployedPageKeys(snapshot) {
+  const pages = (snapshot && snapshot.artifacts && snapshot.artifacts.pages) || {};
+  return Object.keys(pages).filter((key) => pages[key] && pages[key].pageId);
+}
+
 // ---- orchestration ------------------------------------------------------------------------------------
 
 // Run the `--apply --changed-only` flow. `deps.buildModelApp` is injected (no require cycle) so this
 // module orchestrates without importing the CLI wrapper; `deps.buildDeps` is the deps object passed
 // through to buildModelApp (sdk/provisionSdk/journal/verify/log). Returns the buildModelApp result
 // augmented with `.changedOnly` (the decision), or a noop/abort result.
+//
+// The FIRST thing it does is take the app's build lease, or borrow the one its caller holds (`opts.buildLease`, the CLI's): before the spec's
+// content is read, before the snapshot and the distrust markers are read, and before the live identity is resolved (a WhoAmI). A second apply of
+// the same app in this workspace is refused there (`build-locked`), and reads nothing — it would otherwise decide fast/full/noop from a snapshot
+// the running build is about to change. Everything below runs under the lease, and the builds it starts borrow it: one lease for the whole flow,
+// let go when it returns or throws. The workspace is resolved once (lib/app-operation-lease.js applyWorkspaceOf), so the lease and the flow name
+// the same folder.
 async function runChangedOnlyApply({ spec, opts, deps }) {
+  const ws = applyWorkspaceOf(opts);
+  return withAppBuildLease({ workspaceDir: ws, appUniqueName: appUniqueName(spec), buildLease: opts.buildLease, warn: deps.warn },
+    (buildLease) => runChangedOnlyApplyHeld({ spec, opts: { ...opts, workspaceDir: ws, buildLease }, deps }));
+}
+
+async function runChangedOnlyApplyHeld({ spec, opts, deps }) {
   const log = deps.log || (() => {});
   const ws = opts.workspaceDir;
   const annotate = (s) => annotateContentHashes(s, deps.readContent);
   const annotatedSpec = annotate(spec);
   const snapshot = store.readSnapshot(ws);
+  const distrust = store.readDistrust(ws);
+  // A teardown still running lists itself on the tombstone it wrote (apply-snapshot-store.js
+  // tombstoneSnapshot), and a build now would recreate what it is deleting — the fenced invalidate below
+  // would let it, the tombstone's generation being the very one this run read. So the run waits for it,
+  // whichever build it would have run (the no-identity fallback included). A tombstone no teardown still
+  // holds (one that failed, or was killed and stopped being seen) does not block: it only makes the
+  // baseline ineligible, through its debt. A teardown starting after this read is caught by a generation fence
+  // below: the invalidate's, or, in the no-identity fallback, the re-read before it builds and the check made
+  // when the build returns.
+  const running = store.teardownsInFlight(snapshot);
+  if (running.length) {
+    const who = running.map((t) => `pid ${t.pid}, last seen ${Math.max(0, Math.round((Date.now() - (typeof t.beat === 'number' ? t.beat : t.at)) / 1000))}s ago`).join('; ');
+    const msg = `changed-only: ${running.length} teardown(s) of this workspace are still running (${who}) — re-run the build once they have finished. A teardown that died stops counting ${Math.round(store.TEARDOWN_STALE_MS / 60000)} minutes after it was last seen.`;
+    log(`✗ ${msg}`);
+    return { ok: false, errors: [msg], changedOnly: { decision: 'full', reason: 'a teardown is running' } };
+  }
   const live = await deps.resolveLiveIdentity();
 
   // No trustworthy live identity → we cannot safely gate a fast apply. Degrade to a normal full build and
   // do NOT touch the snapshot (writing one we can't identity-bind would be worse than none).
+  //
+  // Identity discovery takes seconds, and a teardown that began meanwhile is not in the read above. The
+  // branches below catch it through their fenced invalidate; this one writes no snapshot, so nothing would —
+  // and the build would recreate what the teardown is deleting. So the workspace is read again, and the build
+  // refused when the snapshot's generation moved: a teardown's tombstone rotates it (on a workspace with no
+  // snapshot too, where it creates one), and so does another build's invalidate.
+  //
+  // A teardown that begins AFTER that re-read, while the build is reading or writing, is not fenced by it. The
+  // other branches notice one at the end, when their baseline CAS is refused; this one has no CAS to refuse. So
+  // the workspace is read once more when the build returns: a generation that moved means a teardown or another
+  // build ran alongside this one, so what this build made may already be partly deleted, and the run fails
+  // rather than report a success nothing can vouch for.
+  //
+  // The generation compared afterwards must be THIS run's own, one no other run can hold. The one it read is not:
+  // with no snapshot, a teardown that begins AND finishes during the build writes its tombstone and deletes it on
+  // release, so "none" before and "none" after hid it; and a second no-identity build that read the same
+  // generation, built and finished inside this one, left it unchanged, so neither saw the other. So, like the
+  // fenced branches, the run takes a generation of its own before it builds. On a workspace with no snapshot it
+  // claims a placeholder (claimBaselineSnapshot: ineligible, debt-free, "no baseline yet") and drops it again
+  // afterwards if it is still that placeholder, so this path leaves no snapshot behind. On one with a snapshot it
+  // invalidates it, fenced to the generation it read, as a full build does: a baseline the build is about to
+  // outdate is never left eligible.
   if (!live) {
+    const genOf = (s) => (s && s.generation) || null;
+    const seen = genOf(store.readSnapshot(ws));
+    if (seen !== genOf(snapshot)) {
+      const msg = 'changed-only: the workspace changed while the live identity was being resolved (a teardown or another build started) — re-run the build once it has finished';
+      log(`✗ ${msg}`);
+      return { ok: false, errors: [msg], changedOnly: { decision: 'full', reason: 'the workspace changed during identity discovery' } };
+    }
+    let claimed = null;
+    let before;
+    if (seen === null) {
+      const claim = store.claimBaselineSnapshot(ws, {});
+      if (!claim.ok) {
+        const msg = `changed-only: could not claim the workspace before the build (${claim.reason}) — aborting before any change`;
+        log(`✗ ${msg}`);
+        return { ok: false, errors: [msg], changedOnly: { decision: 'full', reason: 'the workspace could not be claimed' } };
+      }
+      claimed = claim.generation;
+      before = claimed;
+    } else {
+      const inv = store.invalidateSnapshot(ws, { expectedGeneration: seen });
+      if (!inv.ok) {
+        const msg = `changed-only: could not invalidate the snapshot before the build (${inv.reason}) — aborting before any change`;
+        log(`✗ ${msg}`);
+        return { ok: false, errors: [msg], changedOnly: { decision: 'full', reason: 'the workspace could not be claimed' } };
+      }
+      before = inv.generation;
+    }
     log('▸ changed-only: could not resolve live identity (WhoAmI/app discovery) — running a normal full build');
-    const r = await deps.buildModelApp(spec, fullApplyOpts(opts), deps.buildDeps);
+    let held;
+    try {
+      held = await buildHolding(ws, before, log, () => deps.buildModelApp(spec, fullApplyOpts(opts), deps.buildDeps));
+    } catch (e) {
+      // Only while it is still ours: a placeholder another writer has replaced is theirs.
+      if (claimed) store.dropBaselineClaim(ws, claimed);
+      throw e;
+    }
+    const { r, moved } = held;
+    if (moved) {
+      const msg = 'changed-only: the workspace changed while this build ran (a teardown or another build ran alongside it), so what it built may already be partly deleted — re-run the build once that has finished';
+      log(`✗ ${msg}`);
+      return { ...r, ok: false, errors: [...((r && r.errors) || []), msg], changedOnly: { decision: 'full', reason: 'the workspace changed during the build' } };
+    }
+    if (claimed) {
+      const dropped = store.dropBaselineClaim(ws, claimed);
+      if (!dropped.ok) log(`▸ changed-only: the placeholder this build claimed was left in place (${dropped.reason}); it is ineligible, so the next run still builds in full`);
+    }
     return { ...r, changedOnly: { decision: 'full', reason: 'no live identity' } };
   }
 
   // Whether the app already existed when the flow STARTED — the only proof a subsequent full build is a
-  // fresh create (→ eligible baseline). Captured before any write (Sol #7 / Opus H2).
-  const appPreExisted = !!live.appId;
+  // fresh create (→ eligible baseline). Captured before any write.
+  //
+  // An UNREADABLE app id counts as pre-existing. "We could not look" must not certify a fresh baseline:
+  // the alternative is that one transient app-query failure mints an eligible snapshot for an additive
+  // build on an app that was already there, and a later page edit rides the fast path on it. Treating
+  // it as pre-existing costs one extra full build and records `uncertified-baseline` debt, which is the
+  // recoverable direction.
+  const appPreExisted = live.appIdKnown === false ? true : !!live.appId;
 
-  let decision = decideChangedOnly({ annotatedSpec, snapshot, live });
-  // Sample-data guard (Sol #11): the baseline records whether --sample-data was applied. If THIS run asks
+  let decision = decideChangedOnly({ annotatedSpec, snapshot, live, distrust });
+  // Sample-data guard: the baseline records whether --sample-data was applied. If THIS run asks
   // for sample data but the eligible baseline did not seed it, a fast/noop would never seed the rows —
   // force a full build so the sample-data phase runs.
   if (opts.sampleData && snapshot && snapshot.sampleDataApplied !== true && (decision.decision === 'fast' || decision.decision === 'noop')) {
@@ -208,24 +343,38 @@ async function runChangedOnlyApply({ spec, opts, deps }) {
     // apply writes anything, so a crash mid-upload can never leave a stale "eligible" snapshot and a
     // concurrent reader that captured the old generation can no longer win the re-bless CAS. A failed
     // invalidate means lease contention (another build) → ABORT rather than risk two concurrent builds.
-    const inv = store.invalidateSnapshot(ws);
+    // FENCED to the generation this decision was read at (#587 item 1): a teardown that tombstoned the
+    // snapshot while identity was being resolved must stop this run here, before it uploads anything.
+    const inv = store.invalidateSnapshot(ws, { expectedGeneration: snapshot.generation || null });
     if (!inv.ok) {
       const msg = `changed-only: could not invalidate the snapshot before the fast apply (${inv.reason}) — aborting to avoid an unsafe partial write`;
       log(`✗ ${msg}`);
       return { ok: false, errors: [msg], changedOnly: decision };
     }
-    // selectedKeys: upload ONLY the changed pages (never clobber an unchanged one — Sol #1).
-    const fastOpts = { ...fullApplyOpts(opts), phases: ['pages'], changedOnly: { fastApply: true, resolvedAppId: live.appId, skipSitemapFinalize: true, selectedKeys: decision.pageKeys } };
-    const r = await deps.buildModelApp(spec, fastOpts, deps.buildDeps);
+    // selectedKeys: upload ONLY the changed pages (never clobber an unchanged one).
+    // deployedKeys: the pages the snapshot records its last verified apply deployed. The build checks the bindings of the pages it writes before it writes anything, and it writes a navigation target only
+    // when the target is absent — which it learns only later, in its pages phase. So it is told which pages are there, and leaves their bindings unread; one it was told of and finds absent after all
+    // (deleted in Maker since) it checks before it makes it (sdk-build.js, pagesMadeUnchecked).
+    const fastOpts = { ...fullApplyOpts(opts), phases: ['pages'], changedOnly: { fastApply: true, resolvedAppId: live.appId, skipSitemapFinalize: true, selectedKeys: decision.pageKeys, deployedKeys: deployedPageKeys(snapshot) } };
+    const { r, moved } = await buildHolding(ws, inv.generation, log, () => deps.buildModelApp(spec, fastOpts, deps.buildDeps));
     // Re-bless ONLY on a fully successful apply whose mandatory page verify PASSED (a fast apply always
     // applies the pages phase, so verify is mandatory and r.verify is always set — a missing/failed verify
-    // leaves the snapshot invalidated, fail-closed; Sol #2/#3, Opus H4). CAS `expected` = the post-invalidate
+    // leaves the snapshot invalidated, fail-closed). CAS `expected` = the post-invalidate
     // generation (inv.generation), which the invalidate wrote; a concurrent writer that bumped it again is
     // detected and this re-bless is refused.
-    if (r && r.ok && !r.dryRun && r.verify && r.verify.ok) {
+    if (r && r.ok && !r.dryRun && r.verify && r.verify.ok && moved) {
+      return conflictResult(r, decision, 'fast apply', log);
+    } else if (r && r.ok && !r.dryRun && r.verify && r.verify.ok) {
       const refreshed = assembleFastSnapshot({ snapshot, annotatedSpec, created: r.created, pageKeys: decision.pageKeys, generation: snap.newGeneration() });
       const cas = store.casWriteSnapshot(ws, refreshed, inv.generation);
-      if (!cas.ok) log(`▸ changed-only: fast apply succeeded but the snapshot was not re-blessed (${cas.reason}) — the next run will do a full build`);
+      if (!cas.ok) {
+        // Read before distrust rotates it: a generation that is no longer ours means another writer landed. A lease
+        // held for a moment (its own write) leaves ours in place, and the run's result stands.
+        const conflicted = generationOnDisk(ws) !== inv.generation;
+        log(`▸ changed-only: fast apply succeeded but the snapshot was not re-blessed (${cas.reason}) — the next run will do a full build`);
+        const seen = distrustWorkspace(ws, log, inv.generation);
+        if (conflicted || seen.foreign || !seen.resolved) return conflictResult(r, decision, 'fast apply', log);
+      }
       else log('✓ changed-only: fast apply verified; snapshot re-blessed eligible');
     } else if (r && r.ok && !r.dryRun) {
       log('▸ changed-only: fast apply completed but page verify did not pass — snapshot left invalidated (next run will full-build)');
@@ -236,26 +385,136 @@ async function runChangedOnlyApply({ spec, opts, deps }) {
   // FULL build (baseline, ineligible-snapshot fallback, or an unsupported/unwired change).
   let expectedGen = null;
   if (snapshot) {
-    const inv = store.invalidateSnapshot(ws);
+    // Fenced exactly like the fast path: the baseline this build writes is assembled from the snapshot
+    // read above, so a tombstone that landed since must stop the build rather than be overwritten by it.
+    const inv = store.invalidateSnapshot(ws, { expectedGeneration: snapshot.generation || null });
     if (!inv.ok) {
       const msg = `changed-only: could not invalidate the snapshot before the full apply (${inv.reason}) — aborting to avoid a concurrent build`;
       log(`✗ ${msg}`);
       return { ok: false, errors: [msg], changedOnly: decision };
     }
     expectedGen = inv.generation;
+  } else {
+    // No snapshot to fence against, so CLAIM one. The baseline write below would otherwise expect "none",
+    // and a teardown running alongside that found none either never changes that — this build then
+    // blessed an app the teardown had just deleted. The claim's generation is what the baseline CAS
+    // compares: a teardown landing during the build tombstones the placeholder, so the write is refused;
+    // one that landed since the read above left its tombstone, so the claim is refused and nothing runs.
+    // `snapshot` stays null, so the baseline is assembled with no prior exactly as before.
+    const claim = store.claimBaselineSnapshot(ws, {
+      orgId: live.orgId,
+      envUrl: live.envUrl,
+      appUniqueName: live.appUniqueName,
+      appId: live.appId,
+      solutionUniqueName: annotatedSpec.solution && annotatedSpec.solution.uniqueName,
+    });
+    if (!claim.ok) {
+      const msg = `changed-only: could not claim the workspace for the first baseline (${claim.reason}) — aborting before any change`;
+      log(`✗ ${msg}`);
+      return { ok: false, errors: [msg], changedOnly: decision };
+    }
+    expectedGen = claim.generation;
   }
-  const r = await deps.buildModelApp(spec, fullApplyOpts(opts), deps.buildDeps);
-  if (r && r.ok && !r.dryRun && (!r.verify || r.verify.ok)) {
+  const { r, moved } = await buildHolding(ws, expectedGen, log, () => deps.buildModelApp(spec, fullApplyOpts(opts), deps.buildDeps));
+  if (r && r.ok && !r.dryRun && (!r.verify || r.verify.ok) && moved) {
+    return conflictResult(r, decision, 'build', log);
+  } else if (r && r.ok && !r.dryRun && (!r.verify || r.verify.ok)) {
     // Re-resolve identity so a fresh baseline records the now-created appId (the app did not exist before
     // this build). created.app already carries it, so this is belt-and-suspenders.
     let liveForWrite = live;
     if (!live.appId) { const relive = await deps.resolveLiveIdentity(); if (relive) liveForWrite = relive; }
     const env = assembleBaselineSnapshot({ annotatedSpec, created: r.created, live: liveForWrite, prior: snapshot, appPreExisted, sampleDataApplied: !!opts.sampleData });
     const wrote = store.casWriteSnapshot(ws, env, expectedGen);
-    if (!wrote.ok) log(`▸ changed-only: full apply succeeded but the snapshot was not persisted (${wrote.reason})`);
-    else log(`✓ changed-only: baseline snapshot ${env.eligible ? 'ELIGIBLE' : 'recorded INELIGIBLE (open debt — a future edit needs a full build)'}`);
+    if (!wrote.ok) {
+      const conflicted = generationOnDisk(ws) !== expectedGen;
+      log(`▸ changed-only: full apply succeeded but the snapshot was not persisted (${wrote.reason})`);
+      const seen = distrustWorkspace(ws, log, expectedGen);
+      if (conflicted || seen.foreign || !seen.resolved) return conflictResult(r, decision, 'build', log);
+    }
+    else {
+      log(`✓ changed-only: baseline snapshot ${env.eligible ? 'ELIGIBLE' : 'recorded INELIGIBLE (open debt — a future edit needs a full build)'}`);
+      // This full build ran over whatever the markers distrusted, and its baseline landed on the generation it held, so
+      // the markers it found have done their job. One another run wrote since is left in place (clearDistrust).
+      if (distrust) {
+        const cleared = store.clearDistrust(ws, distrust.names);
+        if (!cleared.ok) log(`▸ changed-only: a distrust marker could not be cleared (${cleared.reason}); the next run builds in full again`);
+      }
+    }
   }
   return { ...r, changedOnly: decision };
+}
+
+const generationOnDisk = (ws) => ((store.readSnapshot(ws) || {}).generation) || null;
+
+// A run that another writer overlapped reports FAILURE, whatever its own build returned: a teardown may have deleted
+// part of what it built, another build may have overwritten it, and no baseline records it. The caller re-runs once
+// the other writer has finished, as the no-identity branch already said.
+function conflictResult(r, decision, what, log) {
+  const msg = `changed-only: the workspace changed while this ${what} ran (a teardown or another build ran alongside it), so no baseline records it and what it wrote may already be partly deleted or overwritten — re-run the build once that has finished`;
+  log(`✗ ${msg}`);
+  return { ...r, ok: false, errors: [...((r && r.errors) || []), msg], changedOnly: decision };
+}
+
+// Run one build while holding generation `held`, the one this run's claim or invalidate wrote. On EVERY way out —
+// a result, a failed verify, a thrown halt — a generation that has moved means another writer ran alongside this
+// build, and the workspace is distrusted (below) before the result or the error goes on. A failed or halted build
+// has still changed the environment, so its way out needs the check as much as a clean one. Returns { r, moved }.
+async function buildHolding(ws, held, log, build) {
+  const movedOn = () => (((store.readSnapshot(ws) || {}).generation) || null) !== held;
+  let r;
+  try {
+    r = await build();
+  } catch (e) {
+    if (movedOn()) distrustWorkspace(ws, log);
+    throw e;
+  }
+  const moved = movedOn();
+  if (moved) distrustWorkspace(ws, log);
+  return { r, moved };
+}
+
+// A run that finds the workspace changed under it (its generation moved while it built, or its baseline write was
+// refused) cannot tell what the other writer recorded from what this run changed after it. A baseline another build
+// blessed meanwhile would certify a state this run may since have overwritten, and a later run would noop on it; and
+// a build still between its verify and its baseline write holds the generation it will CAS against, so an ineligible
+// snapshot is no safer to leave as it is. So whatever is there is invalidated — made ineligible, and its generation
+// rotated so that no pending writer's CAS can land — and the next run builds in full. Each invalidate is fenced to
+// the generation just read and keeps the snapshot's contents: tombstone, debt and teardown list (teardowns release
+// by id, not by generation). A writer landing between the read and the invalidate is read again and invalidated in
+// turn.
+//
+// Returns what it saw, for a caller still deciding whether it was overlapped at all (a baseline write refused by a
+// busy lease): `foreign` when any generation it read was not `held`, the one the caller's run holds. That lease may
+// have been an older build's, about to rotate the generation, and the flag read before this call cannot see that.
+// `resolved` is false when the invalidate never landed; the caller fails closed on that too. And since the snapshot
+// then stays as the lease's holder leaves it, possibly eligible, the refusal is recorded beside it, outside the lease
+// (store.markDistrusted): the next --changed-only run builds in full whatever it reads, on every way out of this run,
+// a thrown build included.
+const DISTRUST_ATTEMPTS = 4;
+function distrustWorkspace(ws, log, held) {
+  let reason = '';
+  let foreign = false;
+  for (let attempt = 1; attempt <= DISTRUST_ATTEMPTS; attempt += 1) {
+    const now = store.readSnapshot(ws);
+    const generation = (now && now.generation) || null;
+    if (held !== undefined && generation !== held) foreign = true;
+    if (!now) {
+      // Only a snapshot that is provably absent leaves nothing to distrust. One that exists but reads as nothing (a
+      // transient read error, a file mid-replace) may be the other writer's eligible baseline, readable again by the
+      // next run, so it is a refusal like any other: read again, and recorded if it never reads.
+      if (store.snapshotAbsent(ws)) return { foreign, resolved: true };
+      reason = 'the snapshot exists but could not be read';
+    } else {
+      const inv = store.invalidateSnapshot(ws, { expectedGeneration: generation });
+      if (inv.ok) return { foreign, resolved: true };
+      reason = inv.reason;
+    }
+    // A lease another writer holds for a moment (its own snapshot write) is waited out briefly.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  }
+  const marked = store.markDistrusted(ws, { reason });
+  log(`▸ changed-only: could not invalidate the snapshot another run left (${reason}) — ${marked.ok ? 'recorded beside it, so the next --changed-only build runs in full' : `and could not record that either (${marked.reason}): run the next build without --changed-only`}`);
+  return { foreign, resolved: false };
 }
 
 // Force a FULL-phase apply: changed-only decides its own phases, so it must ignore any --stage/--only/etc.
@@ -274,4 +533,5 @@ module.exports = {
   assembleFastSnapshot,
   runChangedOnlyApply,
   fullApplyOpts,
+  distrustWorkspace,
 };

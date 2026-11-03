@@ -1,32 +1,111 @@
 #!/usr/bin/env node
 'use strict';
-// download-model-app: pull a DEPLOYED app back into an editable app-spec + page codeFiles (the edit
-// flow's "pull everything" step). Reconstructs the app (sitemap -> appShell), ALL its generative
-// pages (via pac list+download, incl. Maker-authored), its entities (minimal — the build reuses
+// download-model-app: pull the SERVER-CURRENT app (including saved unpublished edits) into an
+// editable app-spec + page codeFiles. The vendored appApi.get uses RetrieveUnpublishedMultiple for
+// both header and sitemap, so membership must use that same current state, not the published layer.
+// Reconstructs the app (sitemap -> appShell), ALL its generative
+// pages (read through the SDK, incl. Maker-authored), its entities (minimal — the build reuses
 // existing tables idempotently), the icon web resources, and its solution, via hydrate-spec.
 //
-// Usage: node download-model-app.js --env <orgUrl> --app <appId|uniqueName|displayName> --out <dir> [--allow-lossy-download]
+// Usage: node download-model-app.js --env <orgUrl> --app <appId|uniqueName|displayName> --out <dir> [--allow-lossy-download] [--reset-page-keys] [--language-code <lcid>]
+//
+// A page's key is its identity in a rebuild, so a download keeps the key each page already has: the one the app's page manifest binds to it, then the one an
+// earlier download of the SAME app gave it (the app-spec.json already in --out, when its app.uniqueName is this app's). If that earlier spec gives a page keys that
+// cannot be told apart — one key to two pages, or two keys to one page — and the manifest does not bind the page, the download stops without writing anything:
+// `{ ok: false, code: 'page-keys-ambiguous', error, pages }`. Correct the file and download again, or pass --reset-page-keys to give exactly those pages fresh
+// keys (minted in page-id order; every other page keeps its key). The switch is a decision about every environment that holds a copy of the earlier spec: it
+// binds each key to the page it built there, so a fresh key can make that copy update another page.
+//
+// The app's navigation titles are written in the language a rebuild resolves, and a download writes them only in a language it KNOWS: --language-code <lcid> (read as the build and verify
+// read it), else the `languageCode` the app-spec.json already in --out pins, else the environment's base language. When none of the three gives one — the base language could not be read —
+// the download stops without writing anything, `{ ok: false, code: 'navigation-language-unknown', error }`: titles read in a guessed language could overwrite the right ones on the next
+// rebuild. Run it again, or pass --language-code. The flag only decides the language the titles are read in: it is not written into the spec (a pin there is the author's), and a flag that
+// names another language than the spec on disk pins is refused (`navigation-language-conflict`).
+//
+// A page's connector and Custom API bindings are written into the spec (`pages[].connectorBindings`, `pages[].actionBindings`) when the spec can state a list WHOLE — every key one of the properties the
+// references document, every value of a shape known to be safe (lib/page-bindings.js, which holds the threat model and every sink) — so a rebuild keeps them in this environment and writes them into another
+// one. A list holding anything else (a connection id, a credential, a property this plugin does not know) is left out whole, named by its place and the vetted property, never a value or an unrecognized key,
+// and stays on the page. What a rebuild cannot make in another environment — the connection references and the connections behind them, the Custom APIs, the service resources a connector binding points at
+// — is said on stderr and in the JSON result as `pageBindings` (pageBindingsReport): { pages, neededInTarget, notCarried?, note }.
+// It is left out of the result when no page holds a binding and none had to be left out; a list the spec cannot state is never a refusal (see parseDownloadedPages).
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { parseArgs, emitResult } = require('./lib/dataverse-auth.js');
+const { assertSafeOutputDir, assertPlainFileTarget, writeFileSafe } = require('./lib/safe-fs.js');
+const { parseArgs, validateFlags, emitResult, preflightAuth, dataverseOrigin, requireDataverseOrigin, webApiUrl, readOrgLanguageCode, readLanguageCodeFlag } = require('./lib/dataverse-auth.js');
+const { writeBaseline } = require('./lib/deployed-baseline.js');
 const { createAzHttpClient } = require('./lib/sdk-http-client.js');
-const { hydrateSpec } = require('./lib/hydrate-spec.js');
-const { makeGenpageCli } = require('./lib/genpage-cli.js');
-const { parseManifestBase64, manifestResourceName, reconcilePageIds } = require('./lib/page-manifest.js');
-const { reverseResolveNavIds } = require('./lib/pageref-resolver.js');
-const { fetchSitemap, sitemapGenPages } = require('./lib/sitemap-pages.js');
+const { hydrateSpec, descriptionFromDataverse, withDescription } = require('./lib/hydrate-spec.js');
+const { makeGenpageSdk, unescapePacName, pageFolderFiles } = require('./lib/genpage-sdk.js');
+const { parseManifestBase64, manifestResourceName, reconcilePageIds, KEY_GRAMMAR } = require('./lib/page-manifest.js');
+const { reverseResolveNavIdsReport } = require('./lib/pageref-resolver.js');
+const { fetchSitemap, sitemapGenPages, appNavigationMatchesSitemap } = require('./lib/sitemap-pages.js');
 const { isRestrictedSolution } = require('./lib/system-solutions.js');
-const { isPlatformIconRef, webResourceNameFromRef, validateAppSpec } = require('./lib/app-spec.js');
+const { isPlatformIconRef, webResourceNameFromRef, validateAppSpec, normalizeLanguageCode, isLocalizedLabelMap, derivedPluralName, ambiguousChoiceAliases, relationshipSchemaName, manyToManySchemaName, dashboardNameKey, PAGE_MODEL_RE, sitemapEntityTables, lookupLabelFor, isOldLookupColumnLabel } = require('./lib/app-spec.js');
+const { PAGE_BINDINGS, pageBindingsProblem, statableBindings, bindingProblemText } = require('./lib/page-bindings.js');
+const { getReviewedDataverseOperation } = require('./lib/dataverse-operations.js');
+const { labelsByLcid, pickLabel, sameLabel } = require('./lib/lookup-labels.js');
+const { odataGuid } = require('./lib/ai-app-settings.js');
+const { APP_COMPONENT_ENTITY_SOURCES, appComponentEntities, appComponentRows, currentAppLayer, readAppComponentInventory, downloadAppMainForms, setAppMembershipFloor } = require('./lib/app-components.js');
+const { mapLimit, DEFAULT_MAX_SIZE_KB } = require('./lib/entity-provision.js');
+const { compareText } = require('./lib/compare-text.js');
+const { hostsCustomControl } = require('./lib/dashboard-tiles.js');
+const { readColumnOptions, columnOptionFields, primaryColumnOptionFields } = require('./lib/download-column-options.js');
+const { readStatusOptions, statusReasonsFromOptions, alternateKeysFromMetadata } = require('./lib/table-schema-metadata.js');
+const { appUniqueName } = require('./lib/sdk-build.js');
+const { makeTempWorkspace } = require('./lib/temp-workspace.js');
+const { makeWritesBlocking } = require('./lib/output-redaction.js');
 
 // webresourcetype (int) -> app-spec web-resource type.
 const WR_TYPE = { 1: 'html', 2: 'css', 3: 'js', 4: 'xml', 5: 'png', 6: 'jpg', 7: 'gif', 8: 'xap', 9: 'xsl', 10: 'ico', 11: 'svg', 12: 'resx' };
+
+// How a download orders every list it writes. Dataverse promises no order for a query that has no `$orderby`, and a directory
+// listing (`fs.readdirSync`) is in the file system's order — name order on NTFS, hash order on ext4 — so a list written in the
+// order it arrived made two downloads of one app differ only in order. Every list is ordered with `compareText`
+// (lib/compare-text.js): by code units, never by the host's locale, so the order is a function of the strings alone and is the
+// same on every machine. The ORDER a list is written in decides nothing else: in particular no page key (see assignPageKeys).
+
+// Pages, as they are written: by name, then by id. The name is the page's own — what the maker called it, which a second download
+// of the app reads the same — so the order does not hang on ids, which differ between environments. Two pages that share a name are
+// told apart by id, the only thing that does. This is the order of `pages[]` and of what is reported about pages; the keys are
+// minted in another (comparePageIds).
+function comparePages(a, b) {
+  return compareText(a && a.name, b && b.name) || compareText(a && a.pageId, b && b.pageId);
+}
+
+// Pages by id alone: the order NEW pages are minted keys in (assignPageKeys). A page's id is its own and never changes, while its
+// name can be changed in Maker, can make the same slug as another page's, and sorts into another place under another comparison —
+// a key decided by that order moves with it. By id it is also the order a file system that lists names in order (NTFS, HFS+: the
+// folders are named by GUID) gave the page folders, which is the order earlier releases minted in: a spec they wrote, and that was
+// deployed to another environment, keeps the keys it was built with.
+function comparePageIds(a, b) {
+  return compareText(a && a.pageId, b && b.pageId);
+}
+
+// A deployed artifact the download inventories ({ id, name, entity }): by table, then name, then id.
+function compareArtifacts(a, b) {
+  return compareText(a && a.entity, b && b.entity) || compareText(a && a.name, b && b.name) || compareText(a && a.id, b && b.id);
+}
+
+// An app-membership note ({ kind, table?, id?, name?, reason }): by what it is about, then by what it says.
+function compareNotes(a, b) {
+  for (const key of ['kind', 'table', 'id', 'name', 'reason']) {
+    const order = compareText(a && a[key], b && b[key]);
+    if (order) return order;
+  }
+  return 0;
+}
 
 // Reconstruct the app's dashboards (declared as DashBoard sitemap subareas) into app-spec
 // dashboards[] entries. Each tile is reconstructed with ID PASSTHROUGH — it carries the deployed
 // view/chart ids (+ target entity) directly, so a rebuild recreates the dashboard against the
 // EXISTING views/charts without needing views[]/charts[] declared (which would else duplicate them).
-async function readDashboards(sdk, app) {
+// `warn` is optional and injected so the CLI can report WHY a dashboard could not be reconstructed.
+// Without it this function swallowed every per-dashboard failure (`catch { continue }`) and returned
+// a short list, so the subarea silently dropped and download failed downstream with "could not be
+// round-tripped" and no cause. That is a diagnosis dead-end: live, the real reason was an SDK
+// deserialization bug several layers down, and nothing surfaced it.
+async function readDashboards(sdk, app, warn) {
   const strip = (g) => String(g || '').replace(/[{}]/g, '') || undefined;
   const ids = new Map(); // dashboardId -> subarea title (fallback name)
   for (const a of (app.siteMap && app.siteMap.areas) || []) {
@@ -39,31 +118,534 @@ async function readDashboards(sdk, app) {
   const out = [];
   for (const [id, title] of ids) {
     let art;
-    try { art = await sdk.fetchArtifact('dashboard', id); } catch { continue; }
-    let name = title || id;
-    try { const rows = await sdk.queryRecords('systemform', { select: ['name'], filter: `formid eq ${id}`, top: 1 }); if (rows && rows[0] && rows[0].name) name = rows[0].name; } catch { /* keep fallback */ }
+    // Keep going on a single unreadable dashboard — one bad artifact must not sink the whole
+    // download — but SAY SO. A dropped subarea with no stated cause is what made this untraceable.
+    try { art = await sdk.fetchArtifact('dashboard', id); } catch (e) {
+      if (typeof warn === 'function') warn(`dashboard '${title || id}' (${id}) could not be read: ${e && e.message}`);
+      continue;
+    }
+    let name = null;
+    let description;
+    let nameError = null;
+    try {
+      const rows = await sdk.queryRecords('systemform', { select: ['name', 'description'], filter: `formid eq ${id}`, top: 1 });
+      if (rows && rows[0] && rows[0].name) name = rows[0].name;
+      description = rows && rows[0] && rows[0].description;
+    } catch (e) { nameError = e; }
+    // An App Spec refers to a dashboard by NAME, and a rebuild finds the deployed one by that name. The
+    // sitemap title is only the subarea's label: standing in for an unread name, it made a rebuild create
+    // (or bind to) another dashboard, and hid a real name clash from the check below. So a dashboard whose
+    // name cannot be read is withheld like an unreadable one — its subarea dropped, which trips the
+    // lossy-download gate with this reason.
+    if (!name) {
+      if (typeof warn === 'function') {
+        warn(`dashboard '${title || id}' (${id}): its name could not be read (${nameError ? (nameError.message || nameError) : 'no row for it'}), and an App Spec refers to a dashboard by name, so it is left out; its sitemap subarea will be dropped. Download again once it can be read.`);
+      }
+      continue;
+    }
     const tiles = [];
     for (const c of art.components || []) {
       const p = c.parameters || {};
       const entity = p.TargetEntityType;
       const viewId = strip(p.ViewId);
-      if (c.type === 'chart' && viewId) tiles.push({ type: 'chart', name: c.name, entity, viewId, visualizationId: strip(p.VisualizationId) });
-      else if (c.type === 'list' && viewId) tiles.push({ type: 'list', name: c.name, entity, viewId });
-      else if (c.type === 'iframe' && p.Url) tiles.push({ type: 'iframe', name: c.name, url: p.Url });
-      else if (c.type === 'webresource' && p.WebResourceName) tiles.push({ type: 'webresource', name: c.name, webResource: p.WebResourceName });
+      // The SDK already read each cell's dimensions. Keep only non-default spans: the build
+      // creates a 1-column by 12-row tile when neither is stated, including for one-row tiles.
+      const size = {};
+      if (Number.isInteger(c.colspan) && c.colspan > 0 && c.colspan !== 1) size.colspan = c.colspan;
+      if (Number.isInteger(c.rowspan) && c.rowspan > 0 && c.rowspan !== 12) size.rowspan = c.rowspan;
+      // A grid or chart a custom control hosts reads exactly like a native one (lib/dashboard-tiles.js, which verify shares),
+      // so it must be told apart BEFORE the branches below build a plain tile from its parameters. It is left out, and named —
+      // never emitted as the plain tile that would replace the control when a rebuild creates the dashboard. A rebuild into
+      // this environment is not touched either way: the spec pins the dashboard by its id, and the build reuses a
+      // dashboard that exists without applying its tile edits (so it never replaces or removes a tile).
+      if (hostsCustomControl(c)) {
+        if (typeof warn === 'function') {
+          warn(`dashboard '${name}' tile '${c.name || '(unnamed)'}' hosts a custom control, which the App Spec cannot express, so it is omitted from dashboards[]. `
+            + 'A rebuild into this environment keeps the dashboard as it is, so the control stays; a rebuild into another environment creates it without this tile — add the tile there in Maker.');
+        }
+        continue;
+      }
+      if (c.type === 'chart' || c.type === 'list') {
+        // The two id-passthrough tile shapes, gated together because they share their required
+        // parameters. EVERY one of these ids is load-bearing: a chart renders a visualization OVER a
+        // view, so it needs both ids, and `entity` is required by both spec gates for either shape.
+        // Emitting a tile missing any of them hands back a spec that fails its own lint — the exact
+        // #572 defect class — so name the missing parameter and omit the tile rather than shipping
+        // one a rebuild cannot honour.
+        //
+        // Collected as a LIST rather than reported one-at-a-time so a component missing several
+        // parameters says so once, and — the reason this is not an `&& viewId` guard — so a tile
+        // with no ViewId is reported too. Falling through to the unsupported-type branch would have
+        // dropped it with no stated cause, which is the untraceability this whole block exists to end.
+        const visualizationId = c.type === 'chart' ? strip(p.VisualizationId) : undefined;
+        const missing = [];
+        if (!entity) missing.push('TargetEntityType');
+        if (!viewId) missing.push('ViewId');
+        if (c.type === 'chart' && !visualizationId) missing.push('VisualizationId');
+        if (!missing.length) {
+          tiles.push(c.type === 'chart'
+            ? { type: 'chart', name: c.name, entity, viewId, visualizationId, ...size }
+            : { type: 'list', name: c.name, entity, viewId, ...size });
+        } else if (typeof warn === 'function') {
+          warn(`dashboard '${name}' ${c.type} tile '${c.name || viewId || '(unnamed)'}' carries no ${missing.join(' or ')}, so it cannot be rebuilt; it is omitted from dashboards[].`);
+        }
+      }
+      else if (c.type === 'iframe' && p.Url) tiles.push({ type: 'iframe', name: c.name, url: p.Url, ...size });
+      else if (c.type === 'webresource' && p.WebResourceName) tiles.push({ type: 'webresource', name: c.name, webResource: p.WebResourceName, ...size });
+      // Everything else a dashboard can hold. Reported for the same reason as the branches above: the
+      // dashboard-level "no recognizable tiles" warning below only fires when NOTHING survives, so a
+      // dashboard with one good tile would otherwise drop its siblings in silence.
+      else if (typeof warn === 'function') {
+        const missingParam = c.type === 'iframe' ? 'Url' : c.type === 'webresource' ? 'WebResourceName' : null;
+        warn(`dashboard '${name}' tile '${c.name || '(unnamed)'}' of type '${c.type}' `
+          + (missingParam
+            ? `carries no ${missingParam}, so it cannot be rebuilt; it is omitted from dashboards[].`
+            : `is not a tile type the App Spec can express, so it is omitted from dashboards[].`));
+      }
     }
-    if (tiles.length) out.push({ id, name, tiles });
+    // A dashboard that read cleanly but yielded no usable tile is ALSO a silent drop — the subarea
+    // disappears with nothing said. Distinguish it from the unreadable case above.
+    if (tiles.length) out.push(withDescription({ id, name, tiles }, description));
+    else if (typeof warn === 'function') {
+      warn(`dashboard '${name}' (${id}) read OK but produced no recognizable tiles `
+        + `(${(art.components || []).length} component(s)); its sitemap subarea will be dropped.`);
+    }
+  }
+  // Two DIFFERENT dashboards whose names compare equal cannot survive the round trip (#586 item 4):
+  // the App Spec names a dashboard, its sitemap subarea points at it BY NAME, and the build finds an
+  // existing one by name — so both subareas would resolve to whichever dashboard a rebuild found, and
+  // the other would silently leave the nav. Every dashboard sharing its name is withheld instead,
+  // which drops its subarea and trips the lossy-download gate with this reason as the cause.
+  // Compared with the App Spec gate's own key, so a download can never emit a spec that gate rejects.
+  // `ids` is keyed by lowercased id, so one dashboard behind two subareas is a single entry here and
+  // can never be mistaken for a clash with itself.
+  const byName = new Map();
+  for (const d of out) byName.set(dashboardNameKey(d.name), (byName.get(dashboardNameKey(d.name)) || []).concat(d));
+  const ambiguous = [...byName.values()].filter((same) => same.length > 1);
+  for (const same of ambiguous) {
+    if (typeof warn === 'function') {
+      warn(`dashboards ${same.map((d) => `${d.id} ('${d.name}')`).join(', ')} share the name '${same[0].name}' as far as Dataverse is concerned (it compares names ignoring case, and in most languages accents), and an App Spec refers to a dashboard by name, so they cannot be told apart; rename one in Maker and download again`);
+    }
+  }
+  return ambiguous.length ? out.filter((d) => byName.get(dashboardNameKey(d.name)).length === 1) : out;
+}
+
+// Reconstruct relationships[] from live metadata (#567).
+//
+// Derived from the CHILD ("referencing") side via `ManyToOneRelationships`, because that is how App
+// Spec indexes a 1:N: `referencing` is the table that carries the lookup column. Reading from the
+// parent side instead would miss the documented "bridge to a standard table" pattern — where the
+// parent is `systemuser`/`account` and is therefore never one of the downloaded entities, so its
+// metadata is never read — which references/app-spec-schema.md explicitly supports.
+//
+// This deliberately does NOT use the SDK's `fetchEntityMetadata().relationships` projection, which
+// LIVE-MEASURED returns entries shaped:
+//   {"schemaName":"cfo_workorder_SyncErrors","type":"OneToMany","relatedEntity":"syncerror","relatedAttribute":"regardingobjectid"}
+// and is missing the facts this needs: (1) no `IsCustomRelationship`, and on a 3-table app 20
+// of 22 entries per table were platform plumbing (SyncErrors, AsyncOperations,
+// MailboxTrackingFolders, BulkDeleteFailures, …) that must not become spec relationships; (2) no
+// properly-cased lookup `SchemaName` — App Spec wants `cfo_CustomerId`, the projection lowercases
+// to `cfo_customerid`. The vendored SDK (8930278f) projection does include ManyToMany entries, so
+// that is no longer a reason to avoid it — (1) and (2) still are, and this read also needs the
+// cased lookup SchemaName the projection does not carry.
+//
+// Returns { relationships, skipped } — `skipped` feeds the not-round-tripped report so a
+// relationship this cannot express is DECLARED missing rather than silently absent, which was the
+// whole complaint in #567.
+//
+// `prefixUnknown`: the spec's publisher prefix is a placeholder (see runDownload), so every deployed name is
+// carried as it is. Omitting one because it equals the name the build would generate is only safe under the
+// REAL prefix: under the placeholder, a rebuild generates another name and creates the relationship twice.
+// A name that is not the one this prefix would generate is the name a same-environment rebuild
+// must send. Dropping a foreign name onto the generated default makes the CREATE fail on the
+// lookup that already exists, and the name search then finds nothing. One warning per such name:
+// a new environment cannot create it under this publisher.
+function adoptDeployedName(rel, deployed, auto, publisherPrefix, prefixUnknown, where, warn) {
+  const lc = (s) => String(s || '').toLowerCase();
+  if (deployed && (prefixUnknown || lc(deployed) !== lc(auto))) rel.schemaName = deployed;
+  if (!deployed || !publisherPrefix || lc(deployed).startsWith(`${lc(publisherPrefix)}_`)) return;
+  if (typeof warn === 'function') {
+    warn(`relationship '${deployed}' on '${where}' does not start with this solution's publisher prefix '${publisherPrefix}_'. A new environment cannot create that name under this publisher; rename it explicitly there.`);
+  }
+}
+
+// The relationship the platform makes WITH a File or an Image column, as a table's ManyToOneRelationships answers it (LIVE-MEASURED):
+//   { "SchemaName": "FileAttachment_<table>_<file>", "ReferencedEntity": "fileattachment", "ReferencingEntity": "<table>",
+//     "ReferencingAttribute": "<file>", "IsCustomRelationship": true }
+//   { "SchemaName": "ImageDescriptor_<table>_<image>", "ReferencedEntity": "imagedescriptor", "ReferencingEntity": "<table>",
+//     "ReferencingAttribute": "<image>id", "IsCustomRelationship": false }
+// Nothing but the column makes it, so a build that creates the column gets it back and relationships[] has nothing to say of it. The
+// Image one is not custom, so the custom filter drops it; the File one IS custom and its parent a stock table, so it was carried as an
+// `existing` relationship under a name with no publisher prefix, and warned about for that. Recognised by the column, not by the parent
+// table alone: the referencing attribute must be a File column of the table (or an Image column's `<name>id`) as this download typed it
+// (entityFromMetadata), so a relationship to either table that is no such column's reads as it always did.
+// See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/file-attributes
+// See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/image-attributes
+const MEDIA_RELATIONSHIP_PARENT = { File: 'fileattachment', Image: 'imagedescriptor' };
+
+// `<parent>:<referencing attribute>` of every such relationship, by the table's logical name, from the downloaded tables' columns.
+function mediaRelationshipKeys(entities) {
+  const lc = (s) => String(s || '').toLowerCase();
+  const out = new Map();
+  for (const e of entities || []) {
+    if (!e || !e.schemaName) continue;
+    const keys = new Set();
+    for (const c of Array.isArray(e.columns) ? e.columns : []) {
+      if (!c || !c.schemaName || !Object.hasOwn(MEDIA_RELATIONSHIP_PARENT, c.type)) continue;
+      keys.add(`${MEDIA_RELATIONSHIP_PARENT[c.type]}:${lc(c.schemaName)}${c.type === 'Image' ? 'id' : ''}`);
+    }
+    if (keys.size) out.set(lc(e.schemaName), keys);
   }
   return out;
 }
 
-function makeProvision(env, workspaceDir) {
-  const { createMakerSdk } = require('./vendor/cds-maker-sdk.cjs');
-  const httpClient = createAzHttpClient(env);
-  fs.mkdirSync(workspaceDir, { recursive: true });
-  const sdk = createMakerSdk({ workspacePath: workspaceDir, instanceUrl: env, httpClient });
-  sdk.initWorkspace();
-  return sdk;
+// Per-table relationship reads overlap because they are independent network fetches, but the
+// TABLE-ORDER processing that dedupes, warns and chooses the surviving N:N owner stays sequential so
+// the emitted notes and winners do not depend on response timing.
+//
+// A failed read is captured as `{ error }` (the caught value itself) rather than as text, so the
+// ordered pass below words the note from it exactly as the sequential loop did — including for a
+// rejection that is not an Error, where `e && e.message` reads as undefined — and never mistakes a
+// falsy rejection for "no failure".
+//
+// `mediaKeys` is the table's entry of mediaRelationshipKeys: a File or Image column's own relationship is dropped with the platform's
+// others, before the lookup read below — which it would otherwise cost a table that has no other custom relationship.
+async function readRelationshipMetadataForTable(sdk, logical, mediaKeys) {
+  const lc = (s) => String(s || '').toLowerCase();
+  const isMediaRelationship = (r) => !!mediaKeys && mediaKeys.has(`${lc(r.ReferencedEntity)}:${lc(r.ReferencingAttribute)}`);
+  let rows = null;
+  let rowsFailure = null;
+  try {
+    // `dataverse.get` RESOLVES on a non-2xx rather than throwing, so the status must be checked
+    // explicitly — a bare try/catch would turn a 403 into "this table has no relationships".
+    const res = await sdk.dataverse.get(`/${metadataEntityPath(logical)}/ManyToOneRelationships`
+      + '?$select=SchemaName,ReferencedEntity,ReferencingEntity,ReferencingAttribute,IsCustomRelationship');
+    if (!res || res.status < 200 || res.status >= 300) throw new Error(`HTTP ${res && res.status}`);
+    rows = ((res.body && res.body.value) || []).filter((r) => r && r.IsCustomRelationship && !isMediaRelationship(r));
+  } catch (e) {
+    rowsFailure = { error: e };
+  }
+
+  if (rows === null) rows = [];
+  // Properly-cased lookup SchemaName + label. Best-effort: on failure the relationship still
+  // round-trips using the lowercase logical name, which produces the same Dataverse column.
+  // Skipped entirely when there is no relationship to label, so a table whose 1:N read failed
+  // does not also pay for an attribute read whose result nothing would consume.
+  const lookups = new Map();
+  if (rows.length) {
+    try {
+      const res = await sdk.dataverse.get(`/${metadataEntityPath(logical)}/Attributes/Microsoft.Dynamics.CRM.LookupAttributeMetadata`
+        + '?$select=LogicalName,SchemaName,DisplayName,Targets');
+      for (const a of ((res && res.body && res.body.value) || [])) lookups.set(String(a.LogicalName || '').toLowerCase(), a);
+    } catch { /* fall back to the relationship's own ReferencingAttribute */ }
+  }
+
+  let manyToManyRows = [];
+  let manyToManyFailure = null;
+  try {
+    // Many-to-many. Both ends must be in the app: the intersect table is created by the platform,
+    // so there is nothing to declare for a partner table a rebuild target would not have.
+    // Attempted INDEPENDENTLY of the 1:N read above: a failed 1:N read says nothing about whether
+    // N:N metadata is readable.
+    const res = await sdk.dataverse.get(`/${metadataEntityPath(logical)}/ManyToManyRelationships`
+      + '?$select=SchemaName,Entity1LogicalName,Entity2LogicalName,IsCustomRelationship');
+    if (!res || res.status < 200 || res.status >= 300) throw new Error(`HTTP ${res && res.status}`);
+    manyToManyRows = ((res.body && res.body.value) || []).filter((x) => x && x.IsCustomRelationship);
+  } catch (e) {
+    manyToManyFailure = { error: e };
+  }
+  return { logical, rows, rowsFailure, lookups, manyToManyRows, manyToManyFailure };
+}
+
+async function readRelationships(sdk, logicals, publisherPrefix, warn, { prefixUnknown = false, entities = [], concurrency, languageCode } = {}) {
+  concurrency = validatedDownloadConcurrency(concurrency);
+  const inApp = new Set((logicals || []).map((l) => String(l).toLowerCase()));
+  const lc = (s) => String(s || '').toLowerCase();
+  const relationships = [];
+  const skipped = [];
+  const seen = new Set(); // relationship SchemaName (lower) — a 1:N read from both ends, and every N:N, appears twice
+  const parentOk = new Map(); // logical -> can a rebuild target be relied on to have this table?
+  // The Dataverse Label of each stock parent, from the SAME read that decides whether it is stock — so
+  // knowing what a rebuild would label a lookup to it costs no request. See `omitsDefaultLabel` below.
+  const stockLabels = new Map(); // logical -> raw DisplayName
+  const note = (name, entity, reason) => {
+    skipped.push({ name, entity, reason });
+    if (typeof warn === 'function') warn(`relationship '${name}' on '${entity}' is not carried into the spec: ${reason}`);
+  };
+
+  // A parent OUTSIDE the app is only safe to declare when a fresh rebuild target is guaranteed to
+  // have it — i.e. it is a stock table. A CUSTOM table this app does not include would not exist
+  // there, so declaring the relationship would turn a silent omission into a failed build.
+  // Three OUTCOMES, deliberately kept apart: the parent is in the app or is a stock table
+  // ('rebuildable'); it is a confirmed custom table this app omits ('custom'); or its metadata could
+  // not be read ('unknown'). Collapsing the last two into `false` made a transient 403/503 report
+  // the confident and possibly wrong diagnosis "is a custom table this app does not include".
+  const referencedRebuildability = async (logical) => {
+    const key = lc(logical);
+    if (inApp.has(key)) return 'rebuildable';
+    if (parentOk.has(key)) return parentOk.get(key);
+    let state = 'unknown';
+    try {
+      const res = await sdk.dataverse.get(`/${metadataEntityPath(logical)}?$select=IsCustomEntity,DisplayName`);
+      if (res && res.status >= 200 && res.status < 300 && res.body) {
+        state = res.body.IsCustomEntity === false ? 'rebuildable' : 'custom';
+        if (res.body.DisplayName) stockLabels.set(key, res.body.DisplayName);
+      }
+    } catch { state = 'unknown'; }
+    parentOk.set(key, state);
+    return state;
+  };
+
+  // ADO 6691205: may this lookup's label be left out of the downloaded spec? Only when a rebuild writes (or
+  // repairs it to) the same label for a lookup that sets none, so the downloaded spec stays minimal and a
+  // rebuild reproduces the label. A label that differs is carried, as ever, and so is every label when there
+  // is nothing to compare it with (no downloaded tables passed, or a stock parent whose label was not read):
+  // omitting is a claim about what a rebuild writes.
+  //   * a parent IN the app: its downloaded displayName, string or map, compared whole;
+  //   * a STOCK parent: its label in the one language the lookup's label is written in;
+  //   * the OLD DEFAULT an earlier build left on the column — the parent's logical name — is omitted too. It is an
+  //     identifier, never a label anyone chose, and an explicit label is never repaired on a
+  //     rebuild: writing it out would carry the defect through download -> edit -> rebuild for good,
+  //     where leaving it out lets the rebuild repair it (the data-model phase's lookup label repair). The
+  //     lookup's own name is NOT one: that is what the SDK left on a form FIELD it could not resolve, and no
+  //     build ever wrote it on a column, so a column carrying it is somebody's label and is carried.
+  // Those comparisons are made on the label's TEXT, the shape every download wrote before a label held in one language other than the
+  // authoring one kept its language (labelFromDataverse), and a parent in the app is compared the same way (singleLanguageText). But a
+  // label is a language too, and equal text no longer proves the label a rebuild writes: an English "Contact" on a lookup to a table
+  // labelled only in French "Contact" is rebuilt as the French label it inherits, and a French "Utilisateur" on a lookup to `systemuser`
+  // as the English "User" the build reads. So when the authoring language is known, a label is left out only where the text comparison
+  // leaves it out AND the label a rebuild writes is this one, language for language (rebuildsAs). Requiring both never leaves out a label
+  // that was carried before, and every label that is carried keeps its language. With no authoring language every label is written
+  // without its language, as before, so the text comparison alone decides, as before.
+  const authoring = normalizeLanguageCode(languageCode);
+  // What a rebuild writes on a lookup that sets no label, as { LCID: text } — the label the build sends (lookupLabelFor) in the language
+  // it sends it in (lib/entity-provision.js, relationships): a parent in the app gives its downloaded displayName, a map as it is and a
+  // plain string in the authoring language (the language a rebuild of this spec resolves, labelFromDataverse); a stock parent gives the
+  // label the build reads for it in that language (pickLabel, as lib/lookup-labels.js makeTableLabelReader reads it), written in that
+  // language — assuming, as the text comparison always has, that the target labels its stock tables as this environment does. Undefined
+  // for a name derived from the table's (lookupLabelFor's last step), which is no label a lookup holds.
+  const rebuildsAs = (referenced, stockRaw) => {
+    const live = stockRaw ? pickLabel(stockRaw, authoring) : null;
+    const would = lookupLabelFor({ entities }, { referenced }, { liveReferencedLabel: live || undefined });
+    if (would.source !== 'table' && would.source !== 'environment') return undefined;
+    return isLocalizedLabelMap(would.label) ? would.label : { [String(authoring)]: would.label };
+  };
+  const omitsDefaultLabel = (referenced, rawLookupLabel) => {
+    const lookupLabel = labelFromDataverse(rawLookupLabel);
+    if (isOldLookupColumnLabel({ referenced }, lookupLabel)) return true;
+    const lookupLanguages = Object.keys(labelsByLcid(rawLookupLabel));
+    const stockRaw = stockLabels.get(lc(referenced));
+    const live = stockRaw && lookupLanguages.length === 1 ? labelsByLcid(stockRaw)[lookupLanguages[0]] : undefined;
+    const would = lookupLabelFor({ entities }, { referenced }, { liveReferencedLabel: live });
+    const sameText = (would.source === 'table' || would.source === 'environment') && sameLabel(lookupLabel, singleLanguageText(would.label));
+    if (!sameText || !authoring) return sameText;
+    return sameLabel(labelsByLcid(rawLookupLabel), rebuildsAs(referenced, stockRaw));
+  };
+
+  const media = mediaRelationshipKeys(entities);
+  const captured = await mapLimit(logicals || [], concurrency, (logical) => readRelationshipMetadataForTable(sdk, logical, media.get(lc(logical))), { firstInOrder: true });
+  for (const { logical, rows, rowsFailure, lookups, manyToManyRows, manyToManyFailure } of captured) {
+    if (rowsFailure) {
+      // Report rather than swallow: "no relationships" and "the query failed" must not look alike.
+      // `rows` stays null so the 1:N block below is skipped, but the N:N read still runs — an
+      // earlier version `continue`d here, which meant a failed 1:N read ALSO skipped the N:N read
+      // silently, leaving any N:N both unreconstructed and unmentioned.
+      note('(all)', lc(logical), `their metadata could not be read (${rowsFailure.error && rowsFailure.error.message})`);
+    }
+
+    // POLYMORPHIC lookups. One lookup column that targets several tables surfaces as SEVERAL
+    // relationships sharing ONE ReferencingAttribute — LIVE-MEASURED, `cfo_billto` with
+    // Targets ["account","contact"] produced BOTH `cfo_cfo_workorder_account` and
+    // `cfo_cfo_workorder_contact`. relationships[] has exactly one `referenced` per lookup, so
+    // emitting both would declare the same lookup schema name twice and the rebuild would fail
+    // creating the second. Skip the whole group and say so.
+    const byAttr = new Map();
+    for (const r of rows) {
+      const k = lc(r.ReferencingAttribute);
+      if (!byAttr.has(k)) byAttr.set(k, []);
+      byAttr.get(k).push(r);
+    }
+
+    for (const [attr, group] of byAttr) {
+      if (group.length > 1) {
+        note(group.map((g) => g.SchemaName).sort().join(' + '), lc(logical),
+          `lookup '${attr}' is polymorphic (targets ${group.map((g) => lc(g.ReferencedEntity)).sort().join(', ')}) and relationships[] declares exactly one referenced table per lookup`);
+        continue;
+      }
+      const r = group[0];
+      const key = lc(r.SchemaName);
+      if (seen.has(key)) continue;
+      const referenced = lc(r.ReferencedEntity);
+      const referencing = lc(r.ReferencingEntity);
+      const rebuildability = await referencedRebuildability(referenced);
+      if (rebuildability !== 'rebuildable') {
+        note(r.SchemaName, referencing, rebuildability === 'custom'
+          ? `its parent table '${referenced}' is a custom table this app does not include, so a rebuild target would not have it`
+          : `its parent table '${referenced}' could not be read, so whether a rebuild target would have it could not be determined`);
+        continue;
+      }
+      seen.add(key);
+      const a = lookups.get(attr);
+      const lookup = { schemaName: (a && a.SchemaName) || r.ReferencingAttribute };
+      // The label written keeps a language other than the authoring one (labelFromDataverse); whether it is left out is omitsDefaultLabel's.
+      const displayName = a && labelFromDataverse(a.DisplayName, languageCode);
+      if (displayName && !omitsDefaultLabel(referenced, a.DisplayName)) lookup.displayName = displayName;
+      // Keep the deployed name whenever it is not the one this prefix would generate. Omitting a
+      // foreign name used to rename it onto the generated default; the rebuild then created under
+      // that name, the CREATE failed because the lookup already existed, and the name search found
+      // nothing. Lint warns on an existing foreign name instead of refusing it (#572).
+      const auto = relationshipSchemaName({ referenced, referencing }, publisherPrefix);
+      const deployed = r.SchemaName;
+      // `existing: true` for the reason the recovered TABLES carry it (#587 item 6): nothing here can
+      // prove this app created the relationship, and a teardown that deleted it would take the lookup
+      // column — and its data — off a table that teardown otherwise retains. A rebuild still creates a
+      // missing one; only teardown reads the flag.
+      const rel = { type: 'OneToMany', referenced, referencing, lookup, existing: true };
+      adoptDeployedName(rel, deployed, auto, publisherPrefix, prefixUnknown, referencing, warn);
+      relationships.push(rel);
+    }
+
+    // The N:N rows were read above; the processing stays inside the same try as before, so a failed
+    // read — or anything thrown while processing — is still reported as the N:N metadata being unreadable.
+    try {
+      if (manyToManyFailure) throw manyToManyFailure.error;
+      for (const r of manyToManyRows) {
+        const key = lc(r.SchemaName);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const e1 = lc(r.Entity1LogicalName);
+        const e2 = lc(r.Entity2LogicalName);
+        if (!inApp.has(e1) || !inApp.has(e2)) {
+          note(r.SchemaName, lc(logical), `it links '${e1}' to '${e2}' and this app does not include both tables`);
+          continue;
+        }
+        // `manyToManySchemaName` SORTS the two entity names before composing, so `auto` is computed
+        // from the same pair that is emitted rather than from the order Dataverse happened to report.
+        const rel = { type: 'ManyToMany', entity1: e1, entity2: e2, existing: true }; // ownership unprovable, as for 1:N above
+        const auto = manyToManySchemaName({ entity1: e1, entity2: e2 }, publisherPrefix);
+        adoptDeployedName(rel, r.SchemaName, auto, publisherPrefix, prefixUnknown, `${e1} <-> ${e2}`, warn);
+        relationships.push(rel);
+      }
+    } catch (e) {
+      note('(many-to-many)', lc(logical), `their metadata could not be read (${e && e.message})`);
+    }
+  }
+
+  // Deterministic order: the metadata endpoints carry no ordering guarantee, and this block is
+  // written to a file that operators diff between runs, so an unstable order reads as a change that
+  // did not happen.
+  relationships.sort((x, y) => compareText(JSON.stringify(x), JSON.stringify(y)));
+  skipped.sort((x, y) => compareText(x.entity + x.name, y.entity + y.name) || compareText(x.reason, y.reason));
+  return { relationships, skipped };
+}
+
+// Render the relationships this download could NOT express in relationships[] (#567).
+//
+// Deliberately NOT folded into `notRoundTrippedSummary`. That report describes classes this download
+// does not reconstruct AT ALL and whose members are all recorded under `descriptionInventory` — both
+// of its standing sentences ("this download does not reconstruct …", "They are NOT lost: every one
+// is listed under descriptionInventory") would be FALSE for relationships, which are now
+// reconstructed apart from specific, individually-explained exceptions. A report whose value is that
+// its claims are true cannot be extended with a claim that is not.
+function relationshipsSkippedWarning(skipped) {
+  if (!skipped || !skipped.length) return '';
+  const lines = [
+    `NOTE: ${skipped.length} relationship(s) could not be expressed in relationships[] and are absent from the rebuildable spec.`,
+    '  They remain on the deployed app, so rebuilding into THIS environment leaves them untouched. Rebuilding into a',
+    '  DIFFERENT environment will NOT recreate them — re-declare or re-create the ones you need there.',
+  ];
+  for (const s of skipped) lines.push(`    - ${s.entity}: ${s.name} — ${s.reason}`);
+  return `${lines.join('\n')}\n`;
+}
+
+// The language the download's SDK reads the app in, which decides what the app's navigation TITLES are. The SDK projects a sitemap in ONE language, the one it is constructed with: a node's title
+// is the `<Title LCID="…">` whose LCID is that language, and "" when the node has none. An SDK built with no language reads 1033, so on an environment whose base language is another — a
+// Spanish-only one holds its titles at 3082 and no other — every area, group and entry came back with no title, and the spec said so: `"label": ""` for an app whose every node has one.
+//
+// It is the language a rebuild of the spec this download writes will resolve, in the order the build resolves it (lib/entity-provision.js resolveLanguageCode): `--language-code` (`flag`), else the
+// `languageCode` an author pinned in the spec already on disk (`authored`, which preserveAuthoredLanguageCode carries into the spec this download writes), else the environment's base language.
+// A label is then a plain string in that language — the rule a table's label follows too (labelFromDataverse) — and the language itself is never written into the spec, for the reason
+// preserveAuthoredLanguageCode gives. A title a node holds in another language is not in the spec: a rebuild into this environment leaves it as it is.
+//
+// The base language is read through the download's own HTTP client (the build reads the same row through the transport hatch, readOrgLanguageCode), so one set of credentials, retries and
+// test seams serves the download.
+//
+// There is NO fallback. The build, when it cannot read the base language, warns and uses 1033 (resolveLanguageCode), and `--verify`, which describes a deployment as a download does, refuses to
+// assume one (its `undetermined` hook). A download is the stricter of the two: the spec it writes is consumed by a build that may well read the language this one could not, and on a bilingual
+// environment whose base language is not English the English titles of a guessed 1033 are non-empty labels, which that build writes over the right ones. So a language that cannot be established
+// is returned as `unresolved` — the reason — and whoever asked refuses.
+// Returns { languageCode, source: 'flag' | 'spec' | 'environment' } or { unresolved }.
+async function readNavigationLanguage(env, httpClient, { flag, authored } = {}) {
+  if (flag) return { languageCode: flag, source: 'flag' };
+  if (authored) return { languageCode: authored, source: 'spec' };
+  let why = 'the answer named no language';
+  // `readOrgLanguageCode` reads `{ status, data }`, the transport hatch's shape for an answer; the SDK's client answers `{ status, headers, body }` and resolves a non-2xx instead of throwing it.
+  // The answer it reads: `GET organizations?$select=languagecode&$top=1` -> `{ "value": [ { "organizationid": "…", "languagecode": 3082 } ] }`. The client takes a FULL URL under the
+  // environment and refuses anything else (it attaches the access token), so the query is put under the Web API root the way `dataverseRequest` puts it. The reason a read fails is kept
+  // here, because readOrgLanguageCode answers only null for every one of them and the operator needs to know which: a refusal (HTTP 403) is not the service being down (HTTP 503).
+  const viaClient = async (envUrl, _method, query) => {
+    let res;
+    try {
+      res = await httpClient.get(webApiUrl(requireDataverseOrigin(envUrl), query));
+    } catch (err) {
+      why = (err && err.message) || String(err);
+      throw err;
+    }
+    if (res.status < 200 || res.status >= 300) why = `HTTP ${res.status}`;
+    return { status: res.status, data: res.body };
+  };
+  const base = await readOrgLanguageCode(env, viaClient);
+  return base ? { languageCode: base, source: 'environment' } : { unresolved: why };
+}
+
+// What the download says when no language is known, and how to go on: run it again (the read may only have failed for a moment), name the language, or pin it in the spec.
+function navigationLanguageRefusal(why, specPath) {
+  return `the environment's base language could not be read (${why}), so the language the app's navigation titles are written in is not known, and a spec written with the titles of a guessed language `
+    + 'could overwrite the right ones on the next rebuild. Nothing was written. Run the download again; or name the language with --language-code <lcid> (the flag the build and verify take): '
+    + `the environment's base language, for example 1033 or 3082; or pin "languageCode" in ${specPath}.`;
+}
+
+// The SDK a download reads through, on a THROWAWAY workspace that is removed afterwards — never the
+// output folder's `.maker-workspace`, which is the workspace a later build in that folder uses. A
+// download must describe what is DEPLOYED, and reading through that workspace could not promise it: a
+// copy an interrupted build left holding unpushed edits made the SDK throw LOCAL_EDITS_WOULD_BE_LOST
+// once the server had moved (the download failed), and was returned as if it were the app when the
+// server had not (the download silently described edits that were never deployed). Nothing a download
+// fetches is of use to the next build either: its plain fetch replaces a clean copy with the server's.
+//
+// Construction happens INSIDE the guard: the constructor builds the filesystem adapter and can throw,
+// and the caller's `finally` is not reachable until this function returns (as in build-model-app.js).
+// `deps` is a test seam: the bundle's factories, the HTTP client, and the temp-directory calls.
+// `deps.languageCode` is the `--language-code` the operator gave and `deps.authoredLanguageCode` the language the spec on disk pins, if either is there (readNavigationLanguage). The result
+// says where the language came from (`languageCode`, `languageSource`) or that there is none (`languageUnresolved`, the reason): the SDK is made either way, in the SDK's own default when there
+// is none, and it is the caller's to refuse — whatever it reads with that default is a guess.
+async function makeDownloadSdk(env, deps = {}) {
+  const workspaceDir = makeTempWorkspace('model-app-download-', { mkdtempSync: deps.mkdtempSync });
+  const cleanup = () => (deps.rmSync || fs.rmSync)(workspaceDir, { recursive: true, force: true });
+  try {
+    const { createMakerSdk, createNodeWorkspaceStorage } = (deps.createMakerSdk && deps.createNodeWorkspaceStorage)
+      ? deps
+      : require('./lib/maker-sdk.js');
+    const httpClient = deps.httpClient || (deps.createHttpClient || createAzHttpClient)(env);
+    const language = await readNavigationLanguage(env, httpClient, { flag: deps.languageCode, authored: deps.authoredLanguageCode });
+    const sdk = createMakerSdk({
+      workspaceStorage: createNodeWorkspaceStorage(workspaceDir),
+      instanceUrl: env,
+      httpClient,
+      // The App, Form and Dashboard adapters bake the language in at construction, as the build gives its own SDK (build-model-app.js).
+      ...(language.languageCode ? { languageCode: language.languageCode } : {}),
+    });
+    await sdk.initWorkspace();
+    return {
+      sdk,
+      workspaceDir,
+      cleanup,
+      ...(language.languageCode ? { languageCode: language.languageCode, languageSource: language.source } : { languageUnresolved: language.unresolved }),
+    };
+  } catch (err) {
+    cleanup();
+    throw err;
+  }
 }
 
 // Resolve `--app` to an app GUID. Accepts the app's id, its immutable `uniquename`, or — as a
@@ -144,94 +726,429 @@ function collectSitemap(app) {
 // the sitemap alone silently dropped those (ADO 6603388), so the download→edit→rebuild round trip
 // lost hidden app dependencies.
 //
-// The entity is derived from the app's VIEW / CHART / FORM components, NOT from its
-// `componenttype eq 1` (Entities) rows. That looks like the obvious source but is unusable:
-// LIVE-verified that every componenttype-1 row carries the SAME `objectid` — the MetadataId of the
-// `entity` metadata table itself — so it identifies the component *kind*, not which table. (On a
-// 2-table app both rows read `9d0f025b-…`, which resolves to the logical name `entity`.)
-// `RetrieveAppComponents` returned 0 rows on the same app, so it is not an alternative here.
-//
-// View/chart/form components DO carry usable ids: each `objectid` is a real row id whose record
-// names its owning table. An app includes its tables' views and forms, so unioning their owners
-// recovers the hidden membership.
-//   componenttype 26 → savedquery.returnedtypecode
-//   componenttype 59 → savedqueryvisualization.primaryentitytypecode
-//   componenttype 60 → systemform.objecttypecode
-// See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/reference/entities/appmodulecomponent
-//
-// `appId` is the appmoduleid; the parent lookup targets `appmoduleidunique`, so that is resolved
-// first. Best-effort by design: any failure returns an empty list so the caller keeps today's
-// sitemap-derived behavior rather than losing the download entirely.
-const APP_COMPONENT_ENTITY_SOURCES = [
-  { componentType: 26, set: 'savedquery', idField: 'savedqueryid', entityField: 'returnedtypecode' },
-  { componentType: 59, set: 'savedqueryvisualization', idField: 'savedqueryvisualizationid', entityField: 'primaryentitytypecode' },
-  { componentType: 60, set: 'systemform', idField: 'formid', entityField: 'objecttypecode' },
-];
-// Dataverse honors `$top` as a HARD cap and omits `@odata.nextLink`, so this is the point past which
-// components of one type stop being inspected. Generous for a real app (a 70-table app has ~1000
-// views), and exceeded only with a warning.
-const COMPONENT_PAGE_CAP = 1000;
+// Dataverse entity set -> the App Spec artifact class it inventories, so a failed read is reported
+// in the author's vocabulary ("forms could not be inventoried") rather than Dataverse's.
+const INVENTORY_KIND_BY_SET = { savedquery: 'views', savedqueryvisualization: 'charts', systemform: 'forms' };
 
-async function appComponentEntities(sdk, appId) {
-  if (!appId) return [];
-  try {
-    const appRows = await sdk.queryRecords('appmodule', { select: ['appmoduleidunique'], filter: `appmoduleid eq ${appId}`, top: 1 });
-    const appUniqueId = appRows && appRows[0] && appRows[0].appmoduleidunique;
-    if (!appUniqueId) return [];
-    const parent = String(appUniqueId).replace(/[{}]/g, '');
-    const found = new Set();
-    for (const src of APP_COMPONENT_ENTITY_SOURCES) {
-      const rows = await sdk.queryRecords('appmodulecomponent', {
-        select: ['objectid', 'componenttype'],
-        filter: `_appmoduleidunique_value eq ${parent} and componenttype eq ${src.componentType}`,
-        top: COMPONENT_PAGE_CAP,
-      });
-      // `$top` is a HARD cap in Dataverse (the SDK refuses to combine `top` with `paginate` for
-      // exactly this reason: `@odata.nextLink` is omitted, so the tail is lost with no signal). An
-      // app with more than this many components of one type would silently lose the remainder —
-      // the same silent-drop class as ADO 6603388, just at a higher threshold — so say so rather
-      // than quietly returning a partial set.
-      if ((rows || []).length >= COMPONENT_PAGE_CAP) {
-        process.stderr.write(`WARNING: this app has at least ${COMPONENT_PAGE_CAP} ${src.set} components; only the first ${COMPONENT_PAGE_CAP} were inspected, so a table referenced only beyond that point may be missing from the spec.\n`);
-      }
-      const ids = [...new Set((rows || []).map((r) => r && r.objectid).filter(Boolean).map((id) => String(id).replace(/[{}]/g, '')))];
-      // Chunk the OR-batched id lookups so a many-component app cannot build an over-long URL.
-      for (let i = 0; i < ids.length; i += 20) {
-        const filter = ids.slice(i, i + 20).map((id) => `${src.idField} eq ${id}`).join(' or ');
-        const recs = await sdk.queryRecords(src.set, { select: [src.idField, src.entityField], filter, top: 1000 });
-        // A dashboard is a `systemform` row too, and its `objecttypecode` is NOT an entity logical
-        // name ('none' / ''). Filtering it here keeps a bogus name out of the metadata fetch loop
-        // instead of relying on that fetch 404-ing into a bare catch.
-        for (const r of recs || []) {
-          const logical = r && r[src.entityField] ? String(r[src.entityField]).toLowerCase() : '';
-          if (logical && logical !== 'none') found.add(logical);
-        }
-      }
-    }
-    return [...found];
-  } catch {
-    return []; // best-effort — never break the download over the component read
+async function rowsByIds(sdk, set, idField, ids, select, mapRow) {
+  const out = [];
+  const clean = [...new Set((ids || []).map((id) => String(id || '').replace(/[{}]/g, '')).filter(Boolean))];
+  for (let i = 0; i < clean.length; i += 20) {
+    const filter = clean.slice(i, i + 20).map((id) => `${idField} eq ${id}`).join(' or ');
+    const rows = await sdk.queryRecords(set, { select, filter, paginate: true });
+    for (const r of rows || []) out.push(mapRow(r));
   }
+  return out;
 }
 
-// Read pac's downloaded page tree (<pagesRoot>/<pageId>/{page.tsx,config.json,prompt.txt}) into
-// pages[] entries with codeFile paths relative to `outDir`.
-function parseDownloadedPages(pagesRoot, outDir, nameById) {
+// The command-bar customisations of the app's tables: the modern commands (`appaction` rows) a rebuild into another environment drops,
+// because a download does not reconstruct `commands[]` (a deployed bar holds what the spec's buttons cannot state — Power Fx actions and
+// visibility, classic-rule visibility, buttons migrated from the classic ribbon). They are listed so the not-round-tripped report names
+// them as it names forms, views and charts; nothing is written from them.
+//
+// Read by `contextvalue`, the logical name of the table a table-bound command is on (the column the teardown scopes these rows by), 20
+// tables to a request, and only UNMANAGED rows: a managed command ships with its solution and exists wherever that is installed. A row
+// is this app's when it is TABLE-scoped (no app: every app that shows the table renders it) or scoped to THIS app; one scoped to another
+// app is that app's. A Group row (type 3) is a container whose buttons are rows of their own, and an inactive row is not rendered. A row
+// is answered as
+//   { "appactionid": "<guid>", "name": "contoso_Escalate!<hex>", "buttonlabeltext": "Escalate", "contextvalue": "contoso_project",
+//     "type": 0, "statecode": 0, "_appmoduleid_value": null }
+// See https://learn.microsoft.com/power-apps/developer/data-platform/reference/entities/appaction and
+// https://learn.microsoft.com/power-apps/maker/model-driven-apps/commanding-scopes
+async function readCommandInventory(sdk, appId, tables) {
+  const app = odataGuid(appId).toLowerCase();
+  const names = [...new Set((tables || []).map((t) => String(t || '').toLowerCase()).filter(Boolean))].sort(compareText);
+  const out = [];
+  for (let i = 0; i < names.length; i += 20) {
+    const onTables = names.slice(i, i + 20).map((t) => `contextvalue eq '${t.replace(/'/g, "''")}'`).join(' or ');
+    const rows = await sdk.queryRecords('appaction', {
+      select: ['appactionid', 'name', 'buttonlabeltext', 'contextvalue', 'type', 'statecode', '_appmoduleid_value'],
+      filter: `ismanaged eq false and (${onTables})`,
+      paginate: true,
+    });
+    for (const r of rows || []) {
+      if (!r || !r.appactionid) continue;
+      const owner = odataGuid(r._appmoduleid_value).toLowerCase();
+      if ((owner && owner !== app) || Number(r.type) === 3 || Number(r.statecode) === 1) continue;
+      const label = typeof r.buttonlabeltext === 'string' && r.buttonlabeltext.trim() ? r.buttonlabeltext : r.name;
+      out.push({ id: r.appactionid, name: label, entity: String(r.contextvalue || '').toLowerCase() });
+    }
+  }
+  return out;
+}
+
+// Read the two app-shell settings the BUILD writes but the download previously dropped, so a
+// downloaded spec round-trips them instead of silently reverting an app to the classic shell when it
+// is rebuilt into a fresh environment (#514).
+//
+// Only an EXPLICIT app-scope override is emitted. An absent row means "inherits the environment", and
+// the build treats an omitted field the same way — so omitting is the faithful representation, and
+// emitting a value for an inherited setting would invent an override the app never had.
+//
+// Encoding, and the trap it hides:
+//   NewLookAlwaysOn            stored as the string 'true' / 'false'
+//   HeaderAndNavigationRefresh stored as a Number TRI-STATE where 2 = on, 1 = OFF, 0 = platform
+//                              default. A truthy read reports 1 — which means disabled — as enabled,
+//                              which is the same mistake that made `ai.appFeatures: false` disable a
+//                              live app's features.
+const SHELL_SETTINGS = {
+  NewLookAlwaysOn: { field: 'newLook', decode: (v) => (String(v).toLowerCase() === 'true' ? true : (String(v).toLowerCase() === 'false' ? false : undefined)) },
+  HeaderAndNavigationRefresh: { field: 'headerNavigationRefresh', decode: (v) => (String(v) === '2' ? true : (String(v) === '1' ? false : undefined)) },
+};
+
+async function readAppShellSettings(sdk, appId) {
+  const out = {};
+  try {
+    const defs = await sdk.queryRecords('settingdefinition', {
+      select: ['settingdefinitionid', 'uniquename'],
+      filter: Object.keys(SHELL_SETTINGS).map((n) => `uniquename eq '${n}'`).join(' or '),
+      top: 10,
+    });
+    const byId = new Map((defs || []).map((d) => [odataGuid(d.settingdefinitionid).toLowerCase(), d.uniquename]));
+    if (!byId.size) return out;
+    // Bound the read by the two DEFINITIONS, not by `$top`. Dataverse honours `$top` as a hard cap and
+    // omits `@odata.nextLink`, so an app-scoped read that leans on a row
+    // limit can return a partial page — and here a partial page is not a visible truncation but a WRONG
+    // ANSWER, because an absent row is indistinguishable from "inherits the environment". The app would
+    // round-trip without its override and rebuild into the classic shell, silently, which is the exact
+    // loss this function exists to stop. Filtering server-side makes the result at most one row per
+    // definition, so no number of unrelated settings on the app can push the shell rows off the page.
+    const defFilter = [...byId.keys()].map((id) => `_settingdefinitionid_value eq ${id}`).join(' or ');
+    const rows = await sdk.queryRecords('appsetting', {
+      select: ['value', '_settingdefinitionid_value'],
+      filter: `_parentappmoduleid_value eq ${odataGuid(appId)} and (${defFilter})`,
+      top: 10,
+    });
+    for (const r of rows || []) {
+      // Both sides of this join are normalized because a miss here is SILENT — an unrecognized id just
+      // `continue`s and the setting vanishes from the spec. Measured live, Dataverse returns both
+      // `settingdefinitionid` and `_settingdefinitionid_value` as bare lower-case GUIDs, so this is
+      // belt-and-braces on a fail-quiet path rather than a fix for an observed mismatch.
+      const name = byId.get(odataGuid(r && r._settingdefinitionid_value).toLowerCase());
+      const spec = name && SHELL_SETTINGS[name];
+      if (!spec) continue;
+      const decoded = spec.decode(r.value);
+      if (decoded !== undefined) out[spec.field] = decoded;
+    }
+  } catch {
+    // Best-effort, like every other capture here: a tenant without these setting definitions, or a
+    // caller without read access to appsettings, still gets a usable spec. Losing an optional shell
+    // setting must never fail a download.
+  }
+  return out;
+}
+
+async function readDescriptionInventory(sdk, appId, solutionScope, referencedGlobalChoices, componentInventory, { tables } = {}) {
+  // `incomplete[]` records an artifact class whose read FAILED. Without it the whole app-component
+  // block shared one broad catch, so a 403 on `systemform` left `forms: []` — indistinguishable from
+  // an app with no forms, which is EXACTLY the reported bug (AB#6686423) reappearing inside the fix
+  // for it. It is a sibling key for the same reason `roleRestrictedForms` is: only the whitelisted
+  // keys reach `app-spec.json`, so this informs the CLI without changing the spec shape.
+  //
+  // `tables` are the app's tables, whose command bars are inventoried (readCommandInventory); a caller that names none reads none.
+  const inventory = { views: [], charts: [], forms: [], businessRules: [], globalChoices: [], commands: [], roleRestrictedForms: [], incomplete: [] };
+  const fail = (kind, err) => inventory.incomplete.push({ kind, reason: (err && err.message) ? String(err.message).slice(0, 200) : 'read failed' });
+  try {
+    const layer = componentInventory ? componentInventory.layer : await currentAppLayer(sdk.dataverse, appId);
+    const parent = layer.ok ? layer.appModuleIdUnique : null;
+    if (parent) {
+      // Caught PER ARTIFACT CLASS, not once around the loop: one failed query must not hide the
+      // other two, and the caller has to be told WHICH class it cannot vouch for.
+      for (const src of APP_COMPONENT_ENTITY_SOURCES) {
+        try {
+          const problem = componentInventory && componentInventory.componentProblems.get(src.componentType);
+          if (problem) throw new Error(problem);
+          const rows = componentInventory
+            ? componentInventory.components.get(src.componentType) || []
+            : await appComponentRows(sdk, parent, src.componentType);
+          // This inventory feeds the not-round-tripped report; a capped component read would turn
+          // "unknown tail" into a smaller authoritative count. Page completely instead.
+          const ids = (rows || []).map((r) => r && r.objectid).filter(Boolean);
+          if (src.set === 'savedquery') {
+            inventory.views.push(...await rowsByIds(sdk, 'savedquery', 'savedqueryid', ids, ['savedqueryid', 'name', 'returnedtypecode', 'description'], (r) =>
+              withDescription({ id: r.savedqueryid, name: r.name, entity: r.returnedtypecode }, r.description)));
+          } else if (src.set === 'savedqueryvisualization') {
+            inventory.charts.push(...await rowsByIds(sdk, 'savedqueryvisualization', 'savedqueryvisualizationid', ids, ['savedqueryvisualizationid', 'name', 'primaryentitytypecode', 'description'], (r) =>
+              withDescription({ id: r.savedqueryvisualizationid, name: r.name, entity: r.primaryentitytypecode }, r.description)));
+          } else if (src.set === 'systemform') {
+            // `formxml` is pulled ONLY to detect a role restriction — it is never stored. A form's
+            // security roles live inside formxml as `<DisplayConditions>` (there is no
+            // systemform↔role relationship), and `forms[]` is not reconstructed by this download at
+            // all, so a restricted form would come back as one every role can see. That is a silent
+            // WIDENING of access on a cross-environment rebuild, which is why it is worth one extra
+            // column on a query this download already makes.
+            //
+            // The flag is kept OFF the form entries and on a sibling key, because
+            // `sanitizeDescriptionInventory` whitelists exactly five keys — so this reaches the
+            // download CLI for its warning without leaking a new field into `app-spec.json`.
+            const rawForms = await rowsByIds(sdk, 'systemform', 'formid', ids, ['formid', 'name', 'objecttypecode', 'description', 'formxml'], (r) => r);
+            for (const r of rawForms) {
+              if (!r || !r.objecttypecode || r.objecttypecode === 'none') continue;
+              inventory.forms.push(withDescription({ id: r.formid, name: r.name, entity: r.objecttypecode }, r.description));
+              if (isRoleRestrictedFormXml(r.formxml)) {
+                inventory.roleRestrictedForms.push({ name: r.name, entity: r.objecttypecode });
+              }
+            }
+          }
+        } catch (err) {
+          fail(INVENTORY_KIND_BY_SET[src.set] || src.set, err);
+        }
+      }
+    } else {
+      // No app-component parent means NONE of the three classes could be enumerated.
+      for (const src of APP_COMPONENT_ENTITY_SOURCES) fail(INVENTORY_KIND_BY_SET[src.set] || src.set, new Error('the app\'s component list could not be read'));
+    }
+  } catch (err) {
+    for (const src of APP_COMPONENT_ENTITY_SOURCES) fail(INVENTORY_KIND_BY_SET[src.set] || src.set, err);
+  }
+
+  // The app's own solution(s), resolved ONCE: the business-rule and the global-choice reads are both
+  // scoped to them. `solutionScope` is one uniquename, EVERY candidate when the app is in several
+  // (#587 item 9), or an Error when its membership could not be read (runDownload decides which).
+  // Built-in containers (Default/Active/Basic) hold every unmanaged customization in the org, so they
+  // scope nothing and are dropped. A FAILED lookup is kept apart as `solutionError`, because "the app
+  // has no solution" and "we could not look" are different facts: each dependent class must report the
+  // second as unknown rather than as empty.
+  let solutionError = solutionScope instanceof Error ? solutionScope : null;
+  const solIds = [];
+  if (!solutionError) {
+    try {
+      for (const name of [].concat(solutionScope || []).filter((n) => n && !isRestrictedSolution(n))) {
+        const esc = String(name).replace(/'/g, "''");
+        const sols = await sdk.queryRecords('solution', { select: ['solutionid'], filter: `uniquename eq '${esc}'`, top: 1 });
+        if (sols && sols[0] && sols[0].solutionid) solIds.push(sols[0].solutionid);
+      }
+    } catch (err) {
+      solutionError = err;
+    }
+  }
+
+  try {
+    if (solutionError) throw solutionError;
+    // Solution component type 29 is Workflow — which is EVERY process kind, not just business
+    // rules: classic workflows, actions, business process flows and modern flows all land here.
+    // See component type values: https://learn.microsoft.com/power-apps/developer/data-platform/reference/entities/solutioncomponent
+    //
+    // So the rows must be narrowed after the fetch. A business rule is `category 2`, and `type 1`
+    // is the DEFINITION — activating one makes Dataverse create a second `type 2` copy of it, so
+    // without the type filter every active rule would appear twice in the inventory.
+    //
+    // Filtered client-side rather than in the query because `rowsByIds` batches on the id column;
+    // both fields are requested in the select so the decision is made on real values, and a row
+    // that reports NEITHER field is dropped rather than assumed to be a rule — fail closed, since
+    // mislabelling somebody's classic workflow as a business rule is the failure mode here.
+    const ids = [];
+    for (const solId of solIds) {
+      const comps = await sdk.queryRecords('solutioncomponent', { select: ['objectid', 'componenttype'], filter: `_solutionid_value eq ${solId} and componenttype eq 29`, paginate: true });
+      ids.push(...(comps || []).map((r) => r && r.objectid).filter(Boolean));
+    }
+    // rowsByIds de-duplicates, so a rule in two of the candidate solutions is listed once.
+    const processes = await rowsByIds(sdk, 'workflow', 'workflowid', ids, ['workflowid', 'name', 'primaryentity', 'description', 'category', 'type'], (r) => r);
+    for (const r of processes) {
+      if (Number(r && r.category) !== 2 || Number(r && r.type) !== 1) continue;
+      inventory.businessRules.push(withDescription({ id: r.workflowid, name: r.name, entity: r.primaryentity }, r.description));
+    }
+  } catch (err) {
+    // FAIL CLOSED, not silent. This used to swallow the error as "an inspection aid, not a rebuild
+    // prerequisite", which was defensible while nothing consumed the list. It is not any more:
+    // `notRoundTrippedSummary` now reports business rules as a class that does not round-trip, and it
+    // reports a class only when it has rows — so a 403 or 500 here leaves the list empty and the
+    // report silently asserts the app HAS no business rules. "Unknown" and "none" must never look
+    // alike in a report whose entire purpose is naming what was left behind.
+    fail('businessRules', err);
+  }
+
+  try {
+    // Global option sets are not app components, but their Description is another Dataverse Label. This
+    // is intentionally an inventory, not `globalChoices[]`: without options we cannot safely claim a
+    // rebuildable choice definition.
+    //
+    // Read through the RAW client, NOT `sdk.queryRecords`. `queryRecords` resolves its first argument
+    // to an entity SET name via `EntityDefinitions(LogicalName='<arg>')?$select=EntitySetName`, and
+    // `GlobalOptionSetDefinitions` is a metadata collection rather than a table, so that lookup 404s
+    // and the catch below would swallow it — leaving this inventory permanently empty while the
+    // download still reported success. Same trap, and same fix, as readEntityWithDescriptions.
+    //
+    // `dataverse.get` RESOLVES on a non-2xx instead of throwing, so an unsuccessful or malformed
+    // response has to be REJECTED explicitly. Coercing it to `[]` (the previous `|| []`) put the
+    // failure beyond the catch's reach, so a metadata 403 was indistinguishable from an environment
+    // with no global choices — and now that the report consumes this list, that reads as a positive
+    // claim rather than an absence of information.
+    //
+    // Only UNMANAGED option sets are inventoried. A managed one ships with its solution and exists in
+    // any environment that has that solution installed, so naming it as "not round-tripped" is false:
+    // there is nothing for a rebuild to recreate. Measured live on a stock environment: 149 global
+    // option sets total, of which exactly 1 was unmanaged — so reporting all of them buried the two
+    // real findings (a form and a view) under 148 lines the maker can neither act on nor recognise.
+    //
+    // The filter is CLIENT-side because `GlobalOptionSetDefinitions` rejects `$filter` outright —
+    // `?$filter=IsManaged eq false` answers HTTP 405 `0x80060888 "The query parameter $filter is not
+    // supported on GlobalOptionSetDefinitions"`. `IsCustomOptionSet` is deliberately NOT the
+    // discriminator: 59 of those 149 were "custom", nearly all of them first-party managed-solution
+    // choices (msdyn_*, mspp_*), so it reproduces most of the noise.
+    //
+    // An ABSENT `IsManaged` keeps the row. This inventory's whole purpose is to avoid asserting an
+    // absence it cannot substantiate, so an unreadable flag degrades to "report it" rather than to a
+    // silent drop.
+    //
+    // And the inventory is SCOPED TO THE APP (#586 item 5): a set is listed only when the app's
+    // SOLUTION owns it, or when a column this download emits REFERENCES it (so its description is
+    // kept). The metadata collection is org-wide, so listing every unmanaged row told the author to
+    // recreate metadata the app has nothing to do with — measured live, an isolated app whose spec
+    // declared no global choices was reported as leaving two behind while its solution held zero
+    // option-set components. Ownership is solution component type 9 (OptionSet), whose `objectid` is
+    // the set's MetadataId — hence MetadataId in the $select, and the join is on normalized GUIDs.
+    // See: https://learn.microsoft.com/power-apps/developer/data-platform/reference/entities/solutioncomponent
+    if (solutionError) throw solutionError;
+    const owned = new Set();
+    for (const solId of solIds) {
+      const comps = await sdk.queryRecords('solutioncomponent', { select: ['objectid'], filter: `_solutionid_value eq ${solId} and componenttype eq 9`, paginate: true });
+      for (const r of comps || []) if (r && r.objectid) owned.add(odataGuid(r.objectid).toLowerCase());
+    }
+    const referenced = new Set([...(referencedGlobalChoices || [])].map((n) => String(n).toLowerCase()));
+    // Nothing in scope — no solution that could own a set, and no emitted column binding one — means
+    // there is nothing of THIS app's to find, so the org-wide read is skipped rather than filtered to
+    // an empty list. That is not an unknown: the sets the app binds are all declared in the spec.
+    if (owned.size || referenced.size) {
+      const res = await sdk.dataverse.get('/GlobalOptionSetDefinitions?$select=Name,Description,IsManaged,MetadataId');
+      if (!res || res.status < 200 || res.status >= 300) throw new Error(`HTTP ${res && res.status}`);
+      if (!res.body || !Array.isArray(res.body.value)) throw new Error('the response carried no value[] array');
+      inventory.globalChoices.push(
+        ...res.body.value
+          .filter((r) => r && r.IsManaged !== true)
+          .filter((r) => owned.has(odataGuid(r.MetadataId).toLowerCase()) || referenced.has(String(r.Name || '').toLowerCase()))
+          .map((r) => withDescription({ name: r.Name }, r.Description))
+      );
+    }
+  } catch (err) {
+    fail('globalChoices', err);
+  }
+
+  // A failed read is UNKNOWN, never "the app has no commands" — the same rule as every class above.
+  if (Array.isArray(tables)) {
+    try {
+      inventory.commands.push(...await readCommandInventory(sdk, appId, tables));
+    } catch (err) {
+      fail('commands', err);
+    }
+  }
+
+  // Ordered here, once, for everything that reads the inventory — the spec's `descriptionInventory`, the not-round-tripped report
+  // and the role-restriction warning. The rows are in the order Dataverse answered, which differs between two reads of one app; by
+  // table, then name, then id (compareArtifacts) they do not.
+  for (const key of ['views', 'charts', 'forms', 'businessRules', 'commands', 'roleRestrictedForms']) inventory[key].sort(compareArtifacts);
+  inventory.globalChoices.sort((a, b) => compareText(a.name, b.name));
+  inventory.incomplete.sort((a, b) => compareText(a.kind, b.kind) || compareText(a.reason, b.reason));
+  return Object.fromEntries(Object.entries(inventory).filter(([, value]) => value.length));
+}
+
+// Read the page tree a download writes (<pagesRoot>/<pageId>/{page.tsx,config.json,prompt.txt}) into
+// pages[] entries with codeFile paths relative to `outDir`. The same layout is what scripts/genpage.js download writes (both through
+// lib/genpage-sdk.js `pageFolderFiles`) and what an earlier release's `pac model genpage download` wrote, so a folder downloaded by either is read the same way.
+//
+// `unreadable` collects pages whose config.json EXISTS but could not be parsed. That distinction is
+// load-bearing: a MISSING config is genuinely optional, but a present-and-unparseable one means the
+// page's `dataSources` are unknown — and defaulting them to `[]` writes a spec that rebuilds the
+// page with NO table bindings while its source still queries the table. Silent, and only visible
+// once the rebuilt page returns nothing.
+//
+// `unkeptModels` collects pages whose model id the App Spec cannot hold (`PAGE_MODEL_RE`): written into
+// the spec it would fail validation and block a rebuild, so it is left out and reported instead.
+//
+// `unkeptBindings` collects the pages whose config.json holds a list of connector or Custom API bindings the spec cannot state: { pageId, field, reason }. The list is not a list, or an entry is not an object
+// (`pageBindingsProblem`), or an entry holds anything a spec does not state (see the projection below). `reason` names the place and the vetted property, never a value or an unrecognized key.
+function parseDownloadedPages(pagesRoot, outDir, nameById, unreadable, unkeptModels, unkeptBindings) {
   const pages = [];
   if (!fs.existsSync(pagesRoot)) return pages;
-  for (const entry of fs.readdirSync(pagesRoot)) {
+  // Read in the pages' own order (comparePages), not the directory's: `readdirSync` lists in the file system's order, which is
+  // not the same on every machine, and this loop decides the order of `pages[]` in the spec and of the unreadable-config and
+  // unkept-model reports. It decides no page key: assignPageKeys mints in the order of the pages' ids, whatever order it is given.
+  const nameOf = (entry) => (nameById && nameById.get(String(entry).toLowerCase())) || entry;
+  const entries = fs.readdirSync(pagesRoot)
+    .map((entry) => ({ pageId: entry, name: nameOf(entry) }))
+    .sort(comparePages)
+    .map((page) => page.pageId);
+  for (const entry of entries) {
     const dir = path.join(pagesRoot, entry);
     if (!fs.statSync(dir).isDirectory()) continue;
     const tsx = path.join(dir, 'page.tsx');
     if (!fs.existsSync(tsx)) continue;
     let config = {};
-    try { config = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8')); } catch { /* optional */ }
-    let prompt = '';
-    try { prompt = fs.readFileSync(path.join(dir, 'prompt.txt'), 'utf8').trim(); } catch { /* optional */ }
+    const configPath = path.join(dir, 'config.json');
+    // Read DIRECTLY and let ENOENT — and ONLY ENOENT — mean "absent, therefore optional".
+    // `existsSync` returns false for a file that exists but cannot be OPENED (permissions/ACL), which
+    // made an unreadable config indistinguishable from a missing one: the page was emitted with no
+    // bindings and never recorded as unreadable, so it slipped past the --allow-lossy-download gate
+    // this very function exists to feed.
+    try {
+      // MEASURED: the config.json an earlier release's `pac model genpage download` wrote starts `ef bb bf` (this release's downloads write none — the SDK keeps the stored
+      // text — but a folder downloaded then is still read). Node's
+      // 'utf8' decode keeps that BOM as U+FEFF, and JSON.parse REJECTS a leading U+FEFF — so a
+      // perfectly valid downloaded config threw, the old catch substituted `{}`, and the page's
+      // table bindings vanished from the emitted spec. A BOM is an encoding marker, not content.
+      config = JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
+      if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('config.json is not a JSON object');
+      if (Object.prototype.hasOwnProperty.call(config, 'dataSources')) {
+        if (!Array.isArray(config.dataSources)) throw new Error('config.json dataSources is present but is not an array');
+        const bad = config.dataSources.find((value) => typeof value !== 'string' || !value.trim());
+        if (bad !== undefined) throw new Error('config.json dataSources must be an array of non-empty table logical names');
+      }
+    } catch (e) {
+      config = {};
+      // Present but unreadable — report it rather than inventing empty metadata. A genuinely absent
+      // config is optional by contract and is NOT reported.
+      if (!(e && e.code === 'ENOENT') && unreadable) {
+        unreadable.push({ pageId: entry, reason: e && e.message ? e.message : String(e) });
+      }
+    }
+    // A MISSING prompt.txt is an OMISSION, not an empty prompt. Emitting '' made every downloaded
+    // page lacking that optional file look like an explicitly blank prompt, which the build's
+    // blank-provenance guard then refuses — aborting the rebuild of a perfectly good downloaded app.
+    // A file that EXISTS but is blank or unreadable stays explicit, so it still fails closed.
+    let prompt;
+    try {
+      prompt = fs.readFileSync(path.join(dir, 'prompt.txt'), 'utf8').replace(/^\uFEFF/, '');
+    } catch (e) {
+      prompt = (e && e.code === 'ENOENT') ? undefined : '';
+    }
+    // The model that generated the page, as config.json records it. It has to come back with the page:
+    // a rebuild that re-uploads a page without its model must not lose the one the page was generated with (an
+    // upload through `pac` (what an earlier release used) stored whatever `--model` it was sent, so one without it wiped the id to "" — live-measured).
+    // Only an id the spec can hold is carried (see above).
+    const recordedModel = typeof config.model === 'string' ? config.model.trim() : '';
+    const model = PAGE_MODEL_RE.test(recordedModel) ? recordedModel : undefined;
+    if (recordedModel && !model && Array.isArray(unkeptModels)) unkeptModels.push({ pageId: entry, model: recordedModel });
+    // The page's connector and Custom API bindings, written into the spec only when the spec can state them WHOLE (page-bindings.js has the threat model and every sink): each key one of the properties the
+    // references document, each value of a conservative shape known to be safe. A binding can carry anything — a connection id, a credential written into a connectors.json (genpage-upload.js takes any JSON
+    // array) as a value, a key or part of a URL, a property a later runtime adds — and the spec is what is committed and shared, so a list with any such thing in any entry is left out of the spec WHOLE and
+    // recorded in `unkeptBindings`, with the place and the vetted property's name only. Nothing is projected out of it: an entry stated without its identity, or without a property it holds, would make a rebuild
+    // REPLACE the page's entry with less (mergeBindings matches entries by identity), while a list the spec leaves out is one a rebuild does not send, so the page keeps it as it is — no write, no publish. It
+    // stays, too, in the page folder's own config.json, which this does not rewrite.
+    // A list that has an entry is carried; an empty one is not, as it says what a page with none already says. `null` is the page's way of holding none (the backend reads it as "not given"), so there is nothing to report.
+    // A list left out is reported and not a gate — a page whose list is left out keeps it when it is rebuilt into this environment, which is what a rebuild did before the spec could state bindings — whereas the
+    // page's data sources, which a rebuild replaces, are (above).
+    const bindings = {};
+    for (const kind of Object.keys(PAGE_BINDINGS)) {
+      if (!Object.prototype.hasOwnProperty.call(config, kind) || config[kind] === null) continue;
+      const problem = pageBindingsProblem(kind, config[kind]);
+      if (problem) {
+        if (Array.isArray(unkeptBindings)) unkeptBindings.push({ pageId: entry, field: kind, reason: problem });
+        continue;
+      }
+      if (!config[kind].length) continue;
+      const projected = statableBindings(kind, config[kind]);
+      if (projected.problem) {
+        if (Array.isArray(unkeptBindings)) unkeptBindings.push({ pageId: entry, field: kind, reason: bindingProblemText(kind, projected.problem.entry, projected.problem) });
+        continue;
+      }
+      bindings[kind] = projected.stated;
+    }
     pages.push({
       pageId: entry,
-      name: (nameById && nameById.get(String(entry).toLowerCase())) || entry,
-      dataSources: config.dataSources || [],
+      name: nameOf(entry),
+      dataSources: Object.prototype.hasOwnProperty.call(config, 'dataSources') ? config.dataSources : [],
+      ...(model ? { model } : {}),
+      ...bindings,
       prompt,
       codeFile: path.relative(outDir, tsx).replace(/\\/g, '/'),
     });
@@ -239,13 +1156,249 @@ function parseDownloadedPages(pagesRoot, outDir, nameById) {
   return pages;
 }
 
-// Assign a STABLE key to every downloaded page + carry the manifest's v2 semantics. `keyToId` (from
-// reconcilePageIds — the authority: manifest-confirmed-live id → unique live-name, ambiguous already
-// HALTed upstream) binds manifest keys to live ids; a page bound there reuses that key + purpose/
-// navigatesTo/pageInput/dataSources. A page with NO binding (legacy app / Maker-authored) gets a FRESH
-// unique slug key (design §7.3 — NOT the old name shape, which drifted on rename). Returns idToKey for
-// reverse-normalizing nav literals. Mutates pages. This uses reconcilePageIds, NOT a name-collapsing Map.
-function assignPageKeys(pages, manifest, keyToId) {
+// The names a page's bindings go by — `PAGE_BINDINGS` says which property of an entry names it — each once, in code-unit order (compareText). An entry with no name (a page can hold one; the validator warns of it)
+// is listed as `(no <property>)`, so a page that holds a binding never reads as one that holds none.
+function bindingNames(list, identity) {
+  const names = (Array.isArray(list) ? list : []).map((entry) => (entry && typeof entry[identity] === 'string' && entry[identity].trim() ? entry[identity].trim() : `(no ${identity})`));
+  return [...new Set(names)].sort(compareText);
+}
+
+// What the connector and Custom API bindings of the pages a download read come to, and what a rebuild into ANOTHER environment still cannot bring:
+//   { pages: [{ key, name, connectorBindings?: [name…], actionBindings?: [name…] }], notCarried?: [{ key, name, field, reason }], neededInTarget: { connectionReferences?, customApis?, dataverseOperations?, serviceResources? }, note }
+// or null when no page holds a binding or lost one. `pages` are the pages whose bindings are in the spec, in the order the spec lists its pages, each with the names its bindings go by (identifiers: a list is
+// in the spec only when every value in it has a safe shape, page-bindings.js); `notCarried` the lists a page holds that the spec cannot state (`unkept`, from parseDownloadedPages), each with the place and the
+// vetted property that kept it out, never a value — a rebuild into this environment leaves those as they are, and a rebuild into another does not carry them.
+//
+// The spec carries the binding LISTS: they are plain text in the page's config.json, so a rebuild writes them in any environment. It carries nothing of what they name, and a rebuild makes none of it:
+//   - a connector binding names a CONNECTION REFERENCE by its logical name. The reference is a Dataverse row that points at a connection, and a connection holds a user's sign-in, so it stays in the environment
+//     that made it; the page resolves the reference by name, which is how the page itself can travel (https://learn.microsoft.com/power-apps/maker/data-platform/create-connection-reference);
+//   - a Custom API binding names a Custom API by its unique name. A Custom API is a solution component, not an App Spec item (https://learn.microsoft.com/power-apps/developer/data-platform/custom-api);
+//   - a binding whose name is EXACTLY WhoAmI or RetrieveVersion names a reviewed built-in Dataverse operation (lib/dataverse-operations.js), not a Custom API: it is a message the platform defines, so there
+//     is nothing to deploy, and `dataverseOperations` names it apart from `customApis` — a legacy or contradictory entry too (a parameter map does not make the name a Custom API). The binding is carried
+//     as the page holds it, not repaired, and nothing says the operation is available in another environment, its player or to its users: that is not certified. Any other spelling is a Custom API name;
+//   - what a connector binding points at inside the service — `dataset`, `tables`: a SharePoint site and its list ids, say — is written as the page holds it, and means something in another environment only if the same
+//     resources are there. `serviceResources` names the connection references whose bindings carry one.
+function pageBindingsReport(pages, unkept) {
+  const held = [];
+  const references = new Set();
+  const apis = new Set();
+  const builtIns = new Set();
+  const service = new Set();
+  const nonEmpty = (list) => Array.isArray(list) && list.length > 0;
+  for (const page of pages || []) {
+    if (!nonEmpty(page.connectorBindings) && !nonEmpty(page.actionBindings)) continue;
+    const entry = { key: page.key, name: page.name };
+    if (nonEmpty(page.connectorBindings)) {
+      entry.connectorBindings = bindingNames(page.connectorBindings, PAGE_BINDINGS.connectorBindings);
+      for (const binding of page.connectorBindings) {
+        const name = binding && typeof binding.logicalName === 'string' ? binding.logicalName.trim() : '';
+        if (!name) continue;
+        references.add(name);
+        if (binding.dataset || nonEmpty(binding.tables)) service.add(name);
+      }
+    }
+    if (nonEmpty(page.actionBindings)) {
+      entry.actionBindings = bindingNames(page.actionBindings, PAGE_BINDINGS.actionBindings);
+      for (const binding of page.actionBindings) {
+        const name = binding && typeof binding.name === 'string' ? binding.name.trim() : '';
+        // The exact name, as the catalogue matches it (`whoami` is a Custom API name).
+        if (binding && getReviewedDataverseOperation(binding.name)) builtIns.add(binding.name);
+        else if (name) apis.add(name);
+      }
+    }
+    held.push(entry);
+  }
+  const byId = new Map((pages || []).map((p) => [String(p.pageId).toLowerCase(), p]));
+  const notCarried = (unkept || []).map((u) => {
+    const page = byId.get(String(u.pageId).toLowerCase()) || {};
+    return { key: page.key, name: page.name === undefined ? u.pageId : page.name, field: u.field, reason: u.reason };
+  }).sort((a, b) => compareText(a.name, b.name) || compareText(a.field, b.field));
+  if (!held.length && !notCarried.length) return null;
+  const sorted = (set) => [...set].sort(compareText);
+  return {
+    pages: held,
+    ...(notCarried.length ? { notCarried } : {}),
+    neededInTarget: {
+      ...(references.size ? { connectionReferences: sorted(references) } : {}),
+      ...(apis.size ? { customApis: sorted(apis) } : {}),
+      ...(builtIns.size ? { dataverseOperations: sorted(builtIns) } : {}),
+      ...(service.size ? { serviceResources: sorted(service) } : {}),
+    },
+    note: 'The spec states these bindings, so a rebuild writes them onto each page in any environment. A rebuild cannot create what they name — the connection references and the connections behind them, the Custom APIs, and the '
+      + 'service resources a connector binding points at — so each must already exist in the environment you rebuild into. A rebuild reads them there before it writes a page: it stops, before writing anything, at a connection '
+      + 'reference that is for another connector, and says by name each reference and Custom API that is not there, a reference that has no connection, and an operation a custom connector there does not define.'
+      + (builtIns.size ? ' The built-in Dataverse operations (dataverseOperations) are not solution components and there is nothing to make for them: their bindings are preserved as the page holds them, not repaired, '
+        + 'and whether an environment, its page player and the signed-in user can call them, or whether a binding matches the reviewed contract, is not certified.' : ''),
+  };
+}
+
+// Render `pageBindingsReport` as the operator-facing text on stderr, kept apart from the computation (as notRoundTrippedWarning is) so the wording is testable without a download. The scripts it names are
+// the ones that make each missing piece in the target environment.
+function pageBindingsNote(report) {
+  if (!report) return '';
+  const lines = [];
+  const needed = report.neededInTarget || {};
+  const list = (names) => names.join(', ');
+  if (report.pages.length) {
+    lines.push(
+      `NOTE: ${report.pages.length} page(s) hold connector or Custom API bindings, and the spec states them (pages[].connectorBindings, pages[].actionBindings), so a rebuild writes them back onto the page — here or in another environment.`,
+      '  Rebuilding into THIS environment keeps them working. Rebuilding into a DIFFERENT environment writes them, but cannot bring what they name, which has to be there first:',
+    );
+    if (needed.connectionReferences) {
+      lines.push(`    - connection reference(s) ${list(needed.connectionReferences)}, and the connection each one goes through (a connection holds a user's sign-in, so it stays where it was made): create the reference there with create-connection-reference.js, or move it with a solution (add-page-to-solution.js --connection-refs, then solution-settings.js for the connection ids)`);
+    }
+    if (needed.customApis) {
+      lines.push(`    - Custom API(s) ${list(needed.customApis)}: a Custom API is a solution component, not an App Spec item — deploy it there first (list-custom-apis.js lists what an environment has); one bound to a table needs that table there too`);
+    }
+    if (needed.dataverseOperations) {
+      lines.push(`    - built-in Dataverse operation(s) ${list(needed.dataverseOperations)}: an operation the platform defines, not a solution component, so there is nothing to make for it — the binding is carried as the page holds it, not repaired, and whether that environment, its page player and the signed-in user can call it is not certified (a rebuild reads nothing for it)`);
+    }
+    if (needed.serviceResources) {
+      lines.push(`    - what the connector bindings of ${list(needed.serviceResources)} point at inside the service (dataset, tables: a SharePoint site and list ids, for example) is written as it is here, and works there only if the same resources exist`);
+    }
+    lines.push('  Until they are, the page cannot use those bindings. A rebuild reads them in the environment it writes to: it stops, before writing anything, at a connection reference that is for another connector, and names each reference and Custom API that is not there, each reference that has no connection, and each operation a custom connector there does not define. The pages:');
+    for (const page of report.pages) {
+      const parts = [];
+      if (page.connectorBindings) parts.push(`connectorBindings: ${list(page.connectorBindings)}`);
+      if (page.actionBindings) parts.push(`actionBindings: ${list(page.actionBindings)}`);
+      lines.push(`    ${page.name}${page.key ? ` [${page.key}]` : ''} — ${parts.join('; ')}`);
+    }
+  }
+  if (report.notCarried && report.notCarried.length) {
+    lines.push(
+      `WARNING: ${report.notCarried.length} list(s) of connector or Custom API bindings are NOT in the spec, because the spec cannot state them as the page holds them: ${report.notCarried.map((n) => `${JSON.stringify(n.name)} (${n.reason})`).join('; ')}.`,
+      '  Rebuilding into THIS environment leaves such a page\'s bindings as they are. Rebuilding into a DIFFERENT environment will not carry them — bind them there with /genpage (genpage-upload.js --connectors / --actions).',
+      '  A spec states a binding only by the properties the references document, each with a value of a shape known to be safe, so a list holding anything else — a connection id, a credential, a property this plugin '
+      + 'does not know — is left out whole (the values are never printed). It is still in the page folder\'s own config.json (pages/<page id>/config.json), which is the page as this environment holds it and is not '
+      + 'rewritten: keep that folder out of version control, and do not share it, if a value there is a credential.',
+    );
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+// The page keys an earlier download of this app left in the output folder: { keys, conflicts, problem, unidentified }, read from the app-spec.json this
+// download is about to replace (the working folder of an edit session holds it). A key is a page's identity in a rebuild — a copy of that spec deployed to
+// another environment binds each key to the page it created there — so a page whose id is read again keeps the key it had, whatever it is called now or
+// however the names sort, instead of being given one afresh (assignPageKeys).
+//
+// What is read of the file is each page's `pageId` and `key`, and `app.uniqueName` to tell this app's spec from any other:
+//   { "app": { "uniqueName": "contoso_app" }, "pages": [ { "key": "work-order", "pageId": "10000000-0000-4000-8000-000000000001", ... }, ... ] }
+// A page id does not say which app a key belongs to — a page can be in several apps, each with its own page manifest and so its own keys — so the file is
+// this app's only when it SAYS so: `app.uniqueName` is a text and is this app's unique name. The name is read as the build reads an app's identity
+// (appUniqueName, lib/sdk-build.js) and compared without case, as Dataverse compares unique names (lib/deployed-baseline.js readBaseline does the same).
+// A gap is never a wildcard. A spec that names another app is skipped. One that names none is skipped too — an authored spec derives its identity from its
+// publisher prefix and name and writes none, and a hand edit can leave a null, a blank or a number — and is reported (`unidentified`) when it held keys that
+// could have been used. (The identity appUniqueName derives for such a spec is a guess at what the build would create, not something the file says.)
+//
+// `keys` (Map<lower-cased page id, key>) holds the entries that are clear. An entry with no id or no key, or a key outside the key grammar, is skipped.
+// A key given to two pages, or a page given two keys, is ambiguous — the file was edited by hand — and is kept for none of them; each such group is in
+// `conflicts` as { keys, pageIds }: one page and the keys it is given, or one key and the pages it is given to. With `livePageIds`, only the rows of those
+// pages are read at all: a row of a page the app no longer has says nothing about a page it has, so it neither voids a clear key nor makes a conflict.
+//
+// Best-effort, like the other things read back from this file (preserveAuthoredLanguageCode): a missing file keeps nothing and says nothing; one that
+// cannot be read keeps nothing and says so (`problem`), because the keys are then minted afresh and may differ from the ones a deployed copy was built
+// with. `problem` never quotes the file: a parse error carries a piece of the text, and a link planted at this name could point at any file.
+function readPreviousPageKeys(specPath, appUnique, { livePageIds } = {}) {
+  const none = (extra = {}) => ({ keys: new Map(), conflicts: [], problem: null, unidentified: false, ...extra });
+  let prior;
+  try {
+    assertPlainFileTarget(specPath); // a missing file passes; a link, a folder or a hard link is refused, unread
+    prior = JSON.parse(fs.readFileSync(specPath, 'utf8').replace(/^\uFEFF/, ''));
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return none();
+    if (error && error.code === 'UNSAFE_OUTPUT') return none({ problem: `it is not a regular file with one name (${error.reason})` });
+    return none({ problem: error instanceof SyntaxError ? 'it is not valid JSON' : String((error && error.code) || (error && error.message) || error) });
+  }
+  if (!prior || typeof prior !== 'object' || !Array.isArray(prior.pages)) return none();
+  const live = livePageIds ? new Set(Array.from(livePageIds, (id) => String(id).trim().toLowerCase())) : null;
+  const rows = [];
+  for (const page of prior.pages) {
+    if (!page || typeof page.key !== 'string' || !KEY_GRAMMAR.test(page.key) || typeof page.pageId !== 'string' || !page.pageId.trim()) continue;
+    const id = page.pageId.trim().toLowerCase();
+    if (!live || live.has(id)) rows.push({ id, key: page.key });
+  }
+  const ours = typeof appUnique === 'string' ? appUnique.trim().toLowerCase() : '';
+  if (!ours) return none();
+  const said = prior.app && typeof prior.app.uniqueName === 'string' && prior.app.uniqueName.trim() ? appUniqueName(prior).trim().toLowerCase() : '';
+  if (!said) return none({ unidentified: rows.length > 0 });
+  if (said !== ours) return none();
+  const idsOfKey = new Map();
+  const keysOfId = new Map();
+  const add = (map, from, to) => { if (!map.has(from)) map.set(from, new Set()); map.get(from).add(to); };
+  for (const { id, key } of rows) {
+    add(idsOfKey, key, id);
+    add(keysOfId, id, key);
+  }
+  const keys = new Map();
+  const ofSeveralKeys = [];
+  const ofSeveralPages = [];
+  for (const [id, own] of keysOfId) {
+    const [key] = own;
+    if (own.size === 1 && idsOfKey.get(key).size === 1) keys.set(id, key);
+    if (own.size > 1) ofSeveralKeys.push({ keys: [...own].sort(compareText), pageIds: [id] });
+  }
+  for (const [key, owners] of idsOfKey) {
+    if (owners.size > 1) ofSeveralPages.push({ keys: [key], pageIds: [...owners].sort(compareText) });
+  }
+  // In an order of their own, not the file's: pages given several keys by page id, then keys given to several pages by key.
+  ofSeveralKeys.sort((a, b) => compareText(a.pageIds[0], b.pageIds[0]));
+  ofSeveralPages.sort((a, b) => compareText(a.keys[0], b.keys[0]));
+  return { keys, conflicts: [...ofSeveralKeys, ...ofSeveralPages], problem: null, unidentified: false };
+}
+
+// The pages the earlier spec's keys leave undecided, and what is wrong with them: `conflicts` is what readPreviousPageKeys found (about the pages of this download
+// only) and `keyToId` the keys the page manifest binds (key -> id). A page the manifest binds is not undecided, whatever the file says of it: the manifest is the
+// authority, and its key is used. Of every other page in a conflict the file cannot say which key a deployed copy was built with. Returns the pages (by name, then
+// id, as { pageId, name }) and the conflicts that concern one of them, or null when there are none.
+function undecidedPageKeys(conflicts, keyToId, nameById) {
+  const bound = new Set(Array.from((keyToId || new Map()).values(), (id) => String(id).toLowerCase()));
+  const undecided = new Map();
+  const concerning = [];
+  for (const conflict of conflicts || []) {
+    const open = conflict.pageIds.filter((id) => !bound.has(id));
+    if (!open.length) continue;
+    concerning.push(conflict);
+    for (const id of open) undecided.set(id, (nameById && nameById.get(id)) || id);
+  }
+  if (!undecided.size) return null;
+  return { pages: [...undecided].map(([pageId, name]) => ({ pageId, name })).sort(comparePages), conflicts: concerning };
+}
+
+// The refusal of a download whose earlier spec leaves page keys undecided (undecidedPageKeys). It names each page with its id and each key, says why guessing is
+// not safe and what the two ways on are. It is the only thing the download answers then: nothing has been written.
+function pageKeysRefusal(specPath, undecided, nameById) {
+  const quoted = (list) => list.map((key) => `'${key}'`).join(', ');
+  const named = (id) => ({ pageId: id, name: (nameById && nameById.get(id)) || id });
+  const describe = (pages) => pages.map((p) => `${JSON.stringify(p.name)} (${p.pageId})`).join(', ');
+  const found = undecided.conflicts.map((c) => (c.pageIds.length > 1
+    ? `the key ${quoted(c.keys)} is given to ${c.pageIds.length} pages: ${describe(c.pageIds.map(named).sort(comparePages))}`
+    : `${describe(c.pageIds.map(named))} is given ${c.keys.length} keys: ${quoted(c.keys)}`));
+  return {
+    ok: false,
+    code: 'page-keys-ambiguous',
+    error: `the page keys in ${specPath} cannot be told apart for ${undecided.pages.length} page(s) that the app's page manifest does not bind: ${found.join('; ')}. `
+      + 'A page\'s key is its identity in a rebuild: a copy of an earlier spec that was deployed to another environment has each key bound to the page it built there, '
+      + 'so giving these pages fresh keys could make that copy update the wrong pages. Nothing was written. Correct the file so that each page has one key and each key one page '
+      + '(the keys an earlier download wrote are the ones a deployed copy was built with) and download again; or download again with --reset-page-keys to give exactly these pages '
+      + 'fresh keys, minted in page-id order (every other page keeps its key), and check each key against every environment that holds a copy of the earlier spec before you deploy this spec there.',
+    pages: undecided.pages,
+    conflicts: undecided.conflicts,
+  };
+}
+
+// Assign a STABLE key to every downloaded page + carry the manifest's v2 semantics. A page's key is its identity in a rebuild (a spec
+// deployed to another environment holds no page ids, so that environment binds each key to the page it created there): once a page has
+// one it keeps it, and a key never depends on the order pages are read or written in. It comes from, in this order:
+//   1. the manifest: `keyToId` (from reconcilePageIds — the authority: manifest-confirmed-live id → unique live-name, ambiguous already
+//      HALTed upstream) binds manifest keys to live ids; a page bound there reuses that key + purpose/navigatesTo/pageInput/dataSources;
+//   2. `previousKeys` (Map<lower-cased page id, key>, readPreviousPageKeys): the key an earlier download of this app gave the page,
+//      matched by the page's id — unless the manifest already gave that key to another page;
+//   3. a FRESH unique slug of the page's name, for a page with neither (legacy app / Maker-authored; design §7.3 — NOT the old name
+//      shape, which drifted on rename). Only these are minted, after every key above is taken, and in the order of the pages' IDS: when two
+//      names make one slug, the lower id gets the plain slug and the next `-2`. Never by name, which is not stable, never by the order
+//      the pages arrive in. (It is the order earlier releases minted in on a file system that lists its folders by name.)
+// Returns idToKey for reverse-normalizing nav literals. Mutates pages. This uses reconcilePageIds, NOT a name-collapsing Map.
+function assignPageKeys(pages, manifest, keyToId, previousKeys) {
   const idToKey = new Map();
   const used = new Set();
   const manifestByKey = new Map(((manifest && manifest.pages) || []).map((m) => [m.key, m]));
@@ -272,22 +1425,35 @@ function assignPageKeys(pages, manifest, keyToId) {
       if (m.purpose !== undefined) p.purpose = m.purpose;
       if (m.navigatesTo) p.navigatesTo = m.navigatesTo;
       if (m.pageInput !== undefined) p.pageInput = m.pageInput;
-      // Only copy manifest dataSources when the download gave us nothing (pac may include them).
+      // Only copy manifest dataSources when the download gave us nothing (the page's own config normally carries them).
       if (m.dataSources && !(p.dataSources || []).length) p.dataSources = m.dataSources;
     }
   }
-  // Second pass: pages that had no binding get a fresh unique slug key.
-  for (const p of pages) {
-    if (!p.key) {
-      p.key = mint(p.name);
-      idToKey.set(String(p.pageId).toLowerCase(), p.key);
-    }
+  // Second pass: a page the manifest does not bind keeps the key an earlier download of this app gave it. Taken in id order, so that even
+  // a map that gives one key to two pages has one answer; a key the manifest bound to another page is not taken twice (it stays with the
+  // manifest's page, and this one is minted below).
+  const unkeyed = () => pages.filter((q) => !q.key).sort(comparePageIds);
+  for (const p of unkeyed()) {
+    const id = String(p.pageId).toLowerCase();
+    const kept = previousKeys && previousKeys.get(id);
+    if (!kept || used.has(kept)) continue;
+    p.key = kept;
+    used.add(kept);
+    idToKey.set(id, kept);
+  }
+  // Third pass: the pages that are new get a fresh unique slug key, minted in the order of their ids (comparePageIds) after every key above
+  // is reserved: a new page cannot take a key an existing page holds, and the page that gets the plain slug of a shared one does not depend
+  // on the order of `pages`, which is the order they are written in (name, then id), nor on how the names compare. Minted in arrival or
+  // name order, an app downloaded again could swap two pages' keys, and a deployed copy of the spec would swap what the pages hold.
+  for (const p of unkeyed()) {
+    p.key = mint(p.name);
+    idToKey.set(String(p.pageId).toLowerCase(), p.key);
   }
   return idToKey;
 }
 
 // Entries of `a` whose pageId is absent from `b`. Used BOTH directions to require exact enumerated<->
-// downloaded id equality (I3). A gap either way means pac downloaded a different set than exists —
+// downloaded id equality. A gap either way means the download read a different set than exists —
 // rebuilding from this spec would silently drop/add pages, so download FAILS instead.
 function missingDownloads(a, b) {
   const have = new Set((b || []).map((p) => String(p.pageId).toLowerCase()));
@@ -309,15 +1475,800 @@ function missingDownloads(a, b) {
 // missing primary name as a hard download failure, which is actionable at the point it happens rather
 // than as a confusing validation error later. Returns `null` for `primaryAttribute` so the caller can
 // detect and report it.
-function entityFromMetadata(meta, logical) {
-  const primary = meta && (meta.primaryNameAttribute || meta.primaryNameLogicalName);
+// Dataverse `AttributeType` -> App Spec column type. Only types the App Spec can actually declare
+// are mapped; anything else (Lookup, Owner, State, Status, Uniqueidentifier, Virtual, ...) is a
+// column the author never wrote — a Lookup comes from `relationships[]`, and the rest are platform
+// plumbing — so it is left out of the hydrated spec entirely.
+// See: https://learn.microsoft.com/en-us/dotnet/api/microsoft.xrm.sdk.metadata.attributetypecode
+const SPEC_TYPE_FROM_ATTRIBUTE_TYPE = {
+  String: 'Text', Memo: 'Memo', Picklist: 'Choice', MultiSelectPicklist: 'MultiChoice',
+  Boolean: 'Boolean', Money: 'Money', DateTime: 'DateTime', Integer: 'Integer',
+  BigInt: 'BigInt', Decimal: 'Decimal', Double: 'Double', File: 'File', Image: 'Image',
+};
+
+// Types whose App Spec declaration REQUIRES detail beyond their type: a Choice/MultiChoice needs
+// options[] or a globalChoice reference. A failed typed expand cannot supply either. AutoNumber
+// also requires a mask, but is emitted only when the String cast positively supplies one; otherwise
+// its surviving String type remains Text and the missing-detail warning explains the loss.
+//
+// So the column is emitted WITHOUT a type rather than with one that makes the whole spec fail
+// validation ("column X: Choice needs options[] or a globalChoice reference") — which is what
+// happened the moment types started being carried, live.
+//
+// This is NOT free, and the cost is surfaced rather than described as harmless. On a rebuild into an
+// org that does NOT already have the table, `provisionDataModel` decides create-vs-reuse from org
+// DISCOVERY (not from `existing`) and computes buildable columns as `SDK_COLUMN_TYPE[c.type ||
+// 'Text']` — so a type-less Choice column is created as TEXT. The now-asymmetric result (Memo, Money
+// and DateTime round-trip while Choice quietly degrades) is harder to notice than the old
+// everything-is-Text, so the affected columns are warned about by name.
+const TYPES_NEEDING_COMPANION_DATA = new Set(['Choice', 'MultiChoice']);
+
+// The two Dataverse attribute CASTS that carry an option set. `Attributes` is a heterogeneous
+// collection, so `OptionSet` can only be `$expand`ed through a cast segment — an uncast
+// `/Attributes?$expand=OptionSet` is rejected because most attribute types have no such property.
+// See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/webapi/query-metadata-web-api
+//
+// `GlobalOptionSet` is deliberately NOT expanded, even though it is the obvious-looking way to tell a
+// shared set from a local one. LIVE-MEASURED against a stock org: it is populated for a LOCAL set
+// too, echoing that local set's own Name (`account.accountcategorycode` -> IsGlobal:false, yet
+// GlobalOptionSet.Name === "account_accountcategorycode"). Keying off its presence, or off its Name,
+// would classify every local set as global and emit a `globalChoice` reference to a shared set that
+// does not exist — so the rebuild would bind the column to nothing. `OptionSet.IsGlobal` is the only
+// honest discriminator, and `OptionSet.Options` is populated for BOTH kinds (confirmed on a
+// global-bound column: `contact.mspp_userpreferredlcid` returned all 45 options through `OptionSet`).
+const OPTION_SET_CASTS = [
+  { cast: 'Microsoft.Dynamics.CRM.PicklistAttributeMetadata', type: 'Choice' },
+  { cast: 'Microsoft.Dynamics.CRM.MultiSelectPicklistAttributeMetadata', type: 'MultiChoice' },
+];
+
+// Dataverse `AttributeTypeName` -> App Spec type, for the choice types ONLY. This is POSITIVE type
+// evidence that does not depend on the option-set read succeeding, and it is why a Choice column now
+// survives a failed or empty cast read instead of disappearing.
+//
+// It exists because `AttributeType` LIES for a multi-select: LIVE-MEASURED, a MultiSelectPicklist
+// reports `AttributeType: "Virtual"` — indistinguishable from the synthetic `<column>name` shadows —
+// and only `AttributeTypeName: "MultiSelectPicklistType"` identifies it. Relying on cast membership
+// instead meant an unusable option label, a 503, or even a 200 with an empty `value[]` silently
+// DELETED a real MultiChoice column from the spec, which is the loss this whole change exists to end.
+// `AttributeTypeName` is a base `AttributeMetadata` property, so selecting it is safe on every
+// supported Web API version.
+const SPEC_TYPE_FROM_ATTRIBUTE_TYPE_NAME = { PicklistType: 'Choice', MultiSelectPicklistType: 'MultiChoice' };
+
+// The App Spec type an attribute can be proven to have WITHOUT a successful option-set read.
+function choiceTypeFromTypeName(a) {
+  const name = a && a.AttributeTypeName && a.AttributeTypeName.Value;
+  return name ? SPEC_TYPE_FROM_ATTRIBUTE_TYPE_NAME[name] : undefined;
+}
+
+// File and Image columns. Like a MultiSelectPicklist, both report `AttributeType: "Virtual"` — the vendored SDK creates them as
+//   { "@odata.type": "Microsoft.Dynamics.CRM.FileAttributeMetadata",  "AttributeType": "Virtual", "AttributeTypeName": { "Value": "FileType" },  "MaxSizeInKB": 1024 }
+//   { "@odata.type": "Microsoft.Dynamics.CRM.ImageAttributeMetadata", "AttributeType": "Virtual", "AttributeTypeName": { "Value": "ImageType" }, "IsPrimaryImage": false, "MaxSizeInKB": 10240 }
+// — so the `File` / `Image` keys of SPEC_TYPE_FROM_ATTRIBUTE_TYPE were never hit, and every download left both out without a
+// word: a downloaded-then-rebuilt app lost them. The type NAME is what identifies them (Microsoft Learn finds image columns the same
+// way: AttributeTypeName equals ImageType), and it is what tells them from the platform's virtual companions of other columns,
+// which are `VirtualType` and name the column they belong to:
+//   { "LogicalName": "contoso_priorityname", "AttributeType": "Virtual", "AttributeTypeName": { "Value": "VirtualType" }, "AttributeOf": "contoso_priority" }
+// See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/image-attributes#retrieve-image-column-definitions
+// See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/file-attributes
+const SPEC_TYPE_FROM_MEDIA_TYPE_NAME = { FileType: 'File', ImageType: 'Image' };
+
+// An attribute's type NAME, from either place a download has it: the attribute read readEntityWithDescriptions merges in
+// (`AttributeTypeName: { "Value": "FileType" }`), else the SDK's own projection of the table (`attributeTypeName: "FileType"`, ''
+// when the platform sent none). The second keeps a File or Image column identifiable when the first read failed, which would
+// otherwise drop both again.
+function attributeTypeNameOf(a) {
+  const merged = a && a.AttributeTypeName && a.AttributeTypeName.Value;
+  if (typeof merged === 'string' && merged) return merged;
+  return a && typeof a.attributeTypeName === 'string' && a.attributeTypeName ? a.attributeTypeName : undefined;
+}
+
+// 'File' or 'Image' for a column of one of the two types, else undefined. `Object.hasOwn`, because the name is the platform's
+// text and must never resolve to something the map inherits.
+function mediaTypeFromTypeName(a) {
+  const name = attributeTypeNameOf(a);
+  return name && Object.hasOwn(SPEC_TYPE_FROM_MEDIA_TYPE_NAME, name) ? SPEC_TYPE_FROM_MEDIA_TYPE_NAME[name] : undefined;
+}
+
+// What a maker did not author and a build never creates, left out by NAME as a system column is:
+//   - the table's own primary image, `entityimage` — the platform's, made with the table's image option, not an Image column a
+//     maker added — with its companions (the `*id`, `*_timestamp` and `*_url` the platform makes beside every image column);
+//   - the companions of each File or Image column the download keeps: `<file>_name` beside a File column, and `<image>id`,
+//     `<image>_timestamp` and `<image>_url` beside an Image column. The platform makes them WITH the column (none appears in the
+//     designer). LIVE-MEASURED, `<file>_name` is `AttributeOf` the File column and `_timestamp` / `_url` are `AttributeOf`
+//     `<image>id`, which the shadow rule in entityFromMetadata reads; but `<image>id` itself is a custom Uniqueidentifier that is
+//     `AttributeOf` nothing and not logical (the Image column is `AttributeOf` IT), so no shadow rule sees it. Naming them here keeps
+//     `<image>id` out (its type would as well: see the AttributeOf rule in entityFromMetadata), and every one of them when that read
+//     failed. Kept in, a rebuild into a fresh environment would create them as Text and BigInt columns of their own, under the very
+//     names the platform makes for the File or Image column itself.
+// See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/image-column-data#primary-images
+// See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/file-column-data
+const TABLE_IMAGE_COLUMNS = new Set(['entityimage', 'entityimage_url', 'entityimage_timestamp', 'entityimageid']);
+const MEDIA_COMPANION_SUFFIXES = { File: ['_name'], Image: ['id', '_timestamp', '_url'] };
+
+function attributeLogicalName(a) {
+  return String((a && (a.logicalName || a.LogicalName || a.schemaName || a.SchemaName)) || '').toLowerCase();
+}
+
+// The lower-cased names of the companions of every File and Image column among `attrs` (see above).
+function mediaCompanionNames(attrs) {
+  const out = new Set();
+  for (const a of attrs || []) {
+    const type = mediaTypeFromTypeName(a);
+    const name = attributeLogicalName(a);
+    if (!type || !name) continue;
+    for (const suffix of MEDIA_COMPANION_SUFFIXES[type]) out.add(`${name}${suffix}`);
+  }
+  return out;
+}
+
+// The size a File or Image column comes back with, when one is worth writing: the size the column was made with, unless it is the
+// one a rebuild of a spec WITHOUT `maxSizeKb` gives it (DEFAULT_MAX_SIZE_KB, the build's own) — so a column authored without a size
+// downloads as it was authored, and one made in Maker (32768 KB for a File column there) or with another size keeps it. Plus, for
+// an image, `isPrimaryImage: true` when the platform reports the column as the table's primary image. The platform makes a table's
+// FIRST Image column its primary image whatever the create sent (LIVE-MEASURED: a build sending `false` read back `true`; Microsoft
+// Learn, image-attributes: "If there's only one image column for a table, this value is set by default"), so a spec whose one Image
+// column sets no flag downloads with it: written all the same, as it is what the environment holds, and a rebuild sends nothing for
+// a column that exists. `false` is what a build sends for a spec without the flag, so it is never written.
+function mediaColumnFields(a, type) {
+  const out = {};
+  const size = a && a.MaxSizeInKB;
+  if (usableMediaSize(size) && size !== DEFAULT_MAX_SIZE_KB) out.maxSizeKb = size;
+  if (type === 'Image' && a && a.IsPrimaryImage === true) out.isPrimaryImage = true;
+  return out;
+}
+
+// `MaxSizeInKB` is an Int32 the platform always fills for a File or Image column, so anything but a positive whole number is not a
+// size this download can write — it is reported as missing (missingMediaDetail) rather than guessed.
+function usableMediaSize(size) {
+  return Number.isInteger(size) && size > 0;
+}
+
+// What an ANSWERED read of a File or Image column's cast did not give it: 'size', and for an image 'primary' — its row was not in the
+// answer, or held a value that cannot be used (a size that is not a positive whole number, a flag that is not true or false). Checked
+// against the columns a download writes, so an answer read while the table changes — a column added after the attribute read, say —
+// is said rather than taken for a column at the build's default. [] when the read did not answer: a failed read is reported as
+// such (mediaReadFailures), and no read is made for a column typed without a type name.
+function missingMediaDetail(meta, a, type) {
+  if (!(meta && meta.mediaReadsAnswered && meta.mediaReadsAnswered[type] === true)) return [];
+  const missing = [];
+  if (!usableMediaSize(a && a.MaxSizeInKB)) missing.push('size');
+  if (type === 'Image' && typeof (a && a.IsPrimaryImage) !== 'boolean') missing.push('primary');
+  return missing;
+}
+
+// One downloaded option set, or null when it carries nothing this spec can declare. Shape:
+//   { name: 'new_ticket_new_status', isGlobal: false, options: [<Dataverse Label>, ...] }
+//
+// The RAW Label is kept rather than a flattened string because the same option has to be emitted TWO
+// different ways depending on where it lands: an inline `columns[].options[]` may be a localized LCID
+// map, while a `globalChoices[]` option may NOT be (validateAppSpec rejects it, because Dataverse
+// stores only the base language for a shared set and reports nothing when it drops the rest).
+// Deriving both from one source keeps them from drifting.
+//
+// Option ORDER is preserved exactly as Dataverse returned it and is NOT sorted by `Value`. Dataverse
+// returns options in their DISPLAY order, and the App Spec assigns `value = 100000000 + index` — so
+// the array order is what a rebuild reproduces on screen. Sorting by Value would silently reorder the
+// picker for any set whose author arranged it by hand.
+function optionSetFromRow(row) {
+  const os = row && row.OptionSet;
+  if (!os || !Array.isArray(os.Options) || !os.Options.length) return null;
+  const name = typeof os.Name === 'string' && os.Name.trim() ? os.Name : null;
+  const labels = os.Options.map((o) => o && o.Label);
+  // EVERY option must yield a usable label. A partially readable set cannot be emitted: dropping the
+  // unreadable ones would shift every later option's index, and therefore its value, so a rebuild
+  // would silently re-point existing data. Refusing to type the column is the honest outcome, and it
+  // falls through to the untyped warning that already exists for exactly this case.
+  if (labels.some((l) => descriptionFromDataverse(l) === undefined)) return null;
+  const displayName = descriptionFromDataverse(os.DisplayName);
+  return { ...(name ? { name } : {}), ...(displayName !== undefined ? { displayName } : {}), isGlobal: os.IsGlobal === true, options: labels };
+}
+
+// Inline Choice options and alternate-key display names can preserve LCID maps, unlike a
+// `globalChoices[]` option, which must be a plain string.
+// `labelFromDataverse` reads only `LocalizedLabels`, so a Label carrying just
+// a `UserLocalizedLabel` falls back to the single-string unwrap rather than emitting `undefined`,
+// which would fail validation with "options[i] must be a non-empty string".
+// `languageCode` is the download's authoring language (labelFromDataverse).
+function localizedSpecLabel(label, languageCode) {
+  const localized = labelFromDataverse(label, languageCode);
+  return localized !== undefined ? localized : descriptionFromDataverse(label);
+}
+
+// Read the option sets for every Choice / MultiChoice column on one table, keyed by lower-cased
+// attribute logical name. THROWS on a failed read so the caller records WHY, rather than silently
+// emitting a spec whose Choice columns degraded to Text.
+async function readOptionSets(sdk, logical) {
+  const byLogical = new Map();
+  let failed = null;
+  for (const { cast, type } of OPTION_SET_CASTS) {
+    const url = `/${metadataEntityPath(logical)}/Attributes/${cast}?$select=LogicalName&$expand=OptionSet($select=Name,DisplayName,IsGlobal,Options)`;
+    try {
+      const res = await sdk.dataverse.get(url);
+      // `dataverse.get` RESOLVES on a non-2xx rather than throwing, so the status must be checked
+      // explicitly — the same trap documented on the description reads above.
+      if (!res || res.status < 200 || res.status >= 300) throw new Error(`HTTP ${res && res.status}`);
+      if (!res.body || !Array.isArray(res.body.value)) throw new Error('the response carried no value[] array');
+      for (const row of res.body.value) {
+        const key = String((row && row.LogicalName) || '').toLowerCase();
+        if (!key) continue;
+        // The CAST that returned the row is authoritative for the TYPE, and it is recorded even when
+        // the OPTIONS could not be parsed (`optionSetFromRow` -> null). Conflating the two DELETED
+        // the column: a MultiChoice reports `AttributeType: "Virtual"`, so discarding this entry
+        // discarded the only evidence it was an authorable column at all, and it vanished from the
+        // spec while the warning claimed it had merely lost its type.
+        byLogical.set(key, { ...(optionSetFromRow(row) || {}), type });
+      }
+    } catch (err) {
+      // Per-cast, NOT fatal. The two casts are independent reads; throwing here discarded an
+      // already-valid Picklist map whenever the multi-select cast failed, so a single transient 503
+      // stripped the type off every Choice column on the table. Keep what was read, report the rest.
+      if (!failed) failed = (err && err.message) ? String(err.message).slice(0, 200) : 'read failed';
+    }
+  }
+  return { byLogical, failed };
+}
+
+// Gather the SHARED option sets a downloaded table binds to, into `into` (name-keyed, so one set
+// bound by several columns is declared once). Global sets must be declared in `spec.globalChoices[]`
+// or a rebuild into a FRESH environment has nothing to bind the column to — `createGlobalOptionSet`
+// is idempotent (it probes by Name and reuses), so declaring one that already exists is safe.
+//
+// Options are FLATTENED to a single string here, unlike the inline case: `validateAppSpec` rejects a
+// localized `globalChoices[]` option outright, because Dataverse accepts the multi-language payload
+// for a shared set and stores only the base language without reporting the loss.
+//
+// Declared `existing: true` (#587 item 6): a global option set is org-wide and can be shared with other
+// apps, and nothing here proves this app created it — so teardown retains it, as it does the tables.
+function collectGlobalChoices(meta, into) {
+  for (const a of (meta && meta.attributes) || []) {
+    const os = a && a.optionSet;
+    if (!os || !os.isGlobal || !os.name) continue;
+    const key = String(os.name).toLowerCase();
+    if (into.has(key)) continue;
+    into.set(key, {
+      name: os.name,
+      ...(os.displayName !== undefined ? { displayName: os.displayName } : {}),
+      options: os.options.map((l) => descriptionFromDataverse(l)), existing: true,
+    });
+  }
+  return into;
+}
+
+// Reduce the collected global-choice CANDIDATES to the ones an EMITTED column actually references,
+// and canonicalize every reference to the declaration's own casing.
+//
+// Both halves close real defects. `collectGlobalChoices` scans RAW metadata, which runs before
+// `entityFromMetadata` filters attributes and before an entity with no primary name is dropped — so
+// a set bound only by a system attribute, or by a table that never made it into the spec, produced
+// an ORPHAN declaration. That is not cosmetic: `provisionDataModel` calls `createGlobalOptionSet`
+// for every declaration, so the rebuild wrote an option set into the target environment that nothing
+// in the app uses.
+//
+// The casing half: declarations are de-duplicated on a lower-cased key, but each column kept the raw
+// `OptionSet.Name` casing Dataverse happened to return for it. `entity-provision` then looks up
+// `globalChoiceIds[c.globalChoice]` CASE-SENSITIVELY, so a second casing of the same set left that
+// column unbound and it silently fell back to an EMPTY inline option list. Rewriting the references
+// here keeps that fix in one place rather than relying on every consumer to normalize.
+function finalizeGlobalChoices(entities, candidates) {
+  const byKey = candidates instanceof Map ? candidates : new Map();
+  const referenced = new Map(); // lower-cased name -> declaration
+  for (const e of entities || []) {
+    for (const c of (e && e.columns) || []) {
+      if (!c || !c.globalChoice) continue;
+      const key = String(c.globalChoice).toLowerCase();
+      const decl = byKey.get(key);
+      if (!decl) continue;
+      c.globalChoice = decl.name;
+      if (!referenced.has(key)) referenced.set(key, decl);
+    }
+  }
+  return [...referenced.values()];
+}
+
+// Does this form's `formxml` restrict it to particular security roles?
+//
+// The roles live INSIDE formxml, as a `<DisplayConditions>` child of `<form>` — `systemform` has no
+// role relationship at all — e.g.:
+//
+//   <DisplayConditions Order="2" FallbackForm="false"><Role Id="{GUID}" /></DisplayConditions>
+//
+// The unrestricted default is the sibling shape `<DisplayConditions ...><Everyone /></...>`, or no
+// element at all. Only the `<Role>` form is a restriction, so match on that specifically rather than
+// on the presence of `<DisplayConditions>`, which every form has.
+//
+// Attribute order and casing vary between platform-authored and SDK-authored xml, so this matches
+// the element name case-insensitively and does not assume `Id` is the first attribute.
+function isRoleRestrictedFormXml(formxml) {
+  const xml = String(formxml || '');
+  const block = xml.match(/<DisplayConditions[\s\S]*?<\/DisplayConditions>/i);
+  if (!block) return false;
+  return /<Role\b/i.test(block[0]);
+}
+
+// Which of the app's DEPLOYED artifact classes this download does not reconstruct. AB#6686423.
+//
+// `forms[]`, `views[]` and `charts[]` are emitted EMPTY by hydrateSpec (see the note there for why
+// each is blocked). The artifacts themselves are already captured — `descriptionInventory` in the
+// written app-spec.json lists every one of them by id, name and table — but until this reporter
+// existed nothing SAID they were missing from the rebuildable part of the spec. The reported
+// symptom was exactly that: "it emitted empty forms and views ... with nothing reporting the loss".
+//
+// This is a REPORT, not a gate. Blocking would be wrong: every app has forms and views, so a
+// failure here would break every download, and the omission is not destructive in the environment
+// the app was downloaded from — a rebuild there does not delete artifacts the spec omits. The loss
+// is real only when rebuilding into a DIFFERENT environment, and the message says so rather than
+// stating a blanket "dropped".
+//
+// Returns null when there is nothing to report, so a caller can skip the warning entirely.
+function notRoundTrippedSummary(inventory) {
+  // Data-driven, and the set is derived from what `hydrateSpec` actually emits — NOT from what is
+  // convenient to format. `hydrateSpec` returns `views: []`, `charts: []`, `forms: []`,
+  // `commands: []` and no `businessRules`/`globalChoices` key at all, so all of these are absent
+  // from the rebuildable spec. Reporting only forms/views/charts contradicted the report's own
+  // purpose and left a business rule — a real cross-environment loss — silent.
+  //
+  // `entityScoped: false` for global choices because they are ORG-wide: grouping one under a table
+  // would invent a relationship the platform does not have.
+  //
+  // `commands` are the command-bar customisations of the app's tables (readCommandInventory). They were
+  // missing until the download read them: a class with no read behind it would have reported a permanent
+  // "0 commands", the false reassurance the `incomplete` channel exists to avoid.
+  const CLASSES = [
+    { key: 'forms', label: 'form', entityScoped: true },
+    { key: 'views', label: 'view', entityScoped: true },
+    { key: 'charts', label: 'chart', entityScoped: true },
+    { key: 'commands', label: 'command', entityScoped: true },
+    { key: 'businessRules', label: 'business rule', entityScoped: true },
+    { key: 'globalChoices', label: 'global choice', entityScoped: false },
+  ];
+  const classes = [];
+  const orgScoped = []; // [{ key, label, names: [] }] — classes with no owning table
+  const byEntity = new Map(); // table logical -> { <classKey>: [names] }
+  const blankEntityRow = () => Object.fromEntries(CLASSES.filter((c) => c.entityScoped).map((c) => [c.key, []]));
+  for (const { key, label, entityScoped } of CLASSES) {
+    const rows = (inventory && Array.isArray(inventory[key]) ? inventory[key] : []).filter((r) => r && r.name);
+    if (!rows.length) continue;
+    classes.push({ kind: key, count: rows.length, label });
+    if (!entityScoped) {
+      orgScoped.push({ kind: key, label, names: rows.map((r) => String(r.name)).sort(compareText) });
+      continue;
+    }
+    for (const r of rows) {
+      const entity = String(r.entity || 'unknown').toLowerCase();
+      if (!byEntity.has(entity)) byEntity.set(entity, blankEntityRow());
+      byEntity.get(entity)[key].push(r.name);
+    }
+  }
+  // A class whose read FAILED is reported too, and is the reason this cannot simply return null on an
+  // empty inventory: "no forms were found" and "the forms query returned 403" look identical from
+  // here, and treating the second as the first is precisely the silent-loss bug being fixed. An
+  // UNKNOWN class is worse than a known-omitted one, so it is surfaced even when nothing was read.
+  const incomplete = (inventory && Array.isArray(inventory.incomplete) ? inventory.incomplete : [])
+    .filter((i) => i && i.kind)
+    .map((i) => ({ kind: i.kind, reason: i.reason || 'read failed' }))
+    .sort((a, b) => compareText(a.kind, b.kind) || compareText(a.reason, b.reason));
+  if (!classes.length && !incomplete.length) return null;
+  // Sorted at EVERY level, not just the table one. The rows arrive from `queryRecords`, i.e. in
+  // whatever order Dataverse returned them, which carries no ordering guarantee — so two downloads
+  // of an unchanged app could emit the same artifacts in a different order. This block is written
+  // into the operator's output and compared between runs, so an unstable order reads as a change
+  // that did not happen, which is the opposite of the point: the report exists to make a real
+  // difference visible. `classes` is already deterministic (built from the fixed CLASSES list). The order is compareText's — by
+  // code units, not the host's collation — so the report reads the same on every machine.
+  const entityKeys = CLASSES.filter((c) => c.entityScoped).map((c) => c.key);
   return {
-    schemaName: (meta && (meta.schemaName || meta.logicalName)) || logical,
-    displayName: (meta && meta.displayName) || logical,
+    classes,
+    total: classes.reduce((n, c) => n + c.count, 0),
+    entities: [...byEntity.entries()]
+      .sort(([a], [b]) => compareText(a, b))
+      .map(([entity, v]) => ({
+        entity,
+        ...Object.fromEntries(entityKeys.map((k) => [k, [...(v[k] || [])].sort(compareText)])),
+      })),
+    ...(orgScoped.length ? { orgScoped } : {}),
+    ...(incomplete.length ? { incomplete } : {}),
+  };
+}
+
+// Drop from the not-round-tripped inventory the global choices this download DOES now reconstruct
+// (#564). The report's whole value is that its claims are true: a shared set emitted into
+// `spec.globalChoices[]` IS carried forward, so listing it as "not round-tripped" would be the same
+// class of false statement the report exists to prevent. Every other set in the inventory — which
+// holds only sets the app's solution owns or its columns bind (#586 item 5) — stays listed: the spec
+// does not declare it, so a rebuild genuinely will not recreate it. `declared` is any collection with
+// `has(lowerCasedName)` and `size`.
+function roundTrippedAware(inventory, globalChoiceDecls) {
+  if (!inventory || !Array.isArray(inventory.globalChoices) || !globalChoiceDecls || !globalChoiceDecls.size) return inventory;
+  const declared = globalChoiceDecls;
+  const remaining = inventory.globalChoices.filter((g) => !(g && g.name && declared.has(String(g.name).toLowerCase())));
+  // Drop the key entirely when nothing is left: `notRoundTrippedSummary` skips an empty class, and an
+  // empty array would otherwise be indistinguishable from "the read returned no rows".
+  const { globalChoices, ...rest } = inventory;
+  void globalChoices;
+  return remaining.length ? { ...rest, globalChoices: remaining } : rest;
+}
+
+// Render `notRoundTrippedSummary` as the operator-facing warning. Kept separate from the computation
+// so the wording is testable without a download, and so the same summary can be emitted as JSON.
+function notRoundTrippedWarning(summary) {
+  if (!summary) return '';
+  const lines = [];
+  if (summary.classes.length) {
+    const counts = summary.classes.map((c) => `${c.count} ${c.label}${c.count === 1 ? '' : 's'}`).join(', ');
+    // The class list is rendered from the summary rather than hardcoded. It used to read
+    // "forms[], views[] or charts[]" regardless of what was actually reported, so once business
+    // rules and global choices joined the inventory the sentence named the wrong things — a report
+    // about silent loss quietly misdescribing its own contents.
+    const names = summary.classes.map((c) => (c.kind === 'globalChoices' ? 'globalChoices[]' : `${c.kind}[]`)).join(', ');
+    const tables = summary.entities.length;
+    lines.push(
+      `NOTE: this download does not reconstruct ${names} — ${counts}${tables ? ` on ${tables} table(s)` : ''} are absent from the rebuildable spec.`,
+      '  They are NOT lost: every one is listed under `descriptionInventory` in app-spec.json, and they remain on the deployed app.',
+      '  Rebuilding into THIS environment leaves them untouched. Rebuilding into a DIFFERENT environment will NOT recreate them —',
+      `  re-declare the ones you need in ${names}, or copy them with a solution export.`,
+    );
+    for (const e of summary.entities) {
+      const parts = [];
+      for (const c of summary.classes) {
+        const list = e[c.kind];
+        if (Array.isArray(list) && list.length) parts.push(`${c.kind}: ${list.join(', ')}`);
+      }
+      if (parts.length) lines.push(`    ${e.entity} — ${parts.join('; ')}`);
+    }
+    // Org-scoped classes are listed separately and WITHOUT a table, because they do not belong to
+    // one; filing a global choice under a table would assert a relationship Dataverse does not have.
+    for (const o of summary.orgScoped || []) {
+      lines.push(`    (environment-wide) ${o.kind}: ${o.names.join(', ')}`);
+    }
+  }
+  if (summary.incomplete && summary.incomplete.length) {
+    lines.push(
+      `WARNING: ${summary.incomplete.length} artifact class(es) could NOT be inventoried, so this download cannot say what it left behind:`,
+    );
+    for (const i of summary.incomplete) lines.push(`    ${i.kind} — ${i.reason}`);
+    lines.push('  Treat an empty list for those classes as UNKNOWN, not as "the app has none".');
+  }
+  for (const note of summary.appMembership || []) {
+    lines.push(`NOTE: app membership not round-tripped${note.table ? ` (${note.table})` : ''}: ${note.reason}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+// Columns whose type could not be substantiated, so a `download -> rebuild into a fresh org` round
+// trip does not silently create them as Text. `type` is absent for a Choice/MultiChoice (above), or
+// for an attribute whose metadata carried no `attributeType` at all — an attribute with a type that
+// simply has no App Spec equivalent is filtered out of `columns[]` entirely, so it never gets here.
+function untypedColumnNames(entities) {
+  const out = [];
+  for (const e of entities || []) {
+    for (const c of (e.columns || [])) {
+      if (c && c.schemaName && c.type === undefined) out.push(`${e.schemaName}.${c.schemaName}`);
+    }
+  }
+  return out;
+}
+
+// The warnings for the columns captured WITHOUT a type (`untyped`, untypedColumnNames). `clashes` maps
+// the ones left untyped because one text names two of their options in a way the App Spec refuses
+// (entityFromMetadata's `labelClashes`) to that clash, e.g.
+//   "contoso_item.contoso_stage" -> "'Abierto' names options[0] and options[1]"
+// Their option sets WERE read, so they are named with the clash: the warning for every other column
+// says the likeliest cause is an option set that could not be read, which sent a maker to download
+// again — and a download made again captures a clash the same way. Every other column keeps that
+// warning word for word. Returns the lines to write, each ending in a newline.
+function untypedColumnWarnings(untyped, clashes = new Map()) {
+  const lines = [];
+  const unexplained = untyped.filter((name) => !clashes.has(name));
+  const clashed = untyped.filter((name) => clashes.has(name));
+  if (unexplained.length) {
+    lines.push(`WARNING: ${unexplained.length} column(s) were captured WITHOUT a type (${unexplained.join(', ')}) — most likely Choice/MultiChoice columns whose option set could not be read. Rebuilding this spec into an environment that already has the table is unaffected, but rebuilding into a FRESH environment would create them as single-line Text. Add the type and options[] (or a globalChoice reference) by hand before a cross-environment rebuild.\n`);
+  }
+  if (clashed.length) {
+    lines.push(`WARNING: ${clashed.length} Choice/MultiChoice column(s) were captured WITHOUT a type because one text names two of their options (${clashed.map((name) => `${name}: ${clashes.get(name)}`).join('; ')}) and their two labels differ in at least one language, so the line does not show which option the text means and the App Spec refuses it. Their option sets were read: a download made again captures them the same way. Rebuilding this spec into an environment that already has the table is unaffected, but rebuilding into a FRESH environment would create them as single-line Text. Rename one of those options in Maker and download again, or add the type and options[] by hand before a cross-environment rebuild.\n`);
+  }
+  return lines;
+}
+
+// `unexpressible`, when given, is an array this fills with the attributes left out because the App Spec has no type for them although
+// nothing shows they were not authored (`{ table, column, typeName }`), so the caller can name them (see the end of the filter).
+// `incomplete`, when given, is filled with the File and Image columns written without detail an answered read should have carried
+// (`{ table, column, type, missing }`, missingMediaDetail), so the caller can name those too.
+// `languageLost`, when given, is filled with the inline Choice option labels written without the one language they hold
+// (`{ table, column, option, label, languageCode }`, see the option screen below), so the caller can name them.
+// `labelClashes`, when given, is filled with the Choice columns left untyped because one text names two of their options in a way
+// the App Spec refuses (`{ table, column, clashes: [{ alias, first, second }] }`, the same screen), so the caller names the clash.
+function entityFromMetadata(meta, logical, { unexpressible, incomplete, schemaOmissions = [], languageCode, languageLost, labelClashes } = {}) {
+  const primary = meta && (meta.primaryNameAttribute || meta.primaryNameLogicalName);
+  const attrs = Array.isArray(meta && meta.attributes) ? meta.attributes : (Array.isArray(meta && meta.Attributes) ? meta.Attributes : []);
+  const primaryLower = String(primary || '').toLowerCase();
+  const companions = mediaCompanionNames(attrs);
+  const columns = attrs.filter((a) => {
+    if (!a) return false;
+    const name = String(a.schemaName || a.SchemaName || a.logicalName || a.LogicalName || '').toLowerCase();
+    // The primary name column is declared separately as `primaryAttribute`, so it must not ALSO
+    // appear in `columns[]`.
+    if (!name || name === primaryLower) return false;
+    // CUSTOM attributes only. `fetchEntityMetadata` returns the FULL attribute list — `createdon`,
+    // `versionnumber`, `importsequencenumber`, `owningbusinessunit` and the rest — and emitting
+    // those as spec columns is not merely noisy, it is destructive: `columns[]` feeds
+    // `defaultViewColumns`, which `enrichDefaultViews` uses to REPLACE the Active/Inactive views'
+    // column set. A downloaded spec that listed system attributes would rewrite a customer's
+    // default views to `Created On` / `Import Sequence Number` on the next rebuild, undoing fix #7
+    // ("drop Created On from enriched default views") whose invariant is stated at
+    // sdk-build.js `defaultViewColumns`: the set only ever contains DECLARED spec columns.
+    const isCustom = a.isCustomAttribute !== undefined ? a.isCustomAttribute : a.IsCustomAttribute;
+    if (isCustom === false) return false;
+    // The table's own primary image, and the platform's companions of a File or Image column — never authored, never created by a
+    // build (TABLE_IMAGE_COLUMNS). A column the type name itself proves to be a File or Image column is never a companion.
+    if (TABLE_IMAGE_COLUMNS.has(name) || (companions.has(name) && mediaTypeFromTypeName(a) === undefined)) return false;
+    // SYNTHETIC SHADOW attributes. Creating a lookup also creates a formatted-name attribute
+    // (`<lookup>name`) which LIVE-MEASURED reports `AttributeType: "String"` AND
+    // `IsCustomAttribute: true` — so neither the type map nor the custom-only filter above excludes
+    // it, and a downloaded spec declared a REAL Text column named after a lookup's shadow. Measured
+    // consequence: a fresh-environment rebuild created `<table>.<lookup>name (Text)`, an invented
+    // column that also collides with the name the real lookup's own shadow needs. `IsLogical` (the
+    // value is not stored on this table) is the distinguishing fact.
+    //
+    // Gated on positive TYPE EVIDENCE, not on "logical" alone: an attribute is dropped only when it
+    // is logical AND nothing proves it is a real choice column (no parsed option set, and no
+    // `AttributeTypeName` saying Picklist/MultiSelectPicklist). Keying only off `optionSet ===
+    // undefined` dropped a genuine logical Choice whenever its option-set read failed, and the
+    // untyped warning then promised a Text column that a rebuild would never create.
+    //
+    // HONESTY NOTE on the example this rule is often justified with: every logical choice attribute
+    // found on stock tables — `address1_addresstypecode` and its five `address1_`/`address2_` twins
+    // on account, plus the equivalents on contact/systemuser/businessunit, 23 in total — is
+    // `IsCustomAttribute: false`, so the custom-only check above already drops them and they never
+    // reach this rule. No CUSTOM logical choice column was found on a live org, so the exemption is
+    // DEFENSIVE rather than demonstrated load-bearing. It is kept because dropping on "logical"
+    // alone becomes a silent column deletion the moment such a column does exist, which is the exact
+    // failure class this change exists to end.
+    //
+    // An ABSENT flag KEEPS the attribute, matching the `isCustom === false` rule above: "we could not
+    // look" must not be turned into a deletion. The direction matters — `IsLogical` is absent for
+    // EVERY attribute when the read fails, so dropping on absent would empty the table's `columns[]`
+    // entirely. The residual cost is that a failed read re-enables the shadow leak, which is why the
+    // label-read warning now names that consequence explicitly.
+    //
+    // A File or Image column is exempt for the same reason a choice is: its type name is positive evidence of an authored column.
+    // And the exemption is load-bearing, not defensive: LIVE-MEASURED, the platform reports an Image column `IsLogical: true` (it is
+    // `AttributeOf` the `<image>id` beside it — see the AttributeOf rule below), and a File column `IsLogical: false`.
+    const isLogical = a.IsLogical !== undefined ? a.IsLogical : a.isLogical;
+    if (isLogical === true && a.optionSet === undefined && choiceTypeFromTypeName(a) === undefined && mediaTypeFromTypeName(a) === undefined) return false;
+    // SHADOW-OF, the precise form of the same rule. `AttributeOf` names the attribute this one is a
+    // projection of, so a non-empty value is positive proof the column was never authored — no type
+    // inference and no relationship context needed.
+    //
+    // This is not redundant with the `IsLogical` rule above. LIVE-MEASURED on a polymorphic
+    // (`Customer`-type) lookup `cfo_billto` targeting account + contact:
+    //   cfo_billtoname      AttributeOf=cfo_billto  IsLogical=FALSE  AttributeType=String
+    //   cfo_billtoyominame  AttributeOf=cfo_billto  IsLogical=FALSE  AttributeType=String
+    //   cfo_customeridname  AttributeOf=cfo_customerid  IsLogical=TRUE  (single-target — already caught)
+    // The polymorphic shadows are physically stored, so `IsLogical` is false and the rule above
+    // cannot see them; they were emitted as real Text columns and a fresh-environment rebuild
+    // invented two text fields where a lookup used to be (#574). A real column — including the
+    // lookup itself — reports `AttributeOf: null`, so nothing authored is at risk.
+    //
+    // Absent KEEPS the attribute, matching every other rule here: when the label read fails no
+    // attribute carries `AttributeOf`, and "we could not look" must not become a column deletion.
+    //
+    // A File or Image column is exempt, because for an Image column "a projection, so never authored" is false. LIVE-MEASURED (the
+    // names here are placeholders), the same for the columns a build made and the ones made in Maker:
+    //   contoso_contract            AttributeOf=null              IsLogical=FALSE  AttributeType=Virtual  AttributeTypeName=FileType
+    //   contoso_contract_name       AttributeOf=contoso_contract  IsLogical=TRUE   AttributeType=String
+    //   contoso_photo               AttributeOf=contoso_photoid   IsLogical=TRUE   AttributeType=Virtual  AttributeTypeName=ImageType
+    //   contoso_photoid             AttributeOf=null              IsLogical=FALSE  AttributeType=Uniqueidentifier  IsCustomAttribute=true
+    //   contoso_photo_timestamp     AttributeOf=contoso_photoid   IsLogical=TRUE   AttributeType=BigInt
+    //   contoso_photo_url           AttributeOf=contoso_photoid   IsLogical=TRUE   AttributeType=String
+    // The authored Image column is itself `AttributeOf` the `<image>id` that holds the image's id, so this rule dropped every Image
+    // column a maker or a build made, without a word. Its type name is positive evidence of an authored column, as for the IsLogical
+    // rule above: no companion is FileType or ImageType, so the exemption admits none — `_timestamp`, `_url` and `<file>_name` are
+    // still dropped here. `<image>id` is `AttributeOf` nothing and not logical, so no shadow rule sees it: its NAME keeps it out (the
+    // companion rule above), and its type would too — a Uniqueidentifier is no App Spec column type, and not being Virtual it is left
+    // out without being named (the type rule below). The table's own image, `entityimage`, which is ImageType, is out by name first.
+    if (a.AttributeOf && mediaTypeFromTypeName(a) === undefined) return false;
+    // BASE-CURRENCY TWIN. Dataverse generates a `<money>_base` column beside every Money column. It
+    // carries no `AttributeOf`, is not logical, and reports `IsCustomAttribute: true`, so every rule
+    // above is blind to it — and emitting it meant a rebuild tried to CREATE a column the platform
+    // generates for itself.
+    //
+    // `IsBaseCurrency` is the ONLY unambiguous signal. `IsValidForCreate: false` is NOT a substitute:
+    // it is a per-column write capability this spec deliberately supports on authored columns
+    // (`isValidForCreate` in app-spec-schema.md), so filtering on it turns a round-trip into a
+    // deletion of a legitimately read-only column. LIVE-MEASURED on stock `opportunity`:
+    //   estimatedvalue       IsBaseCurrency=false  IsValidForCreate=true
+    //   estimatedvalue_base  IsBaseCurrency=TRUE   IsValidForCreate=false
+    //   totalamount          IsBaseCurrency=false  IsValidForCreate=FALSE  <- real column, must KEEP
+    // `totalamount` is exactly the column the capability flag would have wrongly deleted.
+    //
+    // Absent KEEPS the attribute, like every other rule here: `IsBaseCurrency` only rides along when
+    // the Money cast read succeeded, and "we could not look" must never become a column deletion.
+    if (a.IsBaseCurrency === true) return false;
+    // Keep only attribute types the App Spec can declare (see the map above), PLUS any attribute the
+    // option-set read matched, PLUS any attribute `AttributeTypeName` proves is a choice. That last
+    // clause is what keeps a MultiChoice when the cast read failed or came back empty: its
+    // `AttributeType` is `Virtual`, so nothing else would admit it. A File or Image column is
+    // `Virtual` too, and its type name admits it the same way (SPEC_TYPE_FROM_MEDIA_TYPE_NAME).
+    const at = a.attributeType || a.AttributeType;
+    if (at === undefined || SPEC_TYPE_FROM_ATTRIBUTE_TYPE[at] !== undefined || a.optionSet !== undefined || choiceTypeFromTypeName(a) !== undefined || mediaTypeFromTypeName(a) !== undefined) return true;
+    // Any OTHER `Virtual` column that got this far — custom, not logical, the companion of nothing — has a type the App Spec cannot
+    // express, and leaving it out costs a rebuild into a fresh environment that column. So it is NAMED (by the caller, from
+    // `unexpressible`), never dropped without a word. Only when the attribute read gave its type name: without it the platform's
+    // virtual companions cannot be told from such a column (that read also carries `AttributeOf`), and the read's own failure is
+    // what is reported then. Every other type left out here is one a spec never declares as a column — a Lookup comes from
+    // relationships[], an Owner, State, Status or Uniqueidentifier is the platform's — and stays out silently, as before.
+    const typeName = a.AttributeTypeName && a.AttributeTypeName.Value;
+    if (at === 'Virtual' && typeof typeName === 'string' && typeName && Array.isArray(unexpressible)) {
+      unexpressible.push({ table: logical, column: a.schemaName || a.SchemaName || a.logicalName || a.LogicalName, typeName });
+    }
+    return false;
+  }).map((a) => {
+    const schemaName = (a && (a.schemaName || a.SchemaName || a.logicalName || a.LogicalName)) || '';
+    // The SDK projects `attributeType`, NOT `type`. Reading `a.type` yielded `undefined` on every
+    // column, which silently disabled every type-based filter downstream (`DEFAULT_VIEW_SKIP_TYPES`
+    // skips Memo/File/Image; `SDK_COLUMN_TYPE` decides what an auto form layout places).
+    const at = a && (a.attributeType || a.AttributeType);
+    // The option set's own type WINS over the attributeType map, because for a MultiChoice the map
+    // is wrong: Dataverse reports `Virtual`. `readOptionSets` always stamps `type` from the CAST
+    // that returned the row — even when the options themselves were unparseable — so this covers
+    // every attribute either cast saw.
+    //
+    // `choiceTypeFromTypeName` is deliberately NOT consulted here. It is load-bearing in the two
+    // FILTER decisions below (keeping a column the casts never returned, and not mistaking a real
+    // logical Choice for a shadow), but for the TYPE it would be redundant: whenever it could speak,
+    // either `os.type` already said the same thing, or there is no option set and the column is left
+    // untyped regardless. A mutation removing it from this expression was not detectable by any
+    // test, which is the signal that it was decoration rather than logic.
+    const os = (a && a.optionSet) || null;
+    // A File or Image column's type comes from its type NAME, before the AttributeType map (which sees only `Virtual` for both).
+    const mapped = (a && a.type) || (os && os.type) || mediaTypeFromTypeName(a) || SPEC_TYPE_FROM_ATTRIBUTE_TYPE[at];
+    // Companion data for a Choice/MultiChoice (see TYPES_NEEDING_COMPANION_DATA). Present -> the
+    // column carries its REAL type plus the `options[]`/`globalChoice` its declaration requires.
+    // Absent -> it stays untyped and is named in the untyped-column warning, because emitting
+    // `type: "Choice"` with neither companion produces a spec that fails its own validation.
+    //
+    // `os.options` can be absent even when `os` exists: the cast identified the column but its
+    // labels were unreadable. That is deliberately treated as "no companion data" — the column is
+    // kept (it IS a real column) but left untyped.
+    const optionSet = TYPES_NEEDING_COMPANION_DATA.has(mapped) && os && Array.isArray(os.options) ? os : null;
+    // A shared set is REFERENCED, not inlined, so a rebuild binds all its columns to one option set
+    // instead of minting a private copy per column. An unnamed global set (no `Name` came back) has
+    // nothing to reference, so it degrades to inline options rather than emitting a dangling ref.
+    //
+    // INLINE labels are additionally screened for an AMBIGUOUS alias, and that screen is the
+    // difference between one bad column and no download at all. Option labels need not be unique
+    // across options OR languages in Dataverse, so `["Open", {1033:"Closed", 3082:"Open"}]` is legal
+    // — but "Open" then names two options, which `validateAppSpec` treats as an ERROR whenever
+    // either side is localized (the collision is invisible on the page, so it cannot be a warning).
+    // `runDownload` validates before writing and returns on failure, so emitting such a set aborted
+    // the ENTIRE app's download, and `--allow-lossy-download` does not bypass that gate. Refusing to
+    // type just this column falls back to the untyped warning that already exists for an unreadable
+    // label, which is what the download did before types were carried at all — named with the clash
+    // (`labelClashes`), because this option set WAS read.
+    //
+    // The shared `ambiguousChoiceAliases` is reused rather than reimplemented, so this screen and
+    // the validator can never disagree about what "ambiguous" means. Two options labelled alike are not
+    // ambiguous in its sense when their labels are identical in every language they hold — the shape
+    // Dataverse stores for them (it fills the base language in with the same text) — so such a column
+    // keeps its type and options, with the duplicate warning the validator gives two equal plain strings.
+    //
+    // Options held in one language other than the authoring one come back as one-entry LCID maps
+    // (labelFromDataverse). Two of them sharing their text in the SAME language are a duplicate the
+    // validator warns about, as it does two plain strings, so they keep their language. One that shares
+    // its text with an option in ANOTHER language — a plain label (the authoring language) or a one-entry
+    // map of another — is a collision the validator refuses, which would leave the column untyped. Only
+    // the one-entry maps of such a collision are written as the plain strings an earlier download wrote
+    // (a visible duplicate, which the validator only warns about), and each is reported in `languageLost`,
+    // because a rebuild labels it in the language it resolves rather than its own; every other option
+    // keeps its language. A collision involving a label of several languages that is not identical to the
+    // other has no plain-string form: the column is left untyped, as before, and the clash is reported.
+    const inlineLabels = (lcid) => optionSet.options.map((l) => localizedSpecLabel(l, lcid));
+    const hiddenCollision = (options) => ambiguousChoiceAliases(options).some((c) => c.hidden);
+    let inlineOptions = optionSet && !(optionSet.isGlobal && optionSet.name) ? inlineLabels(languageCode) : null;
+    let lostLanguages = [];
+    if (inlineOptions && hiddenCollision(inlineOptions)) {
+      const hidden = new Set(ambiguousChoiceAliases(inlineOptions).filter((c) => c.hidden).map((c) => c.alias));
+      const lost = [];
+      const flattened = inlineOptions.map((label, i) => {
+        const keys = isLocalizedLabelMap(label) ? Object.keys(label) : [];
+        if (keys.length !== 1 || !hidden.has(label[keys[0]])) return label;
+        lost.push({ option: i, label: label[keys[0]], languageCode: Number(keys[0]) });
+        return label[keys[0]];
+      });
+      if (!hiddenCollision(flattened)) {
+        inlineOptions = flattened;
+        lostLanguages = lost;
+      }
+    }
+    const inlineIsAmbiguous = inlineOptions ? hiddenCollision(inlineOptions) : false;
+    const usableOptionSet = inlineIsAmbiguous ? null : optionSet;
+    const specType = TYPES_NEEDING_COMPANION_DATA.has(mapped) && !usableOptionSet ? undefined : mapped;
+    const choice = !usableOptionSet ? {}
+      : (usableOptionSet.isGlobal && usableOptionSet.name
+        ? { globalChoice: usableOptionSet.name }
+        : { options: inlineOptions });
+    if (schemaName && Array.isArray(languageLost)) for (const l of lostLanguages) languageLost.push({ table: logical, column: schemaName, ...l });
+    if (inlineIsAmbiguous && schemaName && Array.isArray(labelClashes)) {
+      labelClashes.push({ table: logical, column: schemaName, clashes: ambiguousChoiceAliases(inlineOptions).filter((c) => c.hidden).map(({ alias, first, second }) => ({ alias, first, second })) });
+    }
+    if ((specType === 'File' || specType === 'Image') && schemaName && Array.isArray(incomplete)) {
+      const missing = missingMediaDetail(meta, a, specType);
+      if (missing.length) incomplete.push({ table: logical, column: schemaName, type: specType, missing });
+    }
+    return withDescription({
+      schemaName,
+      // A column labelled in several languages round-trips as an LCID map; one language stays a
+      // plain string (AB#6686428). Resolution order, and every step must yield a STRING or a map —
+      // never a raw Dataverse Label object:
+      //   1. the RAW `DisplayName` Label merged in by readEntityWithDescriptions (the only source
+      //      that carries every language),
+      //   2. the SDK's own already-flattened `displayName` string,
+      //   3. a single-language Label unwrapped by descriptionFromDataverse.
+      //
+      // Step 2 is not optional tidiness. LIVE-MEASURED: a synthetic lookup `*name` column such as
+      // `cfo_customeridname` carries `{"LocalizedLabels":[],"UserLocalizedLabel":null}` — a wholly
+      // EMPTY Label. `labelFromDataverse` correctly returns undefined for it, and an `|| a.DisplayName`
+      // tail would then emit that raw object as the column's displayName, producing a spec that fails
+      // its own validation with "'LocalizedLabels' is not an LCID". Omitting the label entirely is the
+      // right answer: Dataverse has none either.
+      ...(columnDisplayName(a, languageCode) !== undefined ? { displayName: columnDisplayName(a, languageCode) } : {}),
+      ...(specType ? { type: specType } : {}),
+      ...choice,
+      ...columnOptionFields(a, specType),
+      // The size (and, for an image, the primary-image flag) the column was made with, where a rebuild needs it (mediaColumnFields).
+      ...(specType === 'File' || specType === 'Image' ? mediaColumnFields(a, specType) : {}),
+    }, a && (a.description !== undefined ? a.description : a.Description));
+  }).filter((c) => c.schemaName);
+  // Table label + plural. When the table carries more than one language, BOTH must round-trip and
+  // `pluralName` becomes required (validateAppSpec refuses to derive a plural from a label map), so
+  // the plural is emitted whenever the display name is localized. A label held in one language other
+  // than the authoring one keeps its language as a one-entry map (labelFromDataverse).
+  const displayName = labelFromDataverse(meta && meta.DisplayName, languageCode);
+  let pluralName = labelFromDataverse(meta && meta.DisplayCollectionName, languageCode);
+  // The primary column's own label. It is EXCLUDED from `columns[]` (it is declared separately as
+  // `primaryAttribute`), so its label has to be read from the un-filtered attribute list here —
+  // otherwise a table whose primary column is called "Order Title" / "Título del pedido" downloads
+  // as the hardcoded "Name", and a fresh-environment rebuild loses both the real label and its
+  // translations. `'Name'` remains the fallback for a metadata read that carried no label at all.
+  const primaryAttr = primaryLower ? attrs.find((a) => String((a && (a.logicalName || a.LogicalName || a.schemaName || a.SchemaName)) || '').toLowerCase() === primaryLower) : null;
+  const primaryLabel = columnDisplayName(primaryAttr, languageCode);
+  const tableSchemaName = (meta && (meta.schemaName || meta.logicalName)) || logical;
+  const tableLabel = displayName !== undefined ? displayName : ((meta && meta.displayName) || logical);
+  // A display name kept in its one language as a map needs a plural beside it (validateAppSpec). When the table has no plural label to
+  // read, it is the plural a rebuild of the plain label derived before — derivedPluralName — in that same language, so the text a rebuild
+  // writes is what it always was and only its language is right.
+  const singleLanguage = isLocalizedLabelMap(displayName) && Object.keys(displayName).length === 1;
+  if (pluralName === undefined && singleLanguage) {
+    const [lcid] = Object.keys(displayName);
+    pluralName = { [lcid]: derivedPluralName({ schemaName: tableSchemaName, displayName: displayName[lcid] }) };
+  }
+  const statusReasons = statusReasonsFromOptions(meta && meta.statusOptions, { customTable: !meta || meta.isCustomEntity !== false, languageCode, omitted: schemaOmissions });
+  const alternateKeys = alternateKeysFromMetadata(meta && meta.Keys, (label) => localizedSpecLabel(label, languageCode), schemaOmissions);
+  return {
+    schemaName: tableSchemaName,
+    displayName: tableLabel,
+    // Emitted when EITHER label is localized, not only when the singular is. `validateAppSpec`
+    // requires `pluralName` beside a localized `displayName`, which is why the singular's shape is
+    // checked — but a table can carry a single-language `DisplayName` and a multi-language
+    // `DisplayCollectionName` (the two are independent in Dataverse, and an unprovisioned language is
+    // dropped per-label on read). Keying only off the singular silently discarded those plural
+    // translations and a rebuild then derived an English plural.
+    //
+    // Two PLAIN labels omit it only when the plural is the one a rebuild of a spec without it would
+    // write — derivedPluralName, the build's own rule, applied to what this spec says — so every
+    // download of an ordinary table ("Order" / "Orders") stays byte-identical. Any other plural is
+    // kept, because leaving it out was a silent rename: "Tag Catalog" is not derivable from "Tag", and
+    // a rebuild into another environment named the table "Tags". The comparison is exact (case and
+    // spacing included), because that is how the build writes the derivation.
+    ...(pluralName !== undefined && (isLocalizedLabelMap(displayName) || isLocalizedLabelMap(pluralName)
+      || pluralName !== derivedPluralName({ schemaName: tableSchemaName, displayName: tableLabel })) ? { pluralName } : {}),
+    ...(descriptionFromDataverse(meta && (meta.description !== undefined ? meta.description : meta.Description)) ? { description: descriptionFromDataverse(meta && (meta.description !== undefined ? meta.description : meta.Description)) } : {}),
     // Never synthesized: a fabricated attribute name yields a spec that references a column Dataverse
     // does not have, which is exactly the bug this fixes.
-    primaryAttribute: primary ? { schemaName: primary, displayName: 'Name' } : null,
-    columns: [],
+    primaryAttribute: primary ? { schemaName: primary, displayName: primaryLabel !== undefined ? primaryLabel : 'Name', ...primaryColumnOptionFields(primaryAttr) } : null,
+    columns,
+    ...(statusReasons.length ? { statusReasons } : {}),
+    ...(alternateKeys.length ? { alternateKeys } : {}),
     // Flag every recovered table as pre-existing so a teardown of THIS downloaded spec never deletes the
     // table (+ its data). Download cannot prove which tables the app CREATED vs merely REFERENCED, and
     // deleting a customer's table/data is unrecoverable while an orphaned table is not — so fail safe.
@@ -325,6 +2276,336 @@ function entityFromMetadata(meta, logical) {
     // forms, so the build's `existing`-gated default-form promotion path is not reached here anyway.)
     existing: true,
   };
+}
+
+function metadataEntityPath(logical) {
+  return `EntityDefinitions(LogicalName='${String(logical).replace(/'/g, "''")}')`;
+}
+
+function validatedDownloadConcurrency(concurrency) {
+  if (concurrency === undefined) return 4;
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw new Error(`concurrency must be a positive integer (got ${JSON.stringify(concurrency)})`);
+  }
+  return concurrency;
+}
+
+// The SDK already fans a single table metadata fetch out across several concurrent reads. Keep the
+// TABLE loop ordered so the download never multiplies that environment-sized load; only the
+// post-hydration auxiliary reads below overlap, and their MERGE still runs in the original fixed
+// order so the emitted metadata stays byte-identical to the sequential download.
+async function readEntityAuxMetadata(sdk, logical, concurrency) {
+  const entityPath = `/${metadataEntityPath(logical)}`;
+  const tasks = [
+    async () => {
+      try {
+        const res = await sdk.dataverse.get(`${entityPath}?$select=LogicalName,Description,DisplayName,DisplayCollectionName,IconVectorName&$expand=Keys($select=SchemaName,DisplayName,KeyAttributes,IsManaged)`);
+        if (res && res.status >= 200 && res.status < 300 && res.body) {
+          return { kind: 'entityLabels', body: res.body };
+        }
+        return { kind: 'entityLabels', failed: `HTTP ${res && res.status}` };
+      } catch (err) {
+        return { kind: 'entityLabels', failed: (err && err.message) ? String(err.message).slice(0, 200) : 'read failed' };
+      }
+    },
+    async () => {
+      try {
+        const res = await sdk.dataverse.get(`${entityPath}/Attributes?$select=LogicalName,Description,DisplayName,IsLogical,AttributeOf,AttributeTypeName`);
+        if (!res || res.status < 200 || res.status >= 300) throw new Error(`HTTP ${res && res.status}`);
+        if (!res.body || !Array.isArray(res.body.value)) throw new Error('the response carried no value[] array');
+        return { kind: 'attributeLabels', rows: res.body.value };
+      } catch (err) {
+        return { kind: 'attributeLabels', failed: (err && err.message) ? String(err.message).slice(0, 200) : 'read failed' };
+      }
+    },
+    async () => {
+      try {
+        const res = await sdk.dataverse.get(`${entityPath}/Attributes/Microsoft.Dynamics.CRM.MoneyAttributeMetadata?$select=LogicalName,IsBaseCurrency,MinValue,MaxValue,Precision,PrecisionSource`);
+        if (res && res.status >= 200 && res.status < 300 && res.body && Array.isArray(res.body.value)) {
+          return {
+            kind: 'moneyFlags',
+            rows: res.body.value,
+            baseCurrency: new Set(res.body.value
+              .filter((r) => r && r.LogicalName && r.IsBaseCurrency === true)
+              .map((r) => String(r.LogicalName).toLowerCase())),
+          };
+        }
+      } catch { /* best-effort: absent IsBaseCurrency keeps the column, which is the safe direction */ }
+      return { kind: 'moneyFlags', baseCurrency: new Set() };
+    },
+    async () => {
+      try {
+        const { byLogical, failed } = await readOptionSets(sdk, logical);
+        return { kind: 'optionSets', byLogical, failed: failed || null };
+      } catch (err) {
+        return {
+          kind: 'optionSets',
+          byLogical: new Map(),
+          failed: (err && err.message) ? String(err.message).slice(0, 200) : 'read failed',
+        };
+      }
+    },
+  ];
+  return mapLimit(tasks, concurrency, (task) => task(), { firstInOrder: true });
+}
+
+async function readEntityWithDescriptions(sdk, logical, { concurrency } = {}) {
+  concurrency = validatedDownloadConcurrency(concurrency);
+  const meta = { ...(await sdk.fetchEntityMetadata(logical)) };
+  // The SDK's fetchEntityMetadata projection is enough for identity but carries NO descriptions —
+  // measured against a live org, its entity keys are logicalName/schemaName/displayName/
+  // entitySetName/primaryNameAttribute/primaryIdAttribute/isCustomEntity/attributes/relationships,
+  // and each attribute is {logicalName, displayName, attributeType, isCustomAttribute, targets}.
+  // So descriptions require a second read against the metadata endpoints.
+  //
+  // This deliberately does NOT go through `sdk.queryRecords`. That helper first resolves its
+  // argument to an entity SET name via `EntityDefinitions(LogicalName='<arg>')?$select=EntitySetName`,
+  // so handing it a metadata path produces a nested nonsense URL and a 404:
+  //   .../EntityDefinitions(LogicalName='EntityDefinitions(LogicalName=''contoso_workitem'')')?$select=EntitySetName
+  // Combined with the best-effort catch below, that failed silently for EVERY table — the download
+  // reported success and dropped every table and column description. `sdk.dataverse` is the raw
+  // client and takes an API-relative path verbatim.
+  //
+  // NOTE `dataverse.get` RESOLVES with `{ status, headers, body }` on a non-2xx rather than throwing
+  // (a 404 returns status 404), so the status MUST be checked explicitly. A try/catch alone would
+  // reintroduce exactly the silence this replaces.
+  const [entityLabels, attributeLabels, moneyFlags, optionSets] = await readEntityAuxMetadata(sdk, logical, concurrency);
+  if (entityLabels.body) {
+    // DisplayName / DisplayCollectionName are read alongside Description so a table labelled in more
+    // than one language round-trips (AB#6686428). The SDK's own `fetchEntityMetadata` projection
+    // flattens `displayName` to ONE string, which is enough for identity but silently loses every
+    // other language — a rebuild from such a spec would recreate the table English-only.
+    meta.Description = entityLabels.body.Description;
+    meta.DisplayName = entityLabels.body.DisplayName;
+    meta.DisplayCollectionName = entityLabels.body.DisplayCollectionName;
+    meta.IconVectorName = entityLabels.body.IconVectorName;
+    meta.Keys = entityLabels.body.Keys;
+  } else if (entityLabels.failed) {
+    // A non-2xx is NOT "this table has no extra languages" — it is "we could not look". Recorded so
+    // the caller can say so; see the catch below for why silence here is the wrong default.
+    meta.labelReadFailed = entityLabels.failed;
+    // WHICH read failed is recorded too, because the two carry different things — this one the table's own labels (and with them
+    // its plural, which no other read carries), the one below the columns' labels with the flags and type names the column filters
+    // read — and a warning must say only what the read that failed carries (runDownload).
+    meta.tableLabelReadFailed = entityLabels.failed;
+  }
+  if (attributeLabels.rows) {
+    // Merge onto the SDK's attribute list rather than replacing it: `fetchEntityMetadata` supplies
+    // `targets` (lookup target tables) and `attributeType`, which this projection does not, and
+    // entityFromMetadata/other callers rely on them.
+    //
+    // This read carries the SAME weight as the table-level one above: it is the only source of
+    // multi-language labels for every non-primary COLUMN and for the primary attribute. Treating it
+    // as "column descriptions are best-effort" was right when descriptions were all it fetched, and
+    // became wrong the moment labels rode along — a 403 here returns a spec whose columns are
+    // single-language, with nothing saying so. Same recording, same reason.
+    // `IsLogical` rides along for the synthetic-shadow filter in entityFromMetadata: a lookup's
+    // formatted-name attribute (`<lookup>name`) reports IsCustomAttribute TRUE and AttributeType
+    // String, so nothing else distinguishes it from a real Text column the author wrote.
+    // `AttributeOf` rides along for the same filter and is the STRONGER signal: it names the
+    // attribute a shadow belongs to, and a POLYMORPHIC lookup's shadows report `IsLogical: false`
+    // (live-measured), so `IsLogical` alone cannot see them.
+    const byLogical = new Map(attributeLabels.rows.filter((r) => r && r.LogicalName).map((r) => [String(r.LogicalName).toLowerCase(), r]));
+    meta.attributes = (meta.attributes || []).map((a) => {
+      const key = String((a && (a.logicalName || a.LogicalName)) || '').toLowerCase();
+      const row = byLogical.get(key);
+      return row ? { ...a, Description: row.Description, DisplayName: row.DisplayName, IsLogical: row.IsLogical, AttributeOf: row.AttributeOf, AttributeTypeName: row.AttributeTypeName } : a;
+    });
+  } else if (attributeLabels.failed) {
+    // Recorded, not swallowed — and it does NOT overwrite a table-level failure already recorded
+    // above, because the first reason is the more useful one to show and both describe the same
+    // outcome for the operator: this table came back single-language.
+    if (!meta.labelReadFailed) meta.labelReadFailed = attributeLabels.failed;
+    meta.attributeReadFailed = attributeLabels.failed;
+  }
+  // Base-currency twins. `IsBaseCurrency` lives on MoneyAttributeMetadata, not on the base
+  // attribute type, so it needs its own CAST read — the same shape the option-set reads below use.
+  //
+  // This is the only unambiguous way to recognise the `<money>_base` column Dataverse generates
+  // beside every Money column. It reports no `AttributeOf`, is not logical, and is
+  // `IsCustomAttribute: true`, so nothing else in the projection distinguishes it from a column the
+  // author wrote — and emitting it made a rebuild try to create a column the platform owns.
+  //
+  // Best-effort on purpose: a failure leaves `IsBaseCurrency` absent on every attribute, and the
+  // filter KEEPS an attribute whose flag it could not read. The cost of a failed read is the twin
+  // reappearing, never a real column disappearing.
+  if (moneyFlags.baseCurrency && moneyFlags.baseCurrency.size) {
+    meta.attributes = (meta.attributes || []).map((a) => {
+      const key = String((a && (a.logicalName || a.LogicalName)) || '').toLowerCase();
+      return moneyFlags.baseCurrency.has(key) ? { ...a, IsBaseCurrency: true } : a;
+    });
+  }
+  const moneyByName = new Map((moneyFlags.rows || []).filter((a) => a && a.LogicalName).map((a) => [attributeLogicalName(a), a]));
+  meta.attributes = (meta.attributes || []).map((a) => {
+    const row = moneyByName.get(attributeLogicalName(a));
+    return row ? { ...a, MinValue: row.MinValue, MaxValue: row.MaxValue, Precision: row.Precision, PrecisionSource: row.PrecisionSource } : a;
+  });
+  // Choice / MultiChoice option sets (#564). A SEPARATE read from the attribute one above, and it
+  // has to be: `OptionSet` can only be `$expand`ed through a type CAST, which the heterogeneous
+  // `Attributes` collection cannot carry (see OPTION_SET_CASTS). Without it every Choice column
+  // downloads WITHOUT a type, and a rebuild into a FRESH environment creates it as single-line
+  // Text while a rebuild into the ORIGINAL environment silently reuses the real column — an
+  // asymmetry that is much harder to notice than an outright failure.
+  //
+  // Merged onto the attribute list, never replacing it: the SDK's own projection supplies
+  // `attributeType`/`targets`, and the cast read returns ONLY picklist attributes.
+  meta.attributes = (meta.attributes || []).map((a) => {
+    const os = optionSets.byLogical.get(String((a && (a.logicalName || a.LogicalName)) || '').toLowerCase());
+    return os ? { ...a, optionSet: os } : a;
+  });
+  // A cast that failed is recorded WITHOUT discarding what the other one returned.
+  if (optionSets.failed) meta.optionSetReadFailed = optionSets.failed;
+  // File and Image columns: the size each was made with, and whether an image is the table's primary one (readMediaColumns). Read
+  // AFTER the reads above, because only their type names say whether the table has such a column at all — a table without one
+  // sends no more requests than it did before. A row of the File answer is taken only for a File column, and one of the Image answer
+  // only for an Image column.
+  const media = await readMediaColumns(sdk, logical, meta.attributes, concurrency);
+  if (media.rows.File.size || media.rows.Image.size) {
+    meta.attributes = (meta.attributes || []).map((a) => {
+      const type = mediaTypeFromTypeName(a);
+      const row = type ? media.rows[type].get(attributeLogicalName(a)) : undefined;
+      if (!row) return a;
+      return {
+        ...a,
+        ...(row.MaxSizeInKB !== undefined ? { MaxSizeInKB: row.MaxSizeInKB } : {}),
+        ...(type === 'Image' && row.IsPrimaryImage !== undefined ? { IsPrimaryImage: row.IsPrimaryImage } : {}),
+      };
+    });
+  }
+  // By type, because each read carries only its own columns' detail, and what the caller says must name only what the read that
+  // failed carries (mediaReadFailures). The columns are kept, typed, either way. A read that answered is what entityFromMetadata
+  // checks each of its columns against, so an answer that lacks one is said too (missingMediaDetail).
+  if (Object.keys(media.answered).length) meta.mediaReadsAnswered = media.answered;
+  if (Object.keys(media.failed).length) meta.mediaReadFailures = media.failed;
+  const columnOptions = await readColumnOptions(sdk, logical, meta.attributes, concurrency);
+  meta.attributes = (meta.attributes || []).map((a) => {
+    const row = columnOptions.rows.get(attributeLogicalName(a));
+    return row ? { ...a, ...row } : a;
+  });
+  const statuses = await readStatusOptions(sdk.dataverse, logical);
+  if (statuses.options) meta.statusOptions = statuses.options;
+  meta.schemaReadFailures = [
+    ...columnOptions.failures,
+    ...(statuses.failed ? [`status reasons: ${statuses.failed}`] : []),
+    ...(entityLabels.failed ? [`alternate keys and table icon: ${entityLabels.failed}`] : []),
+    ...(entityLabels.body && !Array.isArray(meta.Keys) ? ['alternate keys: the response carried no Keys[] array'] : []),
+    ...(!moneyFlags.rows && (meta.attributes || []).some((a) => (a.attributeType || a.AttributeType) === 'Money') ? ['Money: the column detail read did not answer'] : []),
+  ];
+  return meta;
+}
+
+// What a File or an Image column was made with. `MaxSizeInKB` and `IsPrimaryImage` belong to the derived metadata types, not to
+// AttributeMetadata, so they are read through a cast segment, as the option sets and the Money flags are. Shapes (abridged):
+//   GET EntityDefinitions(LogicalName='contoso_project')/Attributes/Microsoft.Dynamics.CRM.FileAttributeMetadata?$select=LogicalName,MaxSizeInKB
+//     -> { "value": [ { "LogicalName": "contoso_contract", "MaxSizeInKB": 1024, "MetadataId": "<guid>" } ] }
+//   GET EntityDefinitions(LogicalName='contoso_project')/Attributes/Microsoft.Dynamics.CRM.ImageAttributeMetadata?$select=LogicalName,MaxSizeInKB,IsPrimaryImage
+//     -> { "value": [ { "LogicalName": "contoso_logo", "MaxSizeInKB": 10240, "IsPrimaryImage": false, "MetadataId": "<guid>" } ] }
+// See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/webapi/reference/fileattributemetadata
+// See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/webapi/reference/imageattributemetadata
+const MEDIA_CASTS = [
+  { type: 'File', cast: 'Microsoft.Dynamics.CRM.FileAttributeMetadata', select: 'LogicalName,MaxSizeInKB' },
+  { type: 'Image', cast: 'Microsoft.Dynamics.CRM.ImageAttributeMetadata', select: 'LogicalName,MaxSizeInKB,IsPrimaryImage' },
+];
+
+// Reads the casts of the types `attributes` holds a column of (by type name; the table's own `entityimage` does not count, as it is
+// never written to a spec), and returns, by type: `rows` (Map<lower-cased name, row>, empty for a type not read or not answered),
+// `answered` (true for a read that answered with a value[]) and `failed` (the reason for one that did not). A failed read is recorded,
+// not thrown: the columns are kept either way, and the caller says what was lost (their sizes, an image's primary flag).
+async function readMediaColumns(sdk, logical, attributes, concurrency) {
+  const present = new Set((attributes || [])
+    .filter((a) => !TABLE_IMAGE_COLUMNS.has(attributeLogicalName(a)))
+    .map(mediaTypeFromTypeName)
+    .filter(Boolean));
+  const reads = MEDIA_CASTS.filter((m) => present.has(m.type));
+  const results = await mapLimit(reads, concurrency, async ({ type, cast, select }) => {
+    try {
+      const res = await sdk.dataverse.get(`/${metadataEntityPath(logical)}/Attributes/${cast}?$select=${select}`);
+      // `dataverse.get` RESOLVES on a non-2xx rather than throwing, so the status is checked here, as for every read above.
+      if (!res || res.status < 200 || res.status >= 300) throw new Error(`HTTP ${res && res.status}`);
+      if (!res.body || !Array.isArray(res.body.value)) throw new Error('the response carried no value[] array');
+      return { type, rows: res.body.value };
+    } catch (err) {
+      return { type, failed: (err && err.message) ? String(err.message).slice(0, 200) : 'read failed' };
+    }
+  }, { firstInOrder: true });
+  const out = { rows: { File: new Map(), Image: new Map() }, answered: {}, failed: {} };
+  for (const r of results) {
+    if (r.failed) { out.failed[r.type] = r.failed; continue; }
+    out.answered[r.type] = true;
+    for (const row of r.rows) {
+      const key = String((row && row.LogicalName) || '').toLowerCase();
+      if (key) out.rows[r.type].set(key, row);
+    }
+  }
+  return out;
+}
+
+// Reconstruct an App Spec label from a Dataverse Label, preserving EVERY language. AB#6686428.
+//
+// Shape (see the Label reference linked in hydrate-spec.js):
+//   { "LocalizedLabels": [{ "Label": "Baseline", "LanguageCode": 1033 },
+//                         { "Label": "Línea base", "LanguageCode": 3082 }],
+//     "UserLocalizedLabel": { "Label": "Baseline", "LanguageCode": 1033 } }
+//
+// Returns an LCID map when there are genuinely two or more languages. A label in ONE language is a
+// plain STRING when that language is `languageCode` — the download's authoring language (the
+// `--language-code` flag, else the spec's own pin, else the environment's base language: the language
+// a rebuild of this spec resolves, the one the navigation titles are read in) — and a ONE-ENTRY map,
+// `{ "3082": "Pedido" }`, when it is another. A plain string is written by a rebuild in the language
+// that rebuild resolves, so dropping the LCID of a label held in another language stored Spanish text
+// as the English label, in this environment as in any other. Keeping the plain string for the
+// authoring language keeps every ordinary download byte-identical (a single-language table's labels
+// are all in it) and keeps the spec consistent: every plain label in it is in that one language. A
+// caller with no `languageCode` gets the plain string, as before. Returns undefined when there is
+// nothing usable, so a caller can fall back to the SDK's flattened `displayName` rather than write an
+// empty label.
+//
+// A rebuild into an environment whose base language is not the authoring language still writes the
+// plain labels in ITS language — as it writes the navigation titles — unless the spec pins
+// `languageCode` (or the build is given `--language-code`); a one-entry map needs its language
+// provisioned there, and the build stops at the start of its data-model phase when it is not.
+//
+// MEASURED: Dataverse fills the base language in, with the same text, when a label is created or
+// updated in another language only, so the one language a label holds alone is the environment's
+// base language — the map is written when the authoring language is another (`--language-code`, or
+// the spec's pin): `{ "1033": "Note" }` for an English-only column read with `--language-code 3082`.
+function labelFromDataverse(value, languageCode) {
+  if (!value || typeof value !== 'object') return undefined;
+  const rows = Array.isArray(value.LocalizedLabels) ? value.LocalizedLabels : [];
+  const usable = rows.filter((l) => l && typeof l.Label === 'string' && l.Label.trim() && Number.isInteger(Number(l.LanguageCode)) && Number(l.LanguageCode) > 0);
+  if (!usable.length) return undefined;
+  if (usable.length === 1) {
+    const only = Number(usable[0].LanguageCode);
+    const authoring = normalizeLanguageCode(languageCode);
+    return authoring && only !== authoring ? { [String(only)]: usable[0].Label } : usable[0].Label;
+  }
+  const out = {};
+  // NOT sorted, deliberately: V8 orders integer-like object keys ASCENDING regardless of insertion
+  // order, so `JSON.stringify` of this map is already deterministic and two downloads of the same
+  // table produce byte-identical output. A sort here would look like it earned that guarantee and
+  // could never be shown to matter — verified: inserting 3082 then 1033 yields keys ["1033","3082"].
+  for (const l of usable) out[String(Number(l.LanguageCode))] = l.Label;
+  return out;
+}
+
+// The text of a label held in one language, whichever shape it is written in — a plain string, or the one-entry map a label in a language
+// other than the authoring one is written as (labelFromDataverse). Any other label — a map of several languages — is returned as it is.
+function singleLanguageText(label) {
+  if (!isLocalizedLabelMap(label)) return label;
+  const values = Object.values(label);
+  return values.length === 1 ? values[0] : label;
+}
+
+// The App Spec `displayName` for one downloaded column, or undefined when Dataverse has no usable
+// label. GUARANTEES a string or an LCID map — never a raw Dataverse Label object, which would emit a
+// spec that fails its own validation. See the call site for the live-measured shape that motivated it.
+// `languageCode` is the download's authoring language (labelFromDataverse).
+function columnDisplayName(a, languageCode) {
+  const localized = labelFromDataverse(a && a.DisplayName, languageCode);
+  if (localized !== undefined) return localized;
+  // The SDK's `fetchEntityMetadata` projection already flattens this one to a string.
+  if (typeof (a && a.displayName) === 'string' && a.displayName.trim()) return a.displayName;
+  return descriptionFromDataverse(a && a.DisplayName);
 }
 
 // Image webresourcetypes (png/jpg/gif/ico/svg) — an icon reference must resolve to one of these to be
@@ -360,15 +2641,16 @@ const IMAGE_WR_TYPES = new Set([5, 6, 7, 10, 11]);
 //   genuinely IS 'new': when the prefix is UNVERIFIED we cannot trust `startsWith(ownPrefix)`, so a genuine
 //   own custom icon (e.g. `crba3_nav.svg` while the fallback prefix is `new`) would fail the own-prefix test
 //   and — without this guard — be silently skipped with NO warning, re-introducing the exact broken-icon bug
-//   this fix exists to prevent (Opus review, Medium). So when `prefixResolved` is false we do NOT re-declare
+//   this fix exists to prevent. So when `prefixResolved` is false we do NOT re-declare
 //   any path-derived WR (an unknown non-'new' prefix would BuildHalt on a fresh env) but we PROBE every
 //   customRef and surface each genuine CUSTOM (unmanaged image) one as `unresolved` — a managed/OOB/absent
 //   ref is a system icon present in every env, so it stays silent (no false alarm).
-async function iconWebResources(sdk, icons, customRefs, ownPrefix, prefixResolved, navRefs) {
+async function iconWebResources(sdk, icons, customRefs, ownPrefix, prefixResolved, navRefs, tableRefs) {
   const out = [];
   const seen = new Set();                 // lowercased names actually re-declared into `out`
   const prefixLc = ownPrefix ? String(ownPrefix).toLowerCase() + '_' : null;
-  const customRefSet = new Set((customRefs || []).map((n) => String(n).toLowerCase()));
+  const tableRefSet = new Set((tableRefs || []).map((n) => String(n).toLowerCase()));
+  const customRefSet = new Set([...(customRefs || []), ...(tableRefs || [])].map((n) => String(n).toLowerCase()));
   // `navRefs` are web resources a URL SUBAREA targets (the Site Map Designer's "custom page backed by
   // an HTML web resource"), as opposed to an icon. They take the SAME safety gates as a path-derived
   // icon — own prefix, unmanaged, has content, `external: true` so teardown never deletes it — but
@@ -376,17 +2658,17 @@ async function iconWebResources(sdk, icons, customRefs, ownPrefix, prefixResolve
   // design. Without this distinction the page is never re-declared and a rebuild's nav entry points
   // at a resource the spec cannot recreate.
   const navRefSet = new Set((navRefs || []).map((n) => String(n).toLowerCase()));
-  const allowedTypeFor = (key) => (navRefSet.has(key) ? null : IMAGE_WR_TYPES); // null = any type
+  const allowedTypeFor = (key) => (navRefSet.has(key) ? null : tableRefSet.has(key) ? new Set([11]) : IMAGE_WR_TYPES); // null = any type
   const candidateUnresolved = new Map();  // key -> original name; a path ref we could NOT re-declare in PASS 1
   const queryWr = async (name) =>
-    (await sdk.queryRecords('webresource', { select: ['name', 'webresourcetype', 'content', 'ismanaged'], filter: `name eq '${String(name).replace(/'/g, "''")}'`, top: 1 }))?.[0];
+    (await sdk.queryRecords('webresource', { select: ['name', 'displayname', 'webresourcetype', 'content', 'ismanaged'], filter: `name eq '${String(name).replace(/'/g, "''")}'`, top: 1 }))?.[0];
   const isCustomImage = (wr) => !!(wr && wr.content && wr.ismanaged === false && IMAGE_WR_TYPES.has(wr.webresourcetype));
 
   // PASS 1 — path-derived custom icons (safety-gated). Done FIRST so a name referenced BOTH by a platform
   // path AND by a bare name is classified by the STRICTER path rules (and flagged `external`) before the
   // lenient bare pass can re-declare it as deletable — otherwise the overlap silently loses teardown
-  // protection and a shared nav icon gets deleted (Sol review, High).
-  for (const name of [...(customRefs || []), ...(navRefs || [])]) {
+  // protection and a shared nav icon gets deleted.
+  for (const name of [...(customRefs || []), ...(navRefs || []), ...(tableRefs || [])]) {
     const key = String(name).toLowerCase();
     if (seen.has(key)) continue;
     const ownScoped = !!prefixLc && key.startsWith(prefixLc);
@@ -404,9 +2686,12 @@ async function iconWebResources(sdk, icons, customRefs, ownPrefix, prefixResolve
       }
       if (!wr || !wr.content) { candidateUnresolved.set(key, name); continue; }         // own-prefix but absent on source → will dangle
       const allowed = allowedTypeFor(key);
+      // A table's vector icon can be recreated only from an SVG this publisher owns. An absent
+      // management flag is unknown, not proof of an unmanaged resource safe to copy.
+      if (tableRefSet.has(key) && wr.ismanaged !== false) continue;
       if (wr.ismanaged === true || (allowed && !allowed.has(wr.webresourcetype))) continue;   // managed / wrong type → leave as a bare reference
       seen.add(key);
-      out.push({ name, type: WR_TYPE[wr.webresourcetype] || 'png', contentBase64: wr.content, external: true });
+      out.push({ name, ...(wr.displayname ? { displayName: wr.displayname } : {}), type: WR_TYPE[wr.webresourcetype] || 'png', contentBase64: wr.content, external: true });
     } catch { candidateUnresolved.set(key, name); /* read failure → candidate (surface unless a bare pass resolves it) */ }
   }
 
@@ -417,11 +2702,13 @@ async function iconWebResources(sdk, icons, customRefs, ownPrefix, prefixResolve
   for (const name of icons || []) {
     const key = String(name).toLowerCase();
     if (seen.has(key)) continue;
+    // A second navigation spelling must not turn a rejected table resource into a portable SVG.
+    if (tableRefSet.has(key)) continue;
     try {
       const wr = await queryWr(name);
       if (!wr || !wr.content) continue;
       seen.add(key);
-      const entry = { name, type: WR_TYPE[wr.webresourcetype] || 'png', contentBase64: wr.content };
+      const entry = { name, ...(wr.displayname ? { displayName: wr.displayname } : {}), type: WR_TYPE[wr.webresourcetype] || 'png', contentBase64: wr.content };
       if (customRefSet.has(key)) entry.external = true; // also path-referenced → protect from teardown
       out.push(entry);
     } catch { /* a bare author icon that fails to read is skipped (unchanged) */ }
@@ -442,99 +2729,209 @@ function droppedSubareaCount(app, spec) {
 
 // Recover the REAL unmanaged solution an app module belongs to. An app is a `solutioncomponent` of
 // EVERY solution it lives in — always the built-in system solutions (Active/Default/Basic) AND the
-// real unmanaged solution it was created in. The naive `top:1` query returns an arbitrary row (often
-// 'Default', which is itself ismanaged=false, so an ismanaged filter does not exclude it), so the
-// real solution was never recovered and a downloaded spec defaulted its solution to the restricted
-// 'Default' — which teardown then 400s on, orphaning the real solution. So enumerate ALL memberships
-// and pick the single unmanaged, non-system solution. Best-effort: returns null (caller keeps its own
-// default) on no match or any query error — never throws.
+// real unmanaged solution(s) it was added to. The naive `top:1` query returned an arbitrary row (often
+// 'Default', which is itself ismanaged=false, so an ismanaged filter does not exclude it), so the real
+// solution was never recovered and a downloaded spec defaulted to the restricted 'Default' — which
+// teardown then 400s on, orphaning the real solution. So every membership is read (`paginate`, which
+// the SDK refuses to combine with `top`: `$top` is a hard cap that suppresses `@odata.nextLink`).
+// Never throws. Returns one of:
+//   null                                               — no real (unmanaged, non-system) solution
+//   { uniqueName, description?, publisherPrefix?, publisherUnreadable? }  — exactly one: the app's solution
+//   { ambiguous: [uniqueName, ...], publisherPrefix?, publisherUnreadable? } — several (#587 item 9)
+//   { unreadable: reason }                                                 — the membership could not be read
 //
-// Returns `{ uniqueName, publisherPrefix? }`. The publisher prefix is read from the recovered
-// solution's OWNING PUBLISHER via the SDK's `getSolution`, because it is the only authoritative
-// source: the prefix was previously guessed from the app's uniquename, which breaks whenever the app
-// name doesn't encode the solution's publisher — an app named `new_customermanagement` inside
-// publisher `contoso`, an app with no prefix at all, or a publisher prefix longer than the guess's
-// length bound all collapsed to the literal `'new'` (ADO 6603390). `getSolution` is best-effort on top
-// of best-effort: if it fails or the publisher defines no prefix, we return the uniqueName alone and
-// the caller falls back to the app-derived guess.
+// SEVERAL is never resolved to one. Dataverse has no "owning" solution — a component is simply a
+// member of each — and the pick is not cosmetic: a rebuild adds components to the spec's solution and
+// teardown deletes that container. The rule this replaced took the first qualifying row of a capped
+// first page, so two downloads of one app could name different solutions on row order alone; a
+// heuristic such as "the one whose publisher matches the app name's prefix" rests on the app-name
+// guess ADO 6603390 showed is unreliable. The caller keeps 'Default' — which teardown never deletes —
+// and names the candidates. UNREADABLE stays apart from null for the reason it does everywhere else in
+// this file: "the app is in no solution" and "we could not look" must not look alike.
+//
+// `publisherPrefix` is read from the solution's OWNING PUBLISHER via the SDK's `getSolution`, the only
+// authoritative source: the prefix used to be guessed from the app's uniquename, which breaks whenever
+// the app name doesn't encode the publisher — an app named `new_customermanagement` inside publisher
+// `contoso`, an app with no prefix, or a prefix longer than the guess's length bound all collapsed to
+// the literal `'new'` (ADO 6603390). With several candidates it is reported only when EVERY
+// candidate's prefix was read and they agree: the prefix shapes the relationship schema names the
+// download emits, so a wrong one makes a same-environment rebuild create duplicates — a failed read
+// never counts as agreement. A publisher read that FAILS, for the one solution or any of several, is
+// reported as `publisherUnreadable` (the reason), and the caller then treats the prefix as unknown rather
+// than guess it: a failed read says nothing about the publisher. Only when there is simply no usable
+// prefix — a bundle without getSolution, or a publisher without a customization prefix — does the caller
+// fall back to the app-derived guess.
 async function recoverAppSolution(sdk, appId) {
+  let real;
   try {
-    // objectid == the appmoduleid. `top:500` is a safe over-provision (an app is realistically a
-    // component of only a handful of solutions) that keeps us on the same proven query path as every
-    // other queryRecords call in the skill (all pass an explicit top) — it just must not be the old
-    // `top:1`, which returned an arbitrary single membership (often 'Default').
-    const comps = await sdk.queryRecords('solutioncomponent', { select: ['_solutionid_value'], filter: `objectid eq ${appId}`, top: 500 });
+    const comps = await sdk.queryRecords('solutioncomponent', { select: ['_solutionid_value'], filter: `objectid eq ${appId}`, paginate: true });
     const solIds = [...new Set((comps || []).map((c) => c && c._solutionid_value).filter(Boolean))];
     if (!solIds.length) return null;
-    // One OR-batched lookup for all candidate solutions (solutionid is a Guid, so it is unquoted in
-    // the OData filter — mirrors the existing `solutionid eq ${id}` usage elsewhere in this file).
-    const filter = solIds.map((id) => `solutionid eq ${id}`).join(' or ');
-    const sols = await sdk.queryRecords('solution', { select: ['solutionid', 'uniquename', 'ismanaged'], filter, top: 500 });
-    const real = (sols || []).find((s) => s && s.ismanaged === false && !isRestrictedSolution(s.uniquename));
-    if (!real) return null;
-    const out = { uniqueName: real.uniquename };
-    // Authoritative publisher prefix for anything authored into THIS solution. Guarded on the method
-    // existing so an older vendored bundle (pre-getSolution) degrades to the caller's fallback instead
-    // of throwing away the solution we just recovered.
-    if (typeof sdk.getSolution === 'function') {
-      try {
-        const info = await sdk.getSolution(real.uniquename);
-        // An empty-string prefix is legitimate for some first-party publishers, but it is not usable as
-        // a customization prefix, so treat it as "not recovered" and let the caller fall back.
-        if (info && info.publisherPrefix) out.publisherPrefix = String(info.publisherPrefix).toLowerCase();
-      } catch { /* best-effort — keep the recovered uniqueName */ }
-    }
-    return out;
-  } catch {
-    return null; // best-effort — a recovery failure must not break the download
+    const sols = await rowsByIds(sdk, 'solution', 'solutionid', solIds, ['solutionid', 'uniquename', 'friendlyname', 'ismanaged', 'description'], (r) => r);
+    // Sorted so the candidates — and everything derived from them — are order-independent.
+    real = sols
+      .filter((s) => s && s.ismanaged === false && !isRestrictedSolution(s.uniquename))
+      .sort((a, b) => compareText(a.uniquename, b.uniquename));
+  } catch (e) {
+    return { unreadable: (e && e.message) ? String(e.message).slice(0, 200) : 'read failed' };
   }
+  if (!real.length) return null;
+  // Resolves to the prefix, to null when there is none to use, or to { failed: reason } when the read
+  // itself failed. Guarded on the method existing so an older vendored bundle (pre-getSolution) degrades
+  // to the caller's fallback. An empty-string prefix is legitimate for some first-party publishers, but it
+  // is not usable as a customization prefix, so it reads as "none".
+  const prefixOf = async (s) => {
+    if (typeof sdk.getSolution !== 'function') return null;
+    try {
+      const info = await sdk.getSolution(s.uniquename);
+      return info && info.publisherPrefix ? String(info.publisherPrefix).toLowerCase() : null;
+    } catch (e) {
+      return { failed: (e && e.message) ? String(e.message).slice(0, 200) : 'read failed' };
+    }
+  };
+  if (real.length === 1) {
+    const out = withDescription({
+      uniqueName: real[0].uniquename,
+      ...(typeof real[0].friendlyname === 'string' && real[0].friendlyname.trim() ? { displayName: real[0].friendlyname } : {}),
+    }, real[0].description);
+    const prefix = await prefixOf(real[0]);
+    if (typeof prefix === 'string') out.publisherPrefix = prefix;
+    else if (prefix) out.publisherUnreadable = prefix.failed;
+    return out;
+  }
+  const prefixes = [];
+  for (const s of real) prefixes.push(await prefixOf(s));
+  const out = { ambiguous: real.map((s) => String(s.uniquename)) };
+  if (prefixes.every((p) => typeof p === 'string') && new Set(prefixes).size === 1) out.publisherPrefix = prefixes[0];
+  const failed = prefixes.find((p) => p && typeof p === 'object');
+  if (failed) out.publisherUnreadable = failed.failed;
+  return out;
 }
 
 // Injectable download helper: all live-Dataverse work happens here so tests can inject mock deps.
 // `sdk`        — the MakerSDK (fetchArtifact, queryRecords, fetchEntityMetadata)
-// `genpageCli` — the genpage CLI wrapper (enumerateEnv, download)
+// `genpage`    — the page backend (lib/genpage-sdk.js: enumerateEnv, read)
 // `outDir`     — output directory root
 // `appId`      — the app's GUID (used for download + solution lookup)
 // `appUnique`  — the app's unique name (for fetchSitemap + manifest lookup); may be undefined for
 //                apps not found by unique name, in which case the sitemap read fails gracefully.
+// `resetPageKeys` — the maker's decision to give the pages whose earlier keys cannot be told apart fresh keys instead of stopping (see the header of this file)
 // Returns { ok:true, spec, pages, entities, webResources, droppedSubareas, droppedSubareaDetails,
-// dashboardReconstructionError } or { ok:false, error }.
+// dashboardReconstructionError } or { ok:false, error } — and, when the earlier spec's page keys cannot be told apart, { ok:false, code:'page-keys-ambiguous',
+// error, pages, conflicts }, answered before anything is written.
 // Logical failures (no sitemap, enumeration down, missing download) return { ok:false } without
 // throwing. Unexpected I/O errors propagate as thrown exceptions (caught by main().catch).
-async function runDownload({ sdk, genpageCli, outDir, appId, appUnique, allowLossy = false }) {
-  // `fetchArtifact('app')` FAILS CLOSED when the app's sitemap cannot be resolved, read, or proven to
-  // still belong to this app (SDK code `APP_SITEMAP_UNRESOLVED`) — rather than returning an app whose
-  // navigation is untrustworthy. That is a LOGICAL failure of exactly the class this function's
-  // contract says it returns rather than throws (the sitemap IS the download's membership oracle), so
-  // translate it instead of letting a raw SDK error escape. A newly created app is the common cause:
-  // an unpublished appmodule is not readable, so the caller's fix is to publish it and retry.
+// A link already under pages/ must be refused before the tree is replaced. rm of a real
+// parent drops the link name; that is not the same as leaving the other name untouched.
+function assertNoPlantedPageLinks(pagesRoot) {
+  let entries = [];
+  try { entries = fs.readdirSync(pagesRoot); } catch (e) {
+    if (e && e.code === 'ENOENT') return;
+    throw e;
+  }
+  for (const entry of entries) {
+    const child = path.join(pagesRoot, entry);
+    let st;
+    try { st = fs.lstatSync(child); } catch (e) {
+      if (e && e.code === 'ENOENT') continue;
+      throw e;
+    }
+    if (st.isSymbolicLink() || st.isDirectory()) {
+      assertSafeOutputDir(child);
+      if (st.isDirectory() && !st.isSymbolicLink()) {
+        for (const name of fs.readdirSync(child)) assertPlainFileTarget(path.join(child, name));
+      }
+    } else {
+      assertPlainFileTarget(child);
+    }
+  }
+}
+
+// The page folders a download writes, from the pages as the backend read them: pages/<pageId>/{page.tsx,config.json,prompt.txt}, the
+// layout parseDownloadedPages reads back. The tree is replaced as a whole, so a page deleted since the last download does not linger.
+//
+// The SDK writes nothing to disk itself, so this is the one place that must not follow a link planted in the output folder: one already
+// under pages/ is refused first (assertNoPlantedPageLinks), a folder is made only after the name is checked (assertSafeOutputDir), and
+// every file is written by writeFileSafe, which refuses a link at the file's own name. A page id reaches here only after the backend has
+// read it, and the backend reads a GUID and nothing else, so no id can hold a path separator.
+function writePageTree(pagesRoot, pages) {
+  assertSafeOutputDir(pagesRoot, { create: true });
+  assertNoPlantedPageLinks(pagesRoot);
+  fs.rmSync(pagesRoot, { recursive: true, force: true });
+  assertSafeOutputDir(pagesRoot, { create: true });
+  for (const { pageId, files } of pages) {
+    const destDir = path.join(pagesRoot, pageId);
+    assertSafeOutputDir(destDir, { create: true });
+    for (const [name, text] of Object.entries(files)) writeFileSafe(path.join(destDir, name), text, { encoding: 'utf8' });
+  }
+}
+
+// Reads every page the sitemap names, by id — so nothing outside this app is read — a few at a time, and answers
+// { ok: true, pages: [{ pageId, files }] } in the sitemap's order, or { ok: false, errors } naming each page that could not be read. A page that
+// cannot be read is a page the spec would drop: the caller refuses to write one rather than report it as an app without that page. That includes
+// a page the SDK holds as raw files, which has no source to put in a folder (the backend throws for it).
+async function readSitemapPages(genpage, ids, concurrency) {
+  const results = await mapLimit(ids, concurrency, async (id) => {
+    try { return { id, page: await genpage.read(id) }; } catch (error) { return { id, error }; }
+  }, { firstInOrder: true });
+  const failed = results.filter((r) => r.error);
+  if (failed.length) return { ok: false, errors: failed.map((r) => `${r.id}: ${(r.error && r.error.message) || r.error}`) };
+  return { ok: true, pages: results.map(({ id, page }) => ({ pageId: String(id).toLowerCase(), files: pageFolderFiles(page) })) };
+}
+
+async function runDownload({ sdk, genpage, outDir, appId, appUnique, allowLossy = false, resetPageKeys = false, concurrency, languageCode }) {
+  concurrency = validatedDownloadConcurrency(concurrency);
+  // The caller named this directory. A link at its final component would make every page and
+  // the spec land outside it. Ancestors are the caller's choice and are not inspected.
+  assertSafeOutputDir(outDir);
+  // The sitemap is the download's membership oracle. An unresolved or shared identity is a logical
+  // refusal, not a partial app: return it before reading pages or writing output. Saved-only apps are
+  // readable when the SDK can prove their current layer and sitemap; publishing is not a blanket fix.
   let app;
   try {
     app = await sdk.fetchArtifact('app', appId);
   } catch (e) {
     const code = e && e.code;
-    if (code === 'APP_SITEMAP_UNRESOLVED' || code === 'APP_UPDATE_NO_ETAG') {
+    if (code === 'APP_SITEMAP_UNRESOLVED' || code === 'APP_SITEMAP_SHARED' || code === 'APP_UPDATE_NO_ETAG') {
       return { ok: false, error: `cannot read app ${appId}: ${(e && e.message) || code}` };
     }
     throw e;
   }
-  const { entities: entityLogicals, icons, customRefs, navRefs } = collectSitemap(app);
+  // SDK artifacts use uniqueName, while older readers return uniquename. A GUID lookup on the
+  // published projection can return no row for a draft, so resolve the immutable identity here
+  // BEFORE manifest/publisher lookup; the mutable display name must never stand in for it.
+  const resolvedUnique = [app && app.uniqueName, app && app.uniquename, appUnique]
+    .find((value) => typeof value === 'string' && value.trim());
+  if (!resolvedUnique) {
+    return { ok: false, error: `the app's immutable unique name could not be resolved (${appId}) — refusing to emit a rebuildable spec without its identity` };
+  }
+  appUnique = resolvedUnique.trim();
+  const componentInventory = await readAppComponentInventory(sdk, appId);
 
   // MEMBERSHIP: the authoritative set of pages owned by this app, from its SITEMAP XML (fail-closed,
-  // discriminated). The app-scoped `pac genpage list --app-id` is sitemap-scoped anyway but returns
+  // discriminated). A page list scoped to the app is sitemap-scoped anyway but carries
   // SITEMAP TITLES (not page names), misses headless nav-target pages, and cannot be trusted as the
   // "real names" source. The raw sitemap XML is the single authoritative membership record.
-  const smResult = appUnique
-    ? await fetchSitemap(sdk, appUnique)
-    : { ok: false, reason: 'app-unique-unresolved' };
+  const smResult = await fetchSitemap(sdk, appUnique, { currentLayer: componentInventory.layer });
   if (!smResult.ok) {
     return { ok: false, error: `could not read the app sitemap during download (${smResult.reason}) — refusing to write a spec without the authoritative page set` };
   }
+  // The SDK takes the first unpublished-aware row ($top=1), not the componentstate=1 row.
+  // No tested XML -> appShell converter preserves its bags/icons/titles, so refuse a mixed
+  // snapshot instead of turning a missed draft subarea into a hidden table or lost restriction.
+  if (!appNavigationMatchesSitemap(app, smResult.xml)) {
+    return { ok: false, error: "the app's sitemap has an unpublished change the SDK could not read consistently — publish the app, then download again" };
+  }
+  const { entities: entityLogicals, icons, customRefs, navRefs } = collectSitemap(app);
   // [{ pageId, title? }] — deduped by id; membership-only (title is the XML-decoded subarea label,
   // NOT the page's real name — the real name comes from the env-wide list below).
   const smPages = sitemapGenPages(smResult.xml);
   let pages = [];
+  // Ids a download left in navigation calls instead of turning them back into PAGEREF_ tokens: see the reverse resolution below.
+  const navIdsLeft = [];
   let manifest = null;
+  // What the pages' connector and Custom API bindings come to (pageBindingsReport): in the spec, and what a rebuild into another environment still cannot bring. Null when no page holds any.
+  let pageBindings = null;
 
   if (smPages.length) {
     // Durable manifest (stable key→id bindings + v2 semantics). Best-effort: a missing or corrupt
@@ -544,11 +2941,11 @@ async function runDownload({ sdk, genpageCli, outDir, appId, appUnique, allowLos
       if (rows && rows[0] && rows[0].content) manifest = parseManifestBase64(rows[0].content);
     }
 
-    // Real names from the ENV-WIDE list (addenda new-1: env names ≠ sitemap titles). The env-wide
-    // `pac genpage list` returns each page's actual configured name; the sitemap title is what the
+    // Real names from the ENV-WIDE list (env names ≠ sitemap titles). The env-wide
+    // list holds each page's actual configured name; the sitemap title is what the
     // Maker chose for the subarea label, which can differ. Using the sitemap title as the page name
-    // was the root of the name-vs-title mismatch (live-confirmed; see Plan-5 §Background).
-    const envResult = await genpageCli.enumerateEnv();
+    // was the root of the name-vs-title mismatch (live-confirmed).
+    const envResult = await genpage.enumerateEnv();
     if (!envResult.ok) {
       return { ok: false, error: `page enumeration failed during download: ${envResult.error}` };
     }
@@ -557,29 +2954,87 @@ async function runDownload({ sdk, genpageCli, outDir, appId, appUnique, allowLos
         .map((p) => [String(p.pageId).toLowerCase(), p.name])
     );
 
-    // Download EXACTLY the sitemap's pages (by id — headless-free, no env-wide over-pull). The
+    // Read EXACTLY the sitemap's pages (by id — headless-free, no env-wide over-pull). The
     // sitemap is the MEMBERSHIP authority: we pull precisely this app's pages, no more, no less.
     const pagesRoot = path.join(outDir, 'pages');
-    fs.rmSync(pagesRoot, { recursive: true, force: true });
-    fs.mkdirSync(pagesRoot, { recursive: true });
-    const sitemapIds = smPages.map((p) => p.pageId);
+    // Refuse a link already at pages/ before removing it or creating children through it.
     try {
-      await genpageCli.download({ appId, outputDir: pagesRoot, pageIds: sitemapIds });
+      fs.lstatSync(pagesRoot);
+      assertSafeOutputDir(pagesRoot);
     } catch (e) {
-      return { ok: false, error: `pac genpage download failed: ${e.message}` };
+      if (e && e.code === 'UNSAFE_OUTPUT') throw e;
+      if (!(e && e.code === 'ENOENT')) throw e;
     }
+    const sitemapIds = smPages.map((p) => p.pageId);
 
     // Name resolver: env-wide name (real, stable) primary; sitemap title (XML-entity-decoded) as
     // fallback when the env-wide list doesn't cover an id (shouldn't happen in practice — env-wide
-    // lists all pages — but guards against an eventual stale or truncated listing).
+    // lists all pages — but guards against an eventual stale or truncated listing). Either one may hold
+    // the `\"` an earlier release's `pac` stored for a `"` (the page's own name always did; a navigation title did when
+    // pac wrote it), and the spec's name is what a rebuild sends back — which must not gain a backslash every
+    // round trip. So the spec gets the name the page was given (`unescapePacName`).
     const nameById = new Map(smPages.map((p) => {
       const id = String(p.pageId).toLowerCase();
-      return [id, envNameById.get(id) || p.title || p.pageId];
+      return [id, unescapePacName(envNameById.get(id) || p.title || p.pageId)];
     }));
-    pages = parseDownloadedPages(pagesRoot, outDir, nameById);
 
-    // Bidirectional exact equality: sitemap ids ↔ downloaded ids (I3). A gap either way means pac
-    // fetched a different set than the sitemap declares — rebuilding from this spec would silently
+    // Reconcile by MEMBERSHIP. For download, existence AND membership are both the sitemap ids
+    // (the pages we are about to pull — a page of the sitemap that cannot be pulled fails the download below). This differs from the build path, which
+    // uses the env-wide EXISTENCE set (because a build must find crash-orphaned pages that are not yet in the sitemap). It needs no page content, so it
+    // is done first: the keys below are judged before anything is read or written.
+    const { keyToId, conflicts } = reconcilePageIds(
+      (manifest && manifest.pages) || [],
+      manifest,
+      sitemapIds, // existenceIds: confirmed present (the sitemap names them)
+      sitemapIds  // sitemapIds: membership = same set as existence for the download path
+    );
+    if (conflicts.length) {
+      return { ok: false, error: `page identity conflict during download: ${conflicts.map((c) => c.pageId || c.key).join(', ')} — cannot safely reconstruct` };
+    }
+
+    // The keys an earlier download of this app gave these pages are read, and judged, BEFORE a page is read from the backend or anything is written, so that a
+    // refusal leaves the working folder exactly as it was: the file is the maker's only record of those keys, and the page folders may hold edits. Only the rows of
+    // the pages this app has now count: a row of a page that is gone says nothing about a page that is here.
+    const priorSpecPath = path.join(outDir, 'app-spec.json');
+    const previous = readPreviousPageKeys(priorSpecPath, appUnique, { livePageIds: sitemapIds });
+    if (previous.problem) {
+      process.stderr.write(`WARNING: the app-spec.json in ${outDir} could not be read (${previous.problem}), so the page keys of an earlier download were not kept: a page that the page manifest does not bind is given a fresh key, which can differ from the one a copy of that spec already deployed to another environment was built with.\n`);
+    }
+    if (previous.unidentified) {
+      process.stderr.write(`WARNING: the app-spec.json in ${outDir} does not say which app it describes (its app.uniqueName is missing, blank or not a text), so its page keys were not used as the earlier keys of this app: a page that the page manifest does not bind is given a fresh key, which can differ from the one a copy of that spec already deployed to another environment was built with. A spec an earlier download of this app wrote names the app in app.uniqueName.\n`);
+    }
+    // Keys that cannot be told apart for a page the manifest does not bind are not minted afresh behind the maker's back — that is how two pages of a
+    // deployed copy swap what they hold — unless the maker has said to (--reset-page-keys).
+    const undecided = undecidedPageKeys(previous.conflicts, keyToId, nameById);
+    if (undecided && !resetPageKeys) return pageKeysRefusal(priorSpecPath, undecided, nameById);
+
+    const read = await readSitemapPages(genpage, sitemapIds, concurrency);
+    if (!read.ok) return { ok: false, error: `page download failed: ${read.errors.join('; ')}` };
+    writePageTree(pagesRoot, read.pages);
+
+    const unreadableConfigs = [];
+    const unkeptModels = [];
+    const unkeptBindings = [];
+    pages = parseDownloadedPages(pagesRoot, outDir, nameById, unreadableConfigs, unkeptModels, unkeptBindings);
+    // Reported, not gated: a page whose model is left out rebuilds exactly as every page did before the spec carried models — an
+    // update leaves the model the page already has as it is (the SDK writes only what a spec names), and a page the rebuild creates
+    // gets none.
+    if (unkeptModels.length) {
+      process.stderr.write(`WARNING: ${unkeptModels.length} page model id(s) the App Spec cannot hold were left out, so a rebuild keeps the model of a page that exists as it is and stores none on a page it creates: ${unkeptModels.map((u) => `${u.pageId} (${JSON.stringify(u.model)})`).join(', ')}\n`);
+    }
+    // A page whose config.json could not be read has UNKNOWN data sources, and the spec would claim
+    // it has none — rebuilding it with no table bindings while its source still queries the table.
+    // That is exactly the class of silent loss `--allow-lossy-download` exists to gate.
+    if (unreadableConfigs.length) {
+      const detail = unreadableConfigs.map((u) => `${u.pageId} (${u.reason})`).join(', ');
+      if (!allowLossy) {
+        return { ok: false, error: `could not read config.json for page(s): ${detail} — their data-source bindings are unknown, so refusing to write a spec that would silently rebuild them unbound. Re-run with --allow-lossy-download to accept the loss.` };
+      }
+      process.stderr.write(`WARNING: ${unreadableConfigs.length} page config(s) unreadable; their data-source bindings are DROPPED, and their connector and Custom API bindings are not in the spec either (a rebuild into this environment leaves those as they are): ${detail}\n`);
+    }
+
+    // Bidirectional exact equality: sitemap ids ↔ downloaded ids. A gap either way means the download
+    // read a different set than the sitemap declares — rebuilding from this spec would silently
     // drop or add pages, so download FAILS instead.
     const missing = missingDownloads(smPages, pages);
     if (missing.length) {
@@ -590,32 +3045,51 @@ async function runDownload({ sdk, genpageCli, outDir, appId, appUnique, allowLos
       return { ok: false, error: `downloaded page(s) not in the sitemap: ${extra.map((p) => p.pageId).join(', ')} — inconsistent page set` };
     }
 
-    // Reconcile by MEMBERSHIP. For download, existence AND membership are both the sitemap ids
-    // (the pages we just pulled — if they were downloaded they exist; if not we already aborted
-    // above). This differs from the build path, which uses the env-wide EXISTENCE set (because a
-    // build must find crash-orphaned pages that are not yet in the sitemap).
-    const { keyToId, conflicts } = reconcilePageIds(
-      (manifest && manifest.pages) || [],
-      manifest,
-      sitemapIds, // existenceIds: confirmed present (we just downloaded them)
-      sitemapIds  // sitemapIds: membership = same set as existence for the download path
-    );
-    if (conflicts.length) {
-      return { ok: false, error: `page identity conflict during download: ${conflicts.map((c) => c.pageId || c.key).join(', ')} — cannot safely reconstruct` };
+    // Assign stable keys + carry v2 semantics (navigatesTo/purpose/pageInput) from the manifest.
+    // Pages bound to manifest keys reuse their key and semantics; the other pages keep the key an earlier download of this app
+    // gave them (the app-spec.json this download replaces); only pages with neither (Maker-added, not in the manifest) get a
+    // fresh slug key minted from their env-wide name — and so do the pages whose earlier keys cannot be told apart, when the maker said to (--reset-page-keys).
+    const idToKey = assignPageKeys(pages, manifest, keyToId, previous.keys);
+    if (undecided) {
+      const keyOf = new Map(pages.map((p) => [String(p.pageId).toLowerCase(), p.key]));
+      process.stderr.write(`WARNING: --reset-page-keys: ${undecided.pages.length} page(s) were given a fresh key because the app-spec.json in ${outDir} gave them keys that cannot be told apart (${undecided.pages.map((p) => `${JSON.stringify(p.name)} (${keyOf.get(p.pageId)})`).join(', ')}). A key is a page's identity in a rebuild: another environment that holds a copy of the earlier spec has the earlier keys bound to its pages, so deploying this spec there could update a different page than the earlier one did. Check each key against that environment before you deploy this spec there.\n`);
+    }
+    // A key that is not the earlier one was given by the manifest (it outranks the file, and it holds a key for a page, or a page for a key,
+    // that the file says otherwise of). Say so: a copy of the earlier spec deployed to another environment binds the earlier keys there.
+    const moved = pages.filter((p) => previous.keys.has(String(p.pageId).toLowerCase()) && previous.keys.get(String(p.pageId).toLowerCase()) !== p.key);
+    if (moved.length) {
+      process.stderr.write(`WARNING: ${moved.length} page(s) have a different key than in the app-spec.json this download replaces (${moved.map((p) => `${JSON.stringify(p.name)} (${previous.keys.get(String(p.pageId).toLowerCase())} -> ${p.key})`).join(', ')}) because the app's page manifest binds them differently. A key is a page's identity in a rebuild: another environment that holds a copy of the earlier spec has the earlier keys bound to its pages, so deploying this spec there would update a different page than the earlier one did. Check each key against that environment before you deploy this spec there, or give each page its earlier key again (in app-spec.json, in navigatesTo and in the PAGEREF_ tokens of the page source).\n`);
     }
 
-    // Assign stable keys + carry v2 semantics (navigatesTo/purpose/pageInput) from the manifest.
-    // Pages bound to manifest keys reuse their key and semantics; Maker-added pages (not in the
-    // manifest) get a fresh slug key minted from their env-wide name.
-    const idToKey = assignPageKeys(pages, manifest, keyToId);
-
-    // Reverse-resolve nav pageId literals → symbolic PAGEREF_<key> tokens (structural, oracle-safe).
+    // Reverse-resolve nav pageId literals → symbolic PAGEREF_<key> tokens (structural, oracle-safe). Only a double-quoted literal before any
+    // place the lexer reads by guess is turned back, and only if the build would take the page written that way (see
+    // reverseResolveNavIdsReport); the ids it leaves are reported below.
     for (const p of pages) {
       const abs = path.join(outDir, p.codeFile);
+      assertPlainFileTarget(abs);                         // FAIL on a planted link (no swallow, no write)
       const src = fs.readFileSync(abs, 'utf8');           // FAIL on a read error (no swallow)
-      const rev = reverseResolveNavIds(src, idToKey);     // structural — nav pageId literals only
-      if (rev !== src) fs.writeFileSync(abs, rev, 'utf8'); // FAIL on a write error (no swallow)
+      const rev = reverseResolveNavIdsReport(src, idToKey); // structural — nav pageId literals only
+      if (rev.code !== src) writeFileSafe(abs, rev.code, { encoding: 'utf8' }); // FAIL on a write error (no swallow)
+      for (const left of rev.left) navIdsLeft.push({ page: p.name, ...left });
     }
+    // Every page id of this app still in a downloaded page is reported, whether a call the checker recognised holds it or not (see
+    // knownIdsLeft in pageref-resolver.js). One in a navigation call is a hardcoded page id to the build, which refuses one, so say so now
+    // rather than at the rebuild; one that is data can stay.
+    if (navIdsLeft.length) {
+      const why = (l) => {
+        if (l.why === 'quote') return 'not a double-quoted literal';
+        if (l.why === 'text') return 'not a navigation pageId literal (data, text or a comment)';
+        // The page as tokens would not rebuild (see rebuildRefusal in pageref-resolver.js): none was written, so every id of the page is as deployed.
+        if (l.why === 'would-not-rebuild') return `kept as the id: written as tokens the page would not rebuild${l.frontier ? ` — it would have a "${l.frontier.kind}" ambiguity at line ${l.frontier.line}, column ${l.frontier.column}, where the build stops trusting what it reads` : ''}`;
+        return `${l.frontier.reaches ? 'in a call that reaches' : 'after'} the "${l.frontier.kind}" ambiguity at line ${l.frontier.line}, column ${l.frontier.column}`;
+      };
+      process.stderr.write(`WARNING: ${navIdsLeft.length} page id(s) of this app remain in the downloaded page source instead of PAGEREF_ tokens (${navIdsLeft.map((l) => `page "${l.page}" line ${l.line}, column ${l.column}: ${why(l)}`).join('; ')}) — a navigation call that keeps one is a hardcoded page id, which a rebuild refuses: write it as a double-quoted "PAGEREF_<key>" literal in a navigateTo call whose options object is written inline, before any construct this check reads by guess, then rebuild. An id that is data — a record id, text, a comment — can stay.\n`);
+    }
+
+    // The connector and Custom API bindings the pages hold. The spec states them (parseDownloadedPages), so a rebuild writes them back; what it cannot do in another environment is said here — and in the result — rather
+    // than left for the first call through a binding that cannot resolve. Silent when no page holds one.
+    pageBindings = pageBindingsReport(pages, unkeptBindings);
+    if (pageBindings) process.stderr.write(pageBindingsNote(pageBindings));
 
     // Warn about manifest pages no longer in the sitemap (Maker-deleted in the live app). The
     // rebuilt spec drops these pages; the warning mirrors the droppedSubareaCount WARNING below.
@@ -628,25 +3102,81 @@ async function runDownload({ sdk, genpageCli, outDir, appId, appUnique, allowLos
     }
   }
 
-  // Entities: the sitemap's navigable tables UNIONED with the app's real entity components. The
-  // sitemap alone misses tables reachable only via lookup/sub-grid/related view (ADO 6603388); the
-  // component read is best-effort, so a failure degrades to exactly today's sitemap-derived set.
-  const componentLogicals = await appComponentEntities(sdk, appId);
+  // A hidden STOCK type-1 member must not adopt another solution's schema, even when one of its
+  // views/charts/forms is also referenced. Asset ownership is not table ownership (AB#6603388).
+  // Custom hidden tables and tables discovered ONLY via asset components still hydrate their schema.
   const sitemapSet = new Set(entityLogicals);
-  const allLogicals = [...new Set([...entityLogicals, ...componentLogicals])];
+  const appTables = [...componentInventory.tables.keys()].filter((logical) => !sitemapSet.has(logical)).sort();
+  const assetTables = new Set(componentInventory.assetTables);
+  const schemaComponents = componentInventory.logicalNames.filter((logical) => {
+    const table = componentInventory.tables.get(logical);
+    if (table && !sitemapSet.has(logical)) return table.isCustomEntity === true;
+    return assetTables.has(logical) || (table && table.isCustomEntity === true);
+  });
+  // The navigation's tables keep the navigation's order, which is the app's own. The ones the app holds beyond it arrive in the
+  // order of its component rows, which Dataverse does not fix, so they follow by name.
+  const allLogicals = [...new Set([...entityLogicals, ...schemaComponents.sort(compareText)])];
+  for (const logical of appTables) {
+    if (typeof componentInventory.tables.get(logical).isCustomEntity !== 'boolean') {
+      componentInventory.notes.push({ kind: 'tables', table: logical,
+        reason: `the custom/stock status of '${logical}' could not be read; app.tables preserves its membership without adopting its schema` });
+    }
+  }
   const entities = [];
   const noPrimaryName = [];   // sitemap tables — a hard failure (the user asked for these)
   const droppedComponents = []; // component-only tables — dropped with a warning (best-effort input)
   const metadataErrors = new Map(); // logical -> error message (the read itself failed)
+  // Tables whose LABEL reads failed. Distinct from `metadataErrors`: the table itself was recovered
+  // and the spec is usable, but only the SDK's flattened single-language labels survived, so
+  // a multi-language table silently downloads as English-only. Reported rather than swallowed —
+  // by READ, because the table's own read and the columns' read carry different things, and each
+  // warning must say only what the read that failed carries.
+  const tableLabelReadFailures = new Map(); // logical -> reason
+  const attributeReadFailures = new Map(); // logical -> reason
+  // Tables whose OPTION-SET read failed (#564). Kept apart from the label reads for the same
+  // reason that those are kept apart from `metadataErrors`: the table is recovered and the spec is
+  // usable, but every Choice/MultiChoice column on it comes back untyped, so a cross-environment
+  // rebuild would create them as Text. Naming the reason is what makes that actionable.
+  const optionSetReadFailures = new Map(); // logical -> reason
+  // Tables whose File or Image read failed, by type: those columns are kept and typed, but without what that read carries.
+  const mediaReadFailures = { File: new Map(), Image: new Map() }; // type -> logical -> reason
+  // File and Image columns an answered read came back without detail for (entityFromMetadata's `incomplete`), of the tables kept.
+  const incompleteMediaColumns = [];
+  // Columns left out because the App Spec has no type for them (entityFromMetadata's `unexpressible`), of the tables the spec keeps.
+  const unexpressibleColumns = [];
+  // Choice option labels written without the one language they hold (entityFromMetadata's `languageLost`), of the tables the spec keeps.
+  const optionLanguageLosses = [];
+  // Choice columns left untyped because one text names two of their options (entityFromMetadata's `labelClashes`), of the tables the
+  // spec keeps: `<table>.<column>` -> the clash, which untypedColumnWarnings names in place of an unreadable option set.
+  const labelClashColumns = new Map();
+  // Shared option sets bound by a downloaded column, keyed by lower-cased name so a set used by
+  // several tables is declared once.
+  const globalChoiceDecls = new Map();
+  const tableVectorIcons = new Map();
+  const schemaReadFailures = new Map();
   for (const logical of allLogicals) {
     let e;
+    const leftOut = [];
+    const shortOf = [];
+    const schemaOmissions = [];
+    const lostLabels = [];
+    const clashedColumns = [];
     // A metadata READ failure is not the same as metadata that reports no primary name, and it must
     // not be swallowed: a 429/503 on a sitemap table used to drop it silently, leaving its subarea
     // behind so validation later complained about a "sitemap subArea references unknown entity" —
     // the confusing downstream error the explicit branch below exists to avoid. Bucket it by origin
     // exactly like the no-primary-name case, so the user is told the table AND the reason.
     try {
-      e = entityFromMetadata(await sdk.fetchEntityMetadata(logical), logical);
+      const meta = await readEntityWithDescriptions(sdk, logical, { concurrency });
+      if (meta && meta.tableLabelReadFailed) tableLabelReadFailures.set(logical, meta.tableLabelReadFailed);
+      if (meta && meta.attributeReadFailed) attributeReadFailures.set(logical, meta.attributeReadFailed);
+      if (meta && meta.optionSetReadFailed) optionSetReadFailures.set(logical, meta.optionSetReadFailed);
+      for (const [type, reason] of Object.entries((meta && meta.mediaReadFailures) || {})) if (mediaReadFailures[type]) mediaReadFailures[type].set(logical, reason);
+      collectGlobalChoices(meta, globalChoiceDecls);
+      e = entityFromMetadata(meta, logical, { unexpressible: leftOut, incomplete: shortOf, schemaOmissions, languageCode, languageLost: lostLabels, labelClashes: clashedColumns });
+      if (meta && typeof meta.IconVectorName === 'string' && meta.IconVectorName.trim()) tableVectorIcons.set(logical, meta.IconVectorName);
+      const missingSchema = [...((meta && meta.schemaReadFailures) || []), ...schemaOmissions];
+      if (missingSchema.length) schemaReadFailures.set(logical, missingSchema.join('; '));
     } catch (err) {
       metadataErrors.set(logical, (err && err.message) || String(err));
       (sitemapSet.has(logical) ? noPrimaryName : droppedComponents).push(logical);
@@ -667,6 +3197,12 @@ async function runDownload({ sdk, genpageCli, outDir, appId, appUnique, allowLos
       continue;
     }
     entities.push(e);
+    for (const c of leftOut) unexpressibleColumns.push(`${e.schemaName}.${c.column} (${c.typeName})`);
+    for (const c of shortOf) incompleteMediaColumns.push({ name: `${e.schemaName}.${c.column}`, missing: c.missing });
+    for (const l of lostLabels) optionLanguageLosses.push(`${e.schemaName}.${l.column} options[${l.option}] '${l.label}' (${l.languageCode})`);
+    for (const c of clashedColumns) {
+      labelClashColumns.set(`${e.schemaName}.${c.column}`, c.clashes.map((x) => `'${x.alias}' names options[${x.first}] and options[${x.second}]`).join(', '));
+    }
   }
   const withReason = (list) => list.map((l) => (metadataErrors.has(l) ? `${l} (metadata read failed: ${metadataErrors.get(l)})` : l)).join(', ');
   if (noPrimaryName.length) {
@@ -680,6 +3216,78 @@ async function runDownload({ sdk, genpageCli, outDir, appId, appUnique, allowLos
   }
   if (droppedComponents.length) {
     process.stderr.write(`WARNING: ${droppedComponents.length} app component table(s) were omitted from the spec because Dataverse reported no primary-name column (${withReason(droppedComponents)}) — they are NOT in the app's navigation, and the deployed app still references them; declare them by hand if a rebuild needs them.\n`);
+  }
+  // AB#6686428: the two label reads are the ONLY source of multi-language labels — the table's own (its display name, plural and
+  // description) and the columns' (which also carries the flags and type names the column filters read). When one fails the table
+  // is still recovered, so the download succeeds and the spec looks complete — but it carries the SDK's flattened single-language
+  // labels and every other language is gone. Silently degrading there is the same shape as the bug this feature fixes, so say so —
+  // once per READ, naming only what that read carries: the table's read failing says nothing about the columns, and the columns'
+  // read failing says nothing about the table. Not a gate: an English-only spec is still a usable spec, and failing a read-only
+  // command over it would be worse.
+  const failureDetail = (failures) => [...failures.entries()].sort(([a], [b]) => compareText(a, b)).map(([l, r]) => `${l} (${r})`).join(', ');
+  if (schemaReadFailures.size) {
+    process.stderr.write(`WARNING: some portable schema detail could not be captured (${failureDetail(schemaReadFailures)}). The table and its typed columns are kept, but rebuilding into a FRESH environment uses the build defaults for missing column options and cannot recreate missing status reasons, alternate keys or table icons. Re-run the download to recover unreadable detail, and resolve the stated build limits before a cross-environment rebuild.\n`);
+  }
+  if (tableLabelReadFailures.size) {
+    // The table's plural is carried by this read alone (download keeps one a rebuild would not derive), so it goes with it.
+    process.stderr.write(`WARNING: the table label read failed for ${tableLabelReadFailures.size} table(s) (${failureDetail(tableLabelReadFailures)}). Their display names and descriptions fall back to ONE language and their plurals are not written, so rebuilding into a FRESH environment would recreate each of those tables labelled in one language, with the plural '<display name>s'. Re-run the download to recover them before a cross-environment rebuild.\n`);
+  }
+  if (attributeReadFailures.size) {
+    // Without this read no Virtual column has the type name entityFromMetadata names an unexpressible one by, so none is named: the
+    // platform's own virtual columns could not be told from it. That is what the last clause says, and it is said only here.
+    process.stderr.write(`WARNING: the column read failed for ${attributeReadFailures.size} table(s) (${failureDetail(attributeReadFailures)}). Their COLUMN labels and descriptions fall back to ONE language, so a column labelled in several languages downloads as single-language and rebuilding into a FRESH environment would recreate it that way. That read also carries the flags that identify a lookup's synthetic '<lookup>name' column, so those tables may additionally have captured one as a real Text column — delete any you see before a cross-environment rebuild — and the type names that tell a column of a type the App Spec cannot express from the platform's own, so any such column on those tables was left out without being named. Re-run the download to recover them.\n`);
+  }
+  // #564: the option-set read is the ONLY source of a Choice/MultiChoice column's type. When it
+  // fails the table is still recovered and the spec still looks complete, but every choice column on
+  // it comes back untyped — so a rebuild into a FRESH environment creates them as Text. Reported
+  // with the reason, and separately from the untyped list below, because "we could not look" is a
+  // different fact from "this column has no substantiated type", and only the first is re-runnable.
+  if (optionSetReadFailures.size) {
+    const detail = [...optionSetReadFailures.entries()].sort(([a], [b]) => compareText(a, b)).map(([l, r]) => `${l} (${r})`).join(', ');
+    process.stderr.write(`WARNING: the Choice/MultiChoice option-set read failed for ${optionSetReadFailures.size} table(s) (${detail}). Any choice column on those tables is captured WITHOUT its type or options, so rebuilding into a FRESH environment would create it as single-line Text. Re-run the download to recover them before a cross-environment rebuild.\n`);
+  }
+  // A column whose App Spec type could not be substantiated: a Choice/MultiChoice whose option set
+  // the read did not return (see the failure warning above), or an attribute type the spec cannot
+  // declare. Rebuilding into an org that ALREADY has the table reuses the column and this is inert;
+  // rebuilding into a FRESH org creates it as Text, because the data-model phase falls back to
+  // `c.type || 'Text'`. That silent downgrade is why this is announced by name — and with its cause
+  // where the download knows it: one text naming two of its options (untypedColumnWarnings).
+  const untyped = untypedColumnNames(entities);
+  for (const line of untypedColumnWarnings(untyped, labelClashColumns)) process.stderr.write(line);
+  // A File or Image column whose read failed is still in the spec, typed, but without what that read carries — so a rebuild into a
+  // FRESH environment makes it at the build's default size (and an image not asked to be the table's primary one) instead of as it is
+  // here. Said per READ, with the reason, as the option-set failure is: the read is what is re-runnable, and the File read failing
+  // says nothing about the Image columns, nor the other way round.
+  if (mediaReadFailures.File.size) {
+    process.stderr.write(`WARNING: the File column read failed for ${mediaReadFailures.File.size} table(s) (${failureDetail(mediaReadFailures.File)}). Their File columns are captured WITHOUT the maximum size each was made with, so rebuilding into a FRESH environment would create them at the default size of ${DEFAULT_MAX_SIZE_KB} KB. Re-run the download to recover them before a cross-environment rebuild.\n`);
+  }
+  if (mediaReadFailures.Image.size) {
+    process.stderr.write(`WARNING: the Image column read failed for ${mediaReadFailures.Image.size} table(s) (${failureDetail(mediaReadFailures.Image)}). Their Image columns are captured WITHOUT the maximum size each was made with or whether one is the table's primary image, so rebuilding into a FRESH environment would create them at the default size of ${DEFAULT_MAX_SIZE_KB} KB, none of them asked to be the table's primary image. Re-run the download to recover them before a cross-environment rebuild.\n`);
+  }
+  // A read that answered, but without a column's row or with a value that cannot be used (missingMediaDetail) — what an answer read
+  // while the table changes can carry. The column is kept with whatever valid detail came back; what did not is named per column,
+  // and the consequence is said only for the kinds of detail that are missing.
+  if (incompleteMediaColumns.length) {
+    const WHAT = { size: 'its maximum size', primary: "whether it is the table's primary image" };
+    const named = incompleteMediaColumns.slice().sort((a, b) => compareText(a.name, b.name)).map((c) => `${c.name} (${c.missing.map((m) => WHAT[m]).join(' and ')})`);
+    const consequences = [
+      ...(incompleteMediaColumns.some((c) => c.missing.includes('size')) ? [`create a column without its maximum size at the default size of ${DEFAULT_MAX_SIZE_KB} KB`] : []),
+      ...(incompleteMediaColumns.some((c) => c.missing.includes('primary')) ? ["not ask an Image column without its primary-image flag to be the table's primary image"] : []),
+    ];
+    process.stderr.write(`WARNING: the File/Image column read came back incomplete for ${named.length} column(s): ${named.join(', ')}. Each is captured without what did not come back, so rebuilding into a FRESH environment would ${consequences.join(' and would ')}. Re-run the download to recover them before a cross-environment rebuild.\n`);
+  }
+  // A column whose type the App Spec cannot express is left out of columns[] (entityFromMetadata's `unexpressible`). A rebuild into
+  // an environment that has the table leaves it as it is — a build never deletes a column a spec does not list — but one into a
+  // FRESH environment would not make it at all, so each is named rather than dropped without a word.
+  if (unexpressibleColumns.length) {
+    process.stderr.write(`WARNING: ${unexpressibleColumns.length} column(s) have a type the App Spec cannot express and were left out of the spec (${unexpressibleColumns.join(', ')}). Rebuilding this spec into an environment that already has the table leaves them as they are, but rebuilding into a FRESH environment would not create them: add them there in Maker after the rebuild.\n`);
+  }
+  // A Choice option labelled in one language other than the authoring one, whose text another option of its column holds in another
+  // language (entityFromMetadata's `languageLost`): the spec can hold the two only as plain strings, which a rebuild labels in the language
+  // it resolves, so each label that loses its language is named rather than moved without a word. A rebuild into an environment that
+  // already has the column leaves its options as they are.
+  if (optionLanguageLosses.length) {
+    process.stderr.write(`WARNING: the language of ${optionLanguageLosses.length} Choice option label(s) could not be kept (${optionLanguageLosses.join(', ')}): each shares its text with another option of its column in another language, which the App Spec can hold only as plain strings, so rebuilding into a FRESH environment labels them in the language the build resolves. Rename one of those options in Maker and download again, or relabel them in Maker after the rebuild.\n`);
   }
 
   // App identity comes from the app's REAL, immutable uniquename (`appUnique`, captured from Dataverse as
@@ -700,15 +3308,49 @@ async function runDownload({ sdk, genpageCli, outDir, appId, appUnique, allowLos
   // when recovery finds nothing — that fallback cannot be torn down, but teardown skips it safely (see
   // system-solutions.js) rather than erroring.
   const recovered = await recoverAppSolution(sdk, appId);
+  // Several real solutions (#587 item 9), or a membership that could not be read: the spec keeps
+  // 'Default' rather than a guess — the one solution a teardown never deletes — and says so. The
+  // candidates are returned as well as printed, so the JSON result carries them.
+  const solutionCandidates = recovered && Array.isArray(recovered.ambiguous) ? recovered.ambiguous : null;
+  const solutionUnreadable = recovered && recovered.unreadable ? recovered.unreadable : null;
+  if (solutionCandidates) {
+    process.stderr.write(`WARNING: this app belongs to ${solutionCandidates.length} unmanaged solutions (${solutionCandidates.join(', ')}) and a download cannot tell which one you manage it in, so the spec's solution is left as 'Default', which a teardown never deletes. Set solution.uniqueName in app-spec.json to that solution before a rebuild or teardown.\n`);
+  }
+  if (solutionUnreadable) {
+    process.stderr.write(`WARNING: the solutions this app belongs to could not be read (${solutionUnreadable}), so the spec's solution is left as 'Default', which a teardown never deletes, and its business rules and solution-owned global choices are reported as unknown. Set solution.uniqueName in app-spec.json before a rebuild or teardown.\n`);
+  }
 
   // Prefix precedence: the SOLUTION's publisher (authoritative) → the app-uniquename guess (fallback).
   // `prefixResolved` means "this prefix is trustworthy", which gates the icon own-vs-foreign
   // classification below; it must be true for BOTH trusted sources, or a genuine own-publisher custom
   // nav icon stops round-tripping. It stays false only for the unverified 'new' default.
   const solutionPrefix = (recovered && recovered.publisherPrefix) || null;
-  const trustedPrefix = solutionPrefix || appDerivedPrefix;
+  const publisherUnreadable = (recovered && recovered.publisherUnreadable) || null;
+  // Several candidate solutions whose publishers do not share one prefix, none that could be read, or a
+  // publisher whose read FAILED — the one solution's included: the prefix is UNKNOWN. The app-name guess is
+  // exactly the heuristic that ambiguity refuses to use (see recoverAppSolution), and a wrong prefix renames
+  // every relationship not carrying it, so a same-environment rebuild creates each a second time. So it is
+  // not used: the prefix stays the unverified default, and relationships keep their deployed names. (A failed
+  // read of the one solution's publisher used to read as "no prefix", which fell back to the guess.)
+  const prefixUnknown = !solutionPrefix && !!(solutionCandidates || solutionUnreadable || publisherUnreadable);
+  if (prefixUnknown) {
+    let why = solutionCandidates ? 'the publishers of those solutions do not share one customization prefix' : 'with the solutions unread, the publisher is unknown';
+    if (publisherUnreadable) {
+      why = solutionCandidates
+        ? `the publishers of those solutions could not all be read (${publisherUnreadable})`
+        : `the publisher of solution '${recovered.uniqueName}' could not be read (${publisherUnreadable})`;
+    }
+    process.stderr.write(`WARNING: ${why}, so solution.publisherPrefix is left as the unverified 'new' and every relationship keeps its deployed name. Set solution.publisherPrefix in app-spec.json to your solution publisher's prefix before a rebuild.\n`);
+  }
+  const trustedPrefix = solutionPrefix || (prefixUnknown ? null : appDerivedPrefix);
   const solution = { uniqueName: 'Default', publisherPrefix: trustedPrefix || 'new', prefixResolved: !!trustedPrefix };
   if (recovered && recovered.uniqueName) solution.uniqueName = recovered.uniqueName;
+  if (recovered && recovered.displayName) solution.displayName = recovered.displayName;
+  // `recoverAppSolution` already unwraps the solution's description; carry it across. This object is
+  // built fresh (rather than spread from `recovered`) so an unrecovered solution still gets its
+  // required defaults, which is why each field has to be copied deliberately — a field added to
+  // `recoverAppSolution` and not copied here is silently dropped, as this one was.
+  if (recovered && recovered.description) solution.description = recovered.description;
 
   // Icon web resources — looked up by NAME (the sitemap stores the web-resource name, not its id).
   // Bare-name icons are re-declared as-is; a CUSTOM (unmanaged) web resource referenced by a PLATFORM
@@ -716,105 +3358,397 @@ async function runDownload({ sdk, genpageCli, outDir, appId, appUnique, allowLos
   // survives a rebuild into a fresh env that lacks it — but ONLY when it belongs to THIS app's own
   // publisher (`solution.publisherPrefix`). A FOREIGN-prefix / OOB reference is left as a bare reference:
   // re-declaring it would make the build try to createWebResource under an unregistered prefix on a fresh
-  // env → a hard BuildHalt, turning a cosmetic broken icon into a failed build (Opus review).
-  const { webResources, unresolved: unresolvedIcons } = await iconWebResources(sdk, icons, customRefs, solution.publisherPrefix, solution.prefixResolved, navRefs);
-  if (unresolvedIcons && unresolvedIcons.length) {
+  // env → a hard BuildHalt, turning a cosmetic broken icon into a failed build.
+  // A table icon is shared metadata, not proof this app created the resource. Reuse the
+  // own-prefix/unmanaged gates of path-referenced navigation icons and their teardown protection.
+  const tableIconNames = entities.map((e) => tableVectorIcons.get(e.schemaName.toLowerCase())).filter(Boolean);
+  const { webResources, unresolved: unresolvedIcons } = await iconWebResources(sdk, icons, customRefs, solution.publisherPrefix, solution.prefixResolved, navRefs, tableIconNames);
+  const svgByName = new Map(webResources.filter((wr) => wr.type === 'svg').map((wr) => [wr.name.toLowerCase(), wr.name]));
+  for (const entity of entities) {
+    const name = tableVectorIcons.get(entity.schemaName.toLowerCase());
+    if (name && svgByName.has(name.toLowerCase())) entity.vectorIcon = svgByName.get(name.toLowerCase());
+  }
+  const navigationRefs = new Set([...icons, ...customRefs, ...navRefs].map((name) => String(name).toLowerCase()));
+  const unresolvedNavIcons = unresolvedIcons.filter((name) => navigationRefs.has(String(name).toLowerCase()));
+  const unresolvedTableIcons = unresolvedIcons.filter((name) => !navigationRefs.has(String(name).toLowerCase()));
+  if (unresolvedNavIcons.length) {
     // A custom nav icon we couldn't safely round-trip: either an own-prefix WR that's absent on the source
     // env / failed to read, OR (when the publisher prefix couldn't be verified) any custom image icon we
     // can't classify as own-vs-foreign. Its sitemap reference round-trips but the WR isn't re-declared, so
     // the icon will dangle on a rebuild into a fresh env. Surface it now (the build-time portability
     // warning is the backstop). Without this, an unverified-prefix download would silently drop the icon.
-    process.stderr.write(`WARNING: ${unresolvedIcons.length} custom nav-icon web resource(s) could not be captured (${unresolvedIcons.join(', ')}) — their sitemap reference is kept, but declare the web resource(s) in webResources[] if you rebuild into a fresh environment, or the icon will be missing there.\n`);
+    process.stderr.write(`WARNING: ${unresolvedNavIcons.length} custom nav-icon web resource(s) could not be captured (${unresolvedNavIcons.join(', ')}) — their sitemap reference is kept, but declare the web resource(s) in webResources[] if you rebuild into a fresh environment, or the icon will be missing there.\n`);
+  }
+  if (unresolvedTableIcons.length) {
+    process.stderr.write(`WARNING: ${unresolvedTableIcons.length} table-icon web resource(s) could not be captured (${unresolvedTableIcons.join(', ')}) — their vectorIcon references are omitted. Rebuilding here keeps the existing icons, but declare the SVG resources and table vectorIcon fields before rebuilding into a fresh environment.\n`);
   }
 
   // Dashboards (declared as DashBoard sitemap subareas) — reconstructed with id-passthrough tiles.
   let dashboards = [];
   let dashboardReconstructionError = null;
+  // Per-dashboard failures are collected rather than swallowed. They are the usual cause of a
+  // "subarea could not be round-tripped" error further down, and without them that error names the
+  // subarea but not the reason, which makes it undiagnosable without a debugger.
+  const dashboardWarnings = [];
   try {
-    dashboards = await readDashboards(sdk, app);
+    dashboards = await readDashboards(sdk, app, (m) => {
+      dashboardWarnings.push(m);
+      process.stderr.write(`WARNING: ${m}\n`);
+    });
   } catch (e) {
     dashboardReconstructionError = e.message;
     process.stderr.write(`(dashboards reconstruction skipped: ${e.message})\n`);
   }
 
+  // Relationships (#567). Reconstructed from live metadata; anything that cannot be expressed in
+  // relationships[] is collected in `relationshipsSkipped` and reported with the other
+  // not-round-tripped classes, so an omission is stated rather than left to be discovered.
+  let relationships = [];
+  let relationshipsSkipped = [];
+  try {
+    const rel = await readRelationships(sdk, allLogicals, solution.publisherPrefix, (m) => {
+      process.stderr.write(`WARNING: ${m}\n`);
+    }, { prefixUnknown, entities, concurrency, languageCode });
+    relationships = rel.relationships;
+    relationshipsSkipped = rel.skipped;
+  } catch (e) {
+    // A total failure must not sink the download, but it must not masquerade as "this app has no
+    // relationships" either — that is precisely the silent absence #567 was filed about.
+    relationshipsSkipped = [{ name: '(all)', entity: 'unknown', reason: `relationship metadata could not be read (${e && e.message})` }];
+    process.stderr.write(`WARNING: relationships could not be reconstructed: ${e && e.message}\n`);
+  }
+
+  // Captured by the descriptionInventory accessor below so the role-restriction warning can read it
+  // without making a second query.
+  let capturedInventory;
   const read = {
-    // Ensure the app's REAL uniquename reaches hydrateSpec (→ spec.app.uniqueName) even if the artifact
-    // read didn't surface it: `appUnique` is the authoritative value (from the appmodule query) and is
-    // guaranteed present here (the sitemap gate above bails when it's falsy). This is what lets a rebuild
+    // Normalize both SDK identity spellings to hydrateSpec's uniquename input. appUnique was resolved
+    // immediately after fetch, before any manifest or prefix lookup. This is what lets a rebuild
     // resolve the EXISTING app by identity after a display-name rename instead of creating a duplicate.
-    app: async () => ({ ...app, uniquename: (app && app.uniquename) || appUnique }),
+    app: async () => ({ ...app, uniquename: appUnique, ...(await readAppShellSettings(sdk, appId)) }),
     pages: async () => pages,
     entities: async () => entities,
+    relationships: async () => relationships,
     webResources: async () => webResources,
     dashboards: async () => dashboards,
     solution: async () => solution,
     design: async () => (manifest ? manifest.design : undefined),
+    // #564: the shared option sets the downloaded columns bind to. Reduced to the sets an EMITTED
+    // column actually references (and canonicalized to one casing) — `globalChoiceDecls` is gathered
+    // from RAW metadata, which includes attributes later filtered out and tables later dropped, and
+    // every declaration here becomes a `createGlobalOptionSet` write in the target environment.
+    // Declared so a rebuild into a FRESH environment can create them — `createGlobalOptionSet` probes
+    // by Name and reuses, so declaring one the target org already has is a no-op, not a duplicate.
+    globalChoices: async () => finalizeGlobalChoices(entities, globalChoiceDecls),
+    // Captured on the way past so the role-restriction warning below can read it. The accessor stays
+    // a function (hydrateSpec's contract) and is still called exactly once, so this adds no query.
+    // The global-choice inventory is scoped to the sets the app's solution owns plus the ones an
+    // emitted column binds (#586 item 5); the second half is read off `entities` here rather than off
+    // the `globalChoices` accessor so it does not depend on the order hydrateSpec calls them in.
+    descriptionInventory: async () => {
+      const referenced = new Set();
+      for (const e of entities || []) for (const c of (e && e.columns) || []) if (c && c.globalChoice) referenced.add(String(c.globalChoice).toLowerCase());
+      // Scoped the way the solution was resolved: the one solution; EVERY candidate when there are
+      // several — each contains the app, and scoping by none would report their business rules as
+      // "none", the silent absence this report exists to prevent; unknown when unreadable.
+      const scope = solutionUnreadable
+        ? new Error(`the solutions this app belongs to could not be read (${solutionUnreadable})`)
+        : (solutionCandidates || solution.uniqueName);
+      capturedInventory = await readDescriptionInventory(sdk, appId, scope, referenced, componentInventory, { tables: [...allLogicals, ...appTables] });
+      return capturedInventory;
+    },
   };
   const spec = await hydrateSpec(read);
+  if (appTables.length) spec.app.tables = appTables;
+  const mainFormMembership = componentInventory.layer.ok
+    ? await downloadAppMainForms(sdk.dataverse, componentInventory.layer.appModuleIdUnique, sitemapEntityTables(spec), {
+      components: componentInventory.components.get(60),
+      componentError: componentInventory.componentProblems.get(60),
+    })
+    : { mainForms: {}, notes: [] };
+  if (Object.keys(mainFormMembership.mainForms).length) spec.app.mainForms = mainFormMembership.mainForms;
+  setAppMembershipFloor(spec);
+  if (spec.app.tables !== undefined || spec.app.mainForms !== undefined) {
+    preserveAuthoredLanguageCode(spec, path.join(outDir, 'app-spec.json'));
+  }
+
+  // A form restricted to particular security roles. `forms[]` is not reconstructed by this download,
+  // so nothing carries the restriction forward: rebuilding into a FRESH environment regenerates the
+  // form with no `<DisplayConditions>`, and a form with none is offered to EVERY role. Every other
+  // download gap loses a customization; this one silently WIDENS access, so it is named explicitly.
+  const restricted = (capturedInventory && capturedInventory.roleRestrictedForms) || [];
+  if (restricted.length) {
+    process.stderr.write(`WARNING: ${restricted.length} form(s) are restricted to specific security roles (${restricted.map((f) => `${f.entity}.${f.name}`).join(', ')}). This download does not reconstruct forms[], so that restriction is NOT carried into the spec — rebuilding into a fresh environment would recreate them visible to EVERY role. Re-declare it with forms[].securityRoles before a cross-environment rebuild.\n`);
+  }
+  // AB#6686423: name the artifact classes this download leaves out of the rebuildable spec. The
+  // reported failure was not that they are omitted — that is a documented limitation — but that
+  // NOTHING said so, so a second session reading the spec could not tell "this app has no views"
+  // from "this download does not carry views".
+  //
+  // Round-tripped means DECLARED in the emitted spec, so subtract `spec.globalChoices` — not the raw
+  // `globalChoiceDecls` candidates, which also hold sets bound only by a filtered attribute or a
+  // dropped table. Subtracting those hid a set the spec never re-declares: a silent loss in the one
+  // report whose job is naming them.
+  const declaredGlobalChoices = new Set((spec.globalChoices || []).map((g) => String(g && g.name).toLowerCase()));
+  let notRoundTripped = notRoundTrippedSummary(roundTrippedAware(capturedInventory, declaredGlobalChoices));
+  // The notes come in the order the component rows were read, which Dataverse does not fix (compareNotes).
+  const membershipNotes = [...componentInventory.notes, ...mainFormMembership.notes].sort(compareNotes);
+  if (membershipNotes.length) {
+    notRoundTripped = { ...(notRoundTripped || { classes: [], total: 0, entities: [] }), appMembership: membershipNotes };
+  }
+  if (notRoundTripped) process.stderr.write(notRoundTrippedWarning(notRoundTripped));
+  if (relationshipsSkipped.length) process.stderr.write(relationshipsSkippedWarning(relationshipsSkipped));
   const droppedSubareas = typeof spec.droppedSubareas === 'number' ? spec.droppedSubareas : droppedSubareaCount(app, spec);
   const droppedSubareaDetails = Array.isArray(spec.droppedSubareaDetails) ? spec.droppedSubareaDetails : [];
-  return { ok: true, spec, pages, entities, webResources, droppedSubareas, droppedSubareaDetails, dashboardReconstructionError };
+  return { ok: true, spec, pages, entities, webResources, droppedSubareas, droppedSubareaDetails, dashboardReconstructionError, dashboardWarnings, notRoundTripped, relationships, relationshipsSkipped, ...(navIdsLeft.length ? { navIdsLeft } : {}), ...(pageBindings ? { pageBindings } : {}), ...(solutionCandidates ? { solutionCandidates } : {}) };
 }
 
-async function main() {
-  const { positional, flags } = parseArgs(process.argv.slice(2));
-  // parseArgs returns boolean true for a value-less flag. For value-bearing flags, treat that as
-  // missing so `--env --app x` or `--out` reaches the usage guard instead of passing true into URL,
-  // app-id, or path handling. `--allow-lossy-download` is a real boolean switch and stays true.
-  const env = typeof flags.env === 'string' ? flags.env : undefined;
-  const appArg = (typeof flags.app === 'string' ? flags.app : undefined) || (typeof positional[0] === 'string' ? positional[0] : undefined);
-  const outArg = typeof flags.out === 'string' ? flags.out : (typeof flags.output === 'string' ? flags.output : undefined);
-  const allowLossyDownload = flags['allow-lossy-download'] === true;
-  if (!env || !appArg || flags.app === true || flags.out === true || flags.output === true) {
-    process.stderr.write('Usage: node download-model-app.js --env <url> --app <appId|uniqueName|displayName> --out <dir> [--allow-lossy-download]\n');
-    process.exit(1);
-  }
-  const outDir = path.resolve(outArg || '.');
-  fs.mkdirSync(outDir, { recursive: true });
-  const sdk = makeProvision(env, path.join(outDir, '.maker-workspace'));
-  const resolved = await resolveAppId(sdk, appArg);
-  if (resolved.error) { emitResult(false, { ok: false, error: resolved.error }); return; }
-  const appId = resolved.appId;
-  // Narrate a display-name match so the operator learns the app's stable identity: the unique name
-  // is what every later build/teardown must be given, and it survives a rename of the display name.
-  if (resolved.matchedBy === 'displayName') {
-    process.stderr.write(`(resolved display name '${appArg}' to app unique name '${resolved.uniqueName}' — prefer the unique name, it is immutable)\n`);
-  }
-
-  // Resolve the app's unique name early — needed for fetchSitemap (MEMBERSHIP) + manifest lookup.
-  const appRows = await sdk.queryRecords('appmodule', { select: ['uniquename'], filter: `appmoduleid eq ${appId}`, top: 1 });
-  const appUnique = appRows && appRows[0] && appRows[0].uniquename;
-  const genpageCli = makeGenpageCli(env);
-
-  const result = await runDownload({ sdk, genpageCli, outDir, appId, appUnique, allowLossy: allowLossyDownload });
-  if (!result.ok) { emitResult(false, result); return; }
-
-  const { spec, pages, entities, webResources, droppedSubareas, droppedSubareaDetails, dashboardReconstructionError } = result;
-  if (droppedSubareas > 0 || dashboardReconstructionError) {
-    const droppedList = (droppedSubareaDetails || [])
-      .map((d) => `${d.type}${d.id ? `:${d.id}` : ''}${d.title ? ` (${d.title})` : ''}`)
-      .join(', ');
-    const dashboardMessage = dashboardReconstructionError ? ` Dashboard reconstruction failed: ${dashboardReconstructionError}.` : '';
-    const message = `${droppedSubareas} sitemap subarea(s) could not be round-tripped${droppedList ? `: ${droppedList}` : ''}.${dashboardMessage} A rebuild from this spec will DROP them from the app nav.`;
-    if (!allowLossyDownload) {
-      process.stderr.write(`ERROR: ${message}\nPass --allow-lossy-download to write the partial spec anyway.\n`);
-      emitResult(false, { ok: false, error: message, droppedSubareas, droppedSubareaDetails, dashboardReconstructionError });
-      return;
-    }
-    process.stderr.write(`WARNING: ${message}\n`);
-  }
-  const validation = validateAppSpec(spec, { profile: 'plan' });
-  if (!validation.ok) {
-    emitResult(false, { ok: false, error: 'downloaded App Spec failed validation', errors: validation.errors });
+async function main(deps = {}) {
+  const argv = deps.argv || process.argv.slice(2);
+  // Test seam: every side effect of main() — the process streams and exit, the result printer, the
+  // auth probe, and the helpers that reach Dataverse — can be replaced. Each call still names the
+  // real function (`io.emitResult(...)`), so a reader, and the source-level contract tests, see which runs.
+  const io = {
+    stderr: deps.stderr || process.stderr,
+    exit: deps.exit || process.exit,
+    emitResult: deps.emitResult || emitResult,
+    preflightAuth: deps.preflightAuth || preflightAuth,
+    makeDownloadSdk: deps.makeDownloadSdk || makeDownloadSdk,
+    makeGenpageSdk: deps.makeGenpageSdk || makeGenpageSdk,
+    runDownload: deps.runDownload || runDownload,
+    validateAppSpec: deps.validateAppSpec || validateAppSpec,
+  };
+  const { positional, flags } = parseArgs(argv);
+  const USAGE = 'Usage: node download-model-app.js --env <url> --app <appId|uniqueName|displayName> --out <dir> [--allow-lossy-download] [--reset-page-keys] [--language-code <lcid>]';
+  // `--allow-lossy-download` and `--reset-page-keys` are real boolean switches, so they stay out of needValue; everything else
+  // feeds a URL, an app id, a path or an LCID and must not receive `true`.
+  const flagError = validateFlags(argv, {
+    known: ['env', 'app', 'out', 'output', 'allow-lossy-download', 'reset-page-keys', 'language-code', 'languageCode'],
+    needValue: ['env', 'app', 'out', 'output', 'language-code', 'languageCode'],
+  });
+  if (flagError) {
+    makeWritesBlocking(io.stderr);
+    io.stderr.write(`✗ ${flagError}\n${USAGE}\n`);
+    io.exit(1);
     return;
   }
-  const specPath = path.join(outDir, 'app-spec.json');
-  fs.writeFileSync(specPath, JSON.stringify(spec, null, 2));
-  emitResult(true, { ok: true, spec: specPath, pages: pages.length, entities: entities.length, webResources: webResources.length, droppedSubareas });
+  const env = flags.env;
+  const appArg = flags.app || positional[0];
+  const outArg = flags.out || flags.output;
+  const allowLossyDownload = flags['allow-lossy-download'] === true;
+  // Off unless it is given: it is a decision about every environment that holds a copy of the earlier spec (see the header), never a default.
+  const resetPageKeys = flags['reset-page-keys'] === true;
+  if (!env || !appArg) {
+    io.stderr.write(USAGE + '\n');
+    io.exit(1);
+    return;
+  }
+  // The language the navigation titles are read in, when the operator names one: read exactly as the build and verify read the flag. A value that is no LCID, or a pair that disagrees, is refused
+  // here, before anything is opened — titles read in a language the operator did not mean would be written into the spec as if they were the app's.
+  let languageFlag;
+  try {
+    languageFlag = readLanguageCodeFlag(flags);
+  } catch (e) {
+    makeWritesBlocking(io.stderr);
+    io.stderr.write(`✗ ${e.message}\n${USAGE}\n`);
+    io.exit(1);
+    return;
+  }
+  const outDir = path.resolve(outArg || '.');
+  // Before auth and before the SDK. A link at --out would make the spec and the pages land
+  // outside the directory that was named; a real directory is created if it is missing.
+  try {
+    assertSafeOutputDir(outDir, { create: true });
+  } catch (e) {
+    io.emitResult(false, { ok: false, error: (e && e.message) || String(e) });
+    return;
+  }
+  // The spec this download may overwrite, and the language it pins (readAuthoredLanguageCode): the other source of the language the titles are read in.
+  const specOnDisk = path.join(outDir, 'app-spec.json');
+  const pinnedLanguage = readAuthoredLanguageCode(specOnDisk);
+  // The flag outranks the pin, as it does for the build, but the spec this download writes keeps the pin (preserveAuthoredLanguageCode) and the flag is not written into it: titles read in the
+  // flag's language and a spec that pins another would be rebuilt in the pin's, which writes one language's text as the other's. So the two must agree.
+  if (languageFlag && pinnedLanguage && languageFlag !== pinnedLanguage) {
+    io.emitResult(false, {
+      ok: false,
+      code: 'navigation-language-conflict',
+      error: `--language-code ${languageFlag} names another language than the one the app-spec.json in ${outDir} pins ("languageCode": ${pinnedLanguage}): the titles would be read in one language and a rebuild `
+        + 'would write them in the other. Pass the same language, or change the pin. Nothing was written.',
+    });
+    return;
+  }
+  // AB#6686427 — prove the ambient Azure CLI identity can actually reach this org BEFORE any read.
+  // Every read below is best-effort by design (a tenant without a setting definition, or a caller
+  // without access to one artifact class, must still produce a usable spec), so an auth failure does
+  // not surface as an error here — it degrades to an EMPTY spec: no forms, no views, no columns, and
+  // guessed primary attributes, reported as a success. That is AB#6686423's symptom, and this is the
+  // gate that stops it being mistaken for a round-trip gap.
+  const auth = await io.preflightAuth(env, { identityOnSuccess: false });
+  if (!auth.ok && !auth.inconclusive) { io.emitResult(false, { ok: false, error: auth.error }); return; }
+  // An INCONCLUSIVE probe must not block: it goes through a client with a weaker retry policy than
+  // the one the download itself uses, so a transient 5xx here would otherwise fail a run that would
+  // have succeeded. Surface it and continue.
+  if (auth.inconclusive) io.stderr.write(`⚠ ${auth.error}\n`);
+  // Results are only RECORDED inside the guarded region and printed in `finally`, after the throwaway
+  // workspace is removed: the real printer ends the process (emitResult calls process.exit), so a
+  // cleanup placed after it never ran — every download used to leave its temp workspace behind.
+  let session;
+  let outcome = null;
+  const finish = (ok, payload) => { outcome = [ok, payload]; };
+  try {
+    session = await io.makeDownloadSdk(env, { ...deps, languageCode: languageFlag, authoredLanguageCode: pinnedLanguage });
+    // No language known — the flag, the spec on disk and the environment all gave none — means nothing has been read with a guess yet, and nothing is: the refusal is the result, before the app is
+    // resolved, and the spec and baseline on disk are as they were (navigationLanguageRefusal says how to go on).
+    if (typeof session.languageUnresolved === 'string') {
+      finish(false, { ok: false, code: 'navigation-language-unknown', error: navigationLanguageRefusal(session.languageUnresolved, specOnDisk) });
+      return;
+    }
+    const sdk = session.sdk;
+    const resolved = await resolveAppId(sdk, appArg);
+    if (resolved.error) { finish(false, { ok: false, error: resolved.error }); return; }
+    const appId = resolved.appId;
+    // Narrate a display-name match so the operator learns the app's stable identity: the unique name
+    // is what every later build/teardown must be given, and it survives a rename of the display name.
+    if (resolved.matchedBy === 'displayName') {
+      io.stderr.write(`(resolved display name '${appArg}' to app unique name '${resolved.uniqueName}' — prefer the unique name, it is immutable)\n`);
+    }
+
+    // Resolve the app's unique name early — needed for fetchSitemap (MEMBERSHIP) + manifest lookup.
+    const appRows = await sdk.queryRecords('appmodule', { select: ['uniquename'], filter: `appmoduleid eq ${appId}`, top: 1 });
+    const appUnique = appRows && appRows[0] && appRows[0].uniquename;
+    // The page backend reads through the download's own throwaway SDK, lent to it: nothing of its own to make or remove.
+    const genpage = io.makeGenpageSdk(env, { sdk });
+
+    const result = await io.runDownload({ sdk, genpage, outDir, appId, appUnique, allowLossy: allowLossyDownload, resetPageKeys, languageCode: session.languageCode });
+    // The run's last writes: these lines, then the result and the exit, with no turn of the event loop between them — made blocking (lib/output-redaction.js).
+    makeWritesBlocking(process.stdout, io.stderr);
+    if (!result.ok) { finish(false, result); return; }
+
+    const { spec, pages, entities, webResources, droppedSubareas, droppedSubareaDetails, dashboardReconstructionError, dashboardWarnings, notRoundTripped, solutionCandidates, navIdsLeft, pageBindings } = result;
+    if (droppedSubareas > 0 || dashboardReconstructionError) {
+      const droppedList = (droppedSubareaDetails || [])
+        .map((d) => `${d.type}${d.id ? `:${d.id}` : ''}${d.title ? ` (${d.title})` : ''}`)
+        .join(', ');
+      const dashboardMessage = dashboardReconstructionError ? ` Dashboard reconstruction failed: ${dashboardReconstructionError}.` : '';
+      // Per-dashboard reasons, when there are any. Naming the subarea without saying WHY it dropped
+      // sends the reader looking at their sitemap when the cause is an unreadable artifact.
+      const causeMessage = (dashboardWarnings && dashboardWarnings.length)
+        ? ` Cause: ${dashboardWarnings.join('; ')}.`
+        : '';
+      const message = `${droppedSubareas} sitemap subarea(s) could not be round-tripped${droppedList ? `: ${droppedList}` : ''}.${dashboardMessage}${causeMessage} A rebuild from this spec will DROP them from the app nav.`;
+      if (!allowLossyDownload) {
+        io.stderr.write(`ERROR: ${message}\nPass --allow-lossy-download to write the partial spec anyway.\n`);
+        finish(false, { ok: false, error: message, droppedSubareas, droppedSubareaDetails, dashboardReconstructionError, ...(dashboardWarnings && dashboardWarnings.length ? { dashboardWarnings } : {}) });
+        return;
+      }
+      io.stderr.write(`WARNING: ${message}\n`);
+    }
+    // `reconstructed: true` — this spec was rebuilt from a DEPLOYED app, not authored. Authoring-only
+    // rules become warnings, because refusing to write a description of an app that already exists
+    // leaves the author with no artifact at all (see the pageInput producer rule).
+    const specPath = path.join(outDir, 'app-spec.json');
+    // Preserve the author's higher capability floor BEFORE validation, never after the version gate.
+    preserveAuthoredLanguageCode(spec, specPath);
+    const validation = io.validateAppSpec(spec, { profile: 'plan', reconstructed: true });
+    if (!validation.ok) {
+      finish(false, { ok: false, error: 'downloaded App Spec failed validation', errors: validation.errors });
+      return;
+    }
+    for (const w of validation.warnings || []) io.stderr.write(`WARNING: ${w}\n`);
+    // A defaulted `directEntry` must not be silent. hydrateSpec injects a conservative `emptyState` for
+    // pages that predate the field (otherwise this download would have hard-failed above and written no
+    // spec at all), but the author has to know a behaviour was chosen for them so they can change it.
+    const defaulted = spec.directEntryDefaulted || [];
+    if (defaulted.length) {
+      io.stderr.write(
+        `WARNING: ${defaulted.length} page(s) declare pageInput but predate directEntry — defaulted to `
+        + `{ "behavior": "emptyState" }: ${defaulted.join(', ')}.\n`
+        + '  Review each: change to "selector" if opening the page from the navigation should show a record picker.\n'
+      );
+    }
+    writeFileSafe(specPath, JSON.stringify(spec, null, 2));
+    // AB#6726727: the spec just written is this app's server-current edit snapshot, so it is the baseline a later build
+    // lines the live sitemap up against — a nav change made in the designer after this download is then
+    // kept, not reverted by the now-stale spec. Its dashboard and page ids were read from this
+    // environment, so they are recorded as its deployed ids. Best-effort: a spec with no baseline still
+    // builds, and the build then reports each nav change it makes.
+    try {
+      // Best-effort, like the baseline write itself: a missing snapshot does not fail the
+      // download. A link at .maker-workspace must still be named, not followed.
+      const baselineDir = path.join(outDir, '.maker-workspace');
+      assertSafeOutputDir(baselineDir, { create: true });
+      writeBaseline(baselineDir, spec, { appDir: outDir, environment: dataverseOrigin(env), appUniqueName: appUnique, fromSpec: true });
+    } catch (e) {
+      if (e && e.code === 'UNSAFE_OUTPUT') io.stderr.write(`WARNING: ${e.message}\n`);
+    }
+    // Each optional field is in the result only when it has something to say. `navIdsLeft` is absent in the usual case (runDownload leaves it out when no id is
+    // left) and could be an empty list from another producer, so it is checked for both: an empty list is no finding.
+    finish(true, { ok: true, spec: specPath, pages: pages.length, entities: entities.length, webResources: webResources.length, droppedSubareas, ...(notRoundTripped ? { notRoundTripped } : {}), ...(defaulted.length ? { directEntryDefaulted: defaulted } : {}), ...(navIdsLeft && navIdsLeft.length ? { navIdsLeft } : {}), ...(pageBindings ? { pageBindings } : {}), ...(solutionCandidates ? { solutionCandidates } : {}) });
+  } finally {
+    try { if (session) session.cleanup(); } catch { /* best-effort: the result below matters more */ }
+    if (outcome) io.emitResult(...outcome);
+  }
+}
+
+// The `languageCode` the spec already at `specPath` pins, or undefined when there is no such spec or it pins none (or a value that is no LCID). It is the value preserveAuthoredLanguageCode (below)
+// carries into the spec this download writes, read first because the SDK has to be built with it: it is the language a rebuild resolves before the environment's, so it is the one the
+// navigation titles are written in. Best-effort like that function: a missing, unreadable or malformed spec just pins nothing.
+function readAuthoredLanguageCode(specPath) {
+  try {
+    if (!fs.existsSync(specPath)) return undefined;
+    const lcid = normalizeLanguageCode(JSON.parse(fs.readFileSync(specPath, 'utf8')).languageCode);
+    return lcid === null ? undefined : lcid;
+  } catch {
+    return undefined;
+  }
+}
+
+// Carry an AUTHOR-PINNED `languageCode` across a download, and only from the spec already on disk.
+//
+// Download deliberately does not read `languageCode` from Dataverse. An LCID copied out of the source
+// org would be re-applied verbatim when the spec is rebuilt somewhere else, which is exactly how a
+// spec starts failing in an org that has not provisioned that language (#447) — leaving it absent lets
+// every target org resolve its own base language, which is the right default.
+//
+// But silently dropping a value the author WROTE is its own bug, and a quiet one: the next build
+// resolves the org default, so newly created columns get one language while the ones from the pinned
+// build keep another. A mixed-language app, no error anywhere. So the value is restored from the
+// previous spec at this path — the author's own file — and never synthesized from the environment.
+//
+// Best-effort by design: a missing, unreadable or malformed previous spec just means there is nothing
+// to preserve. Failing the download over it would be worse than the wart this fixes. Only a value that
+// would itself pass validation is restored — carrying a broken one forward would fail the next build
+// for a reason the operator did not cause on this run.
+// Exported for tests.
+function preserveAuthoredLanguageCode(spec, specPath, deps = {}) {
+  const readFileSync = deps.readFileSync || fs.readFileSync;
+  const existsSync = deps.existsSync || fs.existsSync;
+  if (!spec) return spec;
+  const membership = spec.app && (spec.app.tables !== undefined || spec.app.mainForms !== undefined);
+  if (spec.languageCode !== undefined && !membership) return spec;
+  try {
+    if (!existsSync(specPath)) return spec;
+    const prior = JSON.parse(readFileSync(specPath, 'utf8'));
+    // Assign the NORMALIZED value, not the raw one. `"1031"` and `" 1031 "` both validate, but a
+    // downloaded spec is a generated artifact and should be canonical — writing the author's
+    // whitespace or string form back out makes the file's diff noisy and its type inconsistent with
+    // every other numeric field the download emits.
+    const lcid = prior ? normalizeLanguageCode(prior.languageCode) : null;
+    if (spec.languageCode === undefined && lcid !== null) spec.languageCode = lcid;
+    // Retain the established API name, but read both authored options once. A lower generated floor
+    // must not weaken a newer capability requirement the author already wrote.
+    if (membership) setAppMembershipFloor(spec, prior && prior.minimumPluginVersion);
+  } catch (error) {
+    if (membership && error.code !== 'ENOENT') {
+      const warn = deps.warn || ((message) => process.stderr.write(`WARNING: ${message}\n`));
+      warn(`previous app-spec.json options could not be read (${(error && error.message) || error}); a higher authored minimumPluginVersion could not be preserved`);
+    }
+  }
+  return spec;
 }
 
 if (require.main === module) {
   main().catch((err) => emitResult(false, err));
 }
 
-module.exports = { resolveAppId, collectSitemap, appComponentEntities, parseDownloadedPages, assignPageKeys, missingDownloads, entityFromMetadata, iconWebResources, readDashboards, droppedSubareaCount, recoverAppSolution, runDownload };
+module.exports = { untypedColumnNames, untypedColumnWarnings, collectGlobalChoices, finalizeGlobalChoices, roundTrippedAware, isRoleRestrictedFormXml, notRoundTrippedSummary, notRoundTrippedWarning, relationshipsSkippedWarning, labelFromDataverse, columnDisplayName, resolveAppId, collectSitemap, appComponentEntities, parseDownloadedPages, pageBindingsReport, pageBindingsNote, readPreviousPageKeys, assignPageKeys, missingDownloads, entityFromMetadata, readEntityWithDescriptions, readDescriptionInventory, readAppShellSettings, iconWebResources, readDashboards, readRelationships, droppedSubareaCount, recoverAppSolution, runDownload, preserveAuthoredLanguageCode, makeDownloadSdk, compareText, main };

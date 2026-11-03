@@ -7,7 +7,13 @@ telemetry for this plugin. Default to `status` when no argument is given.
 
 1. Read the action from `$ARGUMENTS`. It must be one of `on`, `off`, or `status`.
    If it is empty or anything else, use `status`.
-2. Run the synced CLI (it auto-detects the plugin from the plugin manifest):
+2. For Power Pages, run its plugin-specific CLI:
+
+   ```bash
+   node "${PLUGIN_ROOT}/scripts/telemetry-config.js" --action <action>
+   ```
+
+   For other plugins, run the synced CLI (it auto-detects the plugin from the plugin manifest):
 
    ```bash
    node "${PLUGIN_ROOT}/scripts/lib/telemetry/lib/telemetry-config.js" --action <action>
@@ -24,10 +30,28 @@ telemetry for this plugin. Default to `status` when no argument is given.
   and correlation IDs, and Dataverse organization and Entra tenant GUIDs when PAC
   is signed in.
   Power Pages can also include the signed-in user's Entra object ID as
-  `eventInfo.aadObjectId` when PAC exposes it; Model Apps excludes it.
+  `eventInfo.aadObjectId` when PAC exposes it, and the SPA framework of the
+  Power Pages code site being worked in (`react`, `vue`, `angular`, or `astro`)
+  as `eventInfo.framework`. The framework name describes the scaffold only —
+  it is never a site name or path. Model Apps excludes both.
   When plugin telemetry is enabled, the local diagnostic mirror retains the same
   event fields even when transmission is off.
   A plugin whose committed telemetry config has `disabled: true` writes no mirror.
+- Power Pages non-SPA creation records `template_used` and
+  `non_spa_creation_success`/`non_spa_creation_failure` using one creation
+  `correlationId`, public catalog `eventInfo.templateId`, `eventInfo.templateKind`
+  (`non-spa`), optional already-known `eventInfo.audience` (`internal`/`external`),
+  and a fixed failure category. Success is a validated, committed downloaded baseline,
+  before optional customization. Private correlation receipts under the config
+  directory's `telemetry/power-pages/non-spa-creations/` retain selected catalog
+  revision/common context and outcome markers even when transmission is off.
+  Old receipts are pruned best-effort after 14 days on a later selection; hard-off
+  writes none. No additional question, catalog fetch, or per-poll event is needed.
+- Model Apps app builds (`--apply`) and page uploads record `skill_completed`
+  when they finish: the outcome, duration, a fixed error class and per-phase
+  step counts (or whether a page was created, updated or unchanged), with the
+  organization and tenant GUIDs of the environment they targeted. App, table,
+  page and environment names are never included.
 - Events do not include file paths, prompts, tool inputs, site names, Dataverse
   URLs, credentials, usernames, or hostnames.
 - **Automation/CI** can disable telemetry by setting the opt-out env var

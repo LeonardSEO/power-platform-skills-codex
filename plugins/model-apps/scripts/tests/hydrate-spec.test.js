@@ -41,10 +41,127 @@ function deployedRead() {
   };
 }
 
+// "Nobody could look" and "we looked and there are none" are different facts, and collapsing both to
+// `[]` meant the omit-the-key rule could not tell them apart. A reader that predates relationship
+// reconstruction (#567) must not have an absence asserted on its behalf; a reader that really read
+// zero relationships should record that.
+test('hydrateSpec keeps "no relationships reader" apart from "a read that found none" (#567)', async () => {
+  const noReader = await hydrateSpec(deployedRead());
+  assert.ok(!('relationships' in noReader), 'with no reader the key must be OMITTED, not asserted empty');
+
+  const readEmpty = await hydrateSpec({ ...deployedRead(), relationships: async () => [] });
+  assert.deepStrictEqual(readEmpty.relationships, [], 'a real read proving none is a fact worth recording');
+
+  const readSome = await hydrateSpec({
+    ...deployedRead(),
+    relationships: async () => [{ type: 'OneToMany', referenced: 'new_order', referencing: 'new_line', lookup: { schemaName: 'new_OrderId' } }],
+  });
+  assert.strictEqual(readSome.relationships.length, 1);
+});
+
 test('hydrateSpec reconstructs a valid, complete spec (entities + appShell + pages)', async () => {
   const spec = await hydrateSpec(deployedRead());
   const r = validateAppSpec(spec);
   assert.strictEqual(r.ok, true, JSON.stringify(r.errors));
+});
+
+// A download writes no form (hydrate-spec.js says why `forms` stays empty), so it cannot write a
+// `fieldOptions` key the spec gate refuses. The forms of a downloaded spec are the author's: one that
+// uses every per-field option must pass the build's gate after the file round trip, and a misspelled
+// option must not.
+test('a downloaded spec writes no field option, and a form the author adds with every option still passes the build gate', async () => {
+  const spec = JSON.parse(JSON.stringify(await hydrateSpec(deployedRead())));
+  assert.deepStrictEqual(spec.forms, [], 'a download writes no form, so no fieldOptions');
+  spec.entities[0].columns.push({ schemaName: 'new_due', displayName: 'Due', type: 'DateTime' });
+  spec.forms.push({ entity: 'new_order', name: 'Order', fieldOptions: {
+    new_name: { readOnly: true },
+    new_status: { hidden: true, colspan: 2, rowspan: 1 },
+    new_due: { after: 'new_name' },
+  } });
+  const r = validateAppSpec(spec);
+  assert.strictEqual(r.ok, true, JSON.stringify(r.errors));
+
+  spec.forms[0].fieldOptions.new_due = { aftr: 'new_name' };
+  assert.deepStrictEqual(validateAppSpec(spec).errors, [
+    "form 'Order' (table new_order): unknown key 'aftr' on fieldOptions['new_due'] — did you mean 'after'? (allowed: readOnly, hidden, after, colspan, rowspan)",
+  ]);
+});
+
+test('hydrateSpec unwraps Dataverse Label descriptions and omits absent descriptions', async () => {
+  const spec = await hydrateSpec({
+    app: async () => ({ name: 'A', description: null, siteMap: { areas: [] } }),
+    pages: async () => [],
+    entities: async () => [{
+      schemaName: 'new_order',
+      displayName: 'Order',
+      description: {
+        LocalizedLabels: [{ Label: 'fallback table text', LanguageCode: 1033 }],
+        UserLocalizedLabel: null,
+      },
+      primaryAttribute: { schemaName: 'new_name', displayName: 'Name' },
+      columns: [
+        {
+          schemaName: 'new_score',
+          displayName: 'Score',
+          type: 'Integer',
+          description: {
+            LocalizedLabels: [{ Label: 'fallback column text', LanguageCode: 1033 }],
+          },
+        },
+        { schemaName: 'new_notes', displayName: 'Notes', type: 'Memo', description: null },
+      ],
+    }],
+    webResources: async () => [],
+    dashboards: async () => [
+      { id: 'd-1', name: 'Ops', description: 'Daily operating view.', tiles: [{ type: 'iframe', name: 'Portal', url: 'https://contoso.example' }] },
+      { id: 'd-2', name: 'Empty Desc', description: null, tiles: [{ type: 'iframe', name: 'Portal', url: 'https://contoso.example' }] },
+    ],
+    solution: async () => ({
+      uniqueName: 'S',
+      publisherPrefix: 'new',
+      description: {
+        UserLocalizedLabel: { Label: 'solution label wins', LanguageCode: 1033 },
+        LocalizedLabels: [{ Label: 'fallback solution text', LanguageCode: 1033 }],
+      },
+    }),
+  });
+
+  assert.strictEqual(spec.solution.description, 'solution label wins');
+  assert.strictEqual(spec.entities[0].description, 'fallback table text');
+  assert.strictEqual(spec.entities[0].columns[0].description, 'fallback column text');
+  assert.strictEqual('description' in spec.entities[0].columns[1], false, 'null column descriptions must be omitted, not blanked');
+  assert.strictEqual(spec.dashboards[0].description, 'Daily operating view.');
+  assert.strictEqual('description' in spec.dashboards[1], false, 'null dashboard descriptions must be omitted, not blanked');
+
+  const v = validateAppSpec(spec, { profile: 'plan', reconstructed: true });
+  assert.strictEqual(v.ok, true, JSON.stringify(v.errors));
+});
+
+test('hydrateSpec carries description inventory for artifacts it does not structurally round-trip', async () => {
+  const spec = await hydrateSpec({
+    app: async () => ({ name: 'A', description: '', siteMap: { areas: [] } }),
+    pages: async () => [],
+    entities: async () => [{ schemaName: 'new_order', displayName: 'Order', primaryAttribute: { schemaName: 'new_name', displayName: 'Name' }, columns: [] }],
+    webResources: async () => [],
+    dashboards: async () => [],
+    solution: async () => ({ uniqueName: 'S', publisherPrefix: 'new' }),
+    descriptionInventory: async () => ({
+      views: [{ id: 'v-1', name: 'Active Orders', entity: 'new_order', description: 'Work queue.' }],
+      charts: [{ id: 'c-1', name: 'Orders by Status', entity: 'new_order', description: null }],
+      forms: [{ id: 'f-1', name: 'Main', entity: 'new_order', description: { UserLocalizedLabel: { Label: 'Main form context.', LanguageCode: 1033 } } }],
+      businessRules: [{ id: 'br-1', name: 'Lock Closed', entity: 'new_order', description: 'Closed orders are read-only.' }],
+      globalChoices: [{ name: 'new_priority', description: { LocalizedLabels: [{ Label: 'Shared priority choices.', LanguageCode: 1033 }] } }],
+    }),
+  });
+
+  assert.deepStrictEqual(spec.descriptionInventory.views[0], { id: 'v-1', name: 'Active Orders', entity: 'new_order', description: 'Work queue.' });
+  assert.strictEqual('description' in spec.descriptionInventory.charts[0], false, 'null chart descriptions must be omitted, not blanked');
+  assert.strictEqual(spec.descriptionInventory.forms[0].description, 'Main form context.');
+  assert.strictEqual(spec.descriptionInventory.businessRules[0].description, 'Closed orders are read-only.');
+  assert.strictEqual(spec.descriptionInventory.globalChoices[0].description, 'Shared priority choices.');
+
+  const v = validateAppSpec(spec, { profile: 'plan', reconstructed: true });
+  assert.strictEqual(v.ok, true, JSON.stringify(v.errors));
 });
 
 test('hydrateSpec maps a GenPage subarea back to a page target by name (case-insensitive id match)', async () => {
@@ -66,7 +183,13 @@ test('hydrateSpec preserves entity + URL subareas and icons; omits a DashBoard w
 
 test('hydrateSpec round-trips a DashBoard subarea + dashboards[] (id-passthrough tiles) when a dashboards reader is present', async () => {
   const read = deployedRead();
-  read.dashboards = async () => [{ id: 'D-1', name: 'Ops Overview', tiles: [
+  // The sitemap stores the id braced and upper-cased, and the dashboards reader hands it back as read
+  // (lower-cased, braces kept); the pin is written bare and lower-case.
+  const DASH = '280948EC-7BBB-5279-B106-2BDD09451A3A';
+  const app = await read.app();
+  app.siteMap.areas[0].groups[0].subAreas.find((s) => s.type === 'DashBoard').dashboardId = `{${DASH}}`;
+  read.app = async () => app;
+  read.dashboards = async () => [{ id: `{${DASH}}`.toLowerCase(), name: 'Ops Overview', tiles: [
     { type: 'chart', name: 'Orders by Status', entity: 'new_order', viewId: 'v1', visualizationId: 'c1' },
     { type: 'list', name: 'Active Orders', entity: 'new_order', viewId: 'v1' },
   ] }];
@@ -77,6 +200,9 @@ test('hydrateSpec round-trips a DashBoard subarea + dashboards[] (id-passthrough
   // dashboards[] reconstructed with the id-passthrough tiles
   assert.strictEqual(spec.dashboards.length, 1);
   assert.strictEqual(spec.dashboards[0].name, 'Ops Overview');
+  // AB#6726727: pinned to the dashboard it was read from, so a rename in the designer cannot turn a
+  // rebuild into a second, stale-named dashboard.
+  assert.strictEqual(spec.dashboards[0].dashboardId, DASH.toLowerCase());
   assert.deepStrictEqual(spec.dashboards[0].tiles[0], { type: 'chart', name: 'Orders by Status', entity: 'new_order', viewId: 'v1', visualizationId: 'c1' });
   // and the whole spec still validates (id-based tiles need no declared views[]/charts[])
   const r = validateAppSpec(spec);
@@ -89,7 +215,7 @@ test('hydrateSpec carries every deployed page into pages[] (incl. Maker-authored
   assert.deepStrictEqual(spec.pages[0], { name: 'Overview', dataSources: ['new_order'], prompt: 'kpis', codeFile: 'pages/Overview.tsx' });
 });
 
-// ── Task 11: v2 shape emission + legacy back-compat ───────────────────────────
+// ── v2 shape emission + legacy back-compat ───────────────────────────
 test('hydrateSpec emits the v2 shape when pages carry keys (schemaVersion 2, source.kind tsx, design, key subareas)', async () => {
   const read = {
     app: async () => ({ name: 'A', description: '', siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [{ type: 'GenPage', genPageId: 'gp-o', title: 'Overview' }] }] }] } }),
@@ -106,6 +232,26 @@ test('hydrateSpec emits the v2 shape when pages carry keys (schemaVersion 2, sou
   assert.strictEqual(spec.appShell.areas[0].groups[0].subAreas[0].page, 'overview', 'GenPage subarea resolved by KEY');
 });
 
+// A page's model rides the spec from download to rebuild, in either page shape; a page without one gets no key.
+test('hydrateSpec carries each page\'s model, in the v2 and the legacy shape', async () => {
+  const siteMap = { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [
+    { type: 'GenPage', genPageId: 'gp-o', title: 'Overview' }, { type: 'GenPage', genPageId: 'gp-d', title: 'Detail' }] }] }] };
+  const base = { app: async () => ({ name: 'A', description: '', siteMap }), entities: async () => [], webResources: async () => [],
+    solution: async () => ({ uniqueName: 'S', publisherPrefix: 'new' }) };
+  const v2 = await hydrateSpec({ ...base, pages: async () => [
+    { pageId: 'gp-o', key: 'overview', name: 'Overview', model: 'gpt-4.1', dataSources: [], codeFile: 'overview.tsx' },
+    { pageId: 'gp-d', key: 'detail', name: 'Detail', dataSources: [], codeFile: 'detail.tsx' }] });
+  assert.strictEqual(v2.schemaVersion, 2);
+  assert.deepStrictEqual(v2.pages.map((p) => [p.key, p.model]), [['overview', 'gpt-4.1'], ['detail', undefined]]);
+  assert.ok(!('model' in v2.pages[1]));
+  const legacy = await hydrateSpec({ ...base, pages: async () => [
+    { pageId: 'gp-o', name: 'Overview', model: 'gpt-4.1', dataSources: [], codeFile: 'overview.tsx' },
+    { pageId: 'gp-d', name: 'Detail', dataSources: [], codeFile: 'detail.tsx' }] });
+  assert.strictEqual(legacy.schemaVersion, undefined);
+  assert.deepStrictEqual(legacy.pages.map((p) => [p.name, p.model]), [['Overview', 'gpt-4.1'], ['Detail', undefined]]);
+  assert.ok(!('model' in legacy.pages[1]));
+});
+
 test('hydrateSpec keeps the legacy name-based shape when pages carry no key (back-compat)', async () => {
   const read = {
     app: async () => ({ name: 'A', description: '', siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [{ type: 'GenPage', genPageId: 'gp-o', title: 'Overview' }] }] }] } }),
@@ -118,8 +264,8 @@ test('hydrateSpec keeps the legacy name-based shape when pages carry no key (bac
   assert.strictEqual(spec.appShell.areas[0].groups[0].subAreas[0].page, 'Overview', 'legacy GenPage subarea resolved by NAME');
 });
 
-// ── Task 6: pageId kept in the v2 edit-snapshot (C3) ─────────────────────────
-test('hydrateSpec emits pageId on v2 pages (edit-snapshot self-describes its ids, C3)', async () => {
+// ── pageId kept in the v2 edit-snapshot ─────────────────────────
+test('hydrateSpec emits pageId on v2 pages (edit-snapshot self-describes its ids)', async () => {
   const GP_O = '13ecbc57-a3a4-4132-b0a2-a6c6b12691e8';
   const read = {
     app: async () => ({ name: 'A', description: '', siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [{ type: 'GenPage', genPageId: GP_O, title: 'Overview' }] }] }] } }),
@@ -129,7 +275,7 @@ test('hydrateSpec emits pageId on v2 pages (edit-snapshot self-describes its ids
   const spec = await hydrateSpec(read);
   assert.strictEqual(spec.schemaVersion, 2, 'v2 shape (pages have keys)');
   assert.strictEqual(spec.pages[0].key, 'overview');
-  assert.strictEqual(spec.pages[0].pageId, GP_O, 'pageId carried through as C3 edit-snapshot marker');
+  assert.strictEqual(spec.pages[0].pageId, GP_O, 'pageId carried through as the edit-snapshot marker');
   // A legacy page (no key) must NOT get pageId even if one is present on the page object
   const spec2 = await hydrateSpec({
     app: async () => ({ name: 'A', description: '', siteMap: { areas: [] } }),
@@ -218,7 +364,7 @@ test('an UNDECLARED web-resource subarea still validates — it is a live/OOB re
     solution: { uniqueName: 'S', publisherPrefix: 'new' },
     app: { name: 'A' },
     entities: [{ schemaName: 'new_o', displayName: 'O', primaryAttribute: { schemaName: 'new_name', displayName: 'N' }, columns: [] }],
-    appShell: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [{ title: 'Home', url: '$webresource:new_homepage.html' }] }] }] },
+    appShell: { areas: [{ label: 'M', groups: [{ label: 'G', subAreas: [{ title: 'Home', url: '$webresource:new_homepage.html' }] }] }] },
   };
   const v = validateAppSpec(spec, { profile: 'plan' });
   assert.strictEqual(v.ok, true, 'validation errors: ' + JSON.stringify(v.errors));
@@ -254,4 +400,164 @@ test('validateAppSpec rejects a javascript: subarea url outright (#430 guard int
   const v = validateAppSpec(spec, { profile: 'plan' });
   assert.strictEqual(v.ok, false);
   assert.ok((v.errors || []).some((e) => /http\(s\) URL or a \$webresource/.test(e)), JSON.stringify(v.errors));
+});
+
+// UPGRADE PATH. An app deployed BEFORE `directEntry` existed has a page manifest carrying
+// `pageInput` and no `directEntry`. App Spec validation now requires the pair, and
+// `download-model-app.js` validates BEFORE it writes anything — so without a default here, the
+// download hard-fails and writes NO spec file at all. The author is left with nothing to edit and no
+// way back into the download → edit → rebuild loop.
+//
+// That is the same shape as #430 ("no spec file was written at all ... over a single unrelated nav
+// entry"), which this release fixes — so reintroducing it through the rule that closed a DIFFERENT
+// hole would be a straight regression for every app that already uses pageInput.
+function legacyPageInputRead() {
+  return {
+    app: async () => ({
+      name: 'A', description: '',
+      siteMap: { areas: [{ title: 'M', groups: [{ title: 'G', subAreas: [
+        { type: 'GenPage', genPageId: '11111111-1111-1111-1111-111111111111', title: 'Overview' },
+        { type: 'GenPage', genPageId: '22222222-2222-2222-2222-222222222222', title: 'Detail' },
+      ] }] }] },
+    }),
+    // Note: no `directEntry` on either page — this manifest predates the field.
+    pages: async () => [
+      { pageId: '11111111-1111-1111-1111-111111111111', name: 'Overview', key: 'overview', navigatesTo: [{ targetKey: 'detail', data: { orderId: 'string' } }], dataSources: [], codeFile: 'overview.tsx' },
+      { pageId: '22222222-2222-2222-2222-222222222222', name: 'Detail', key: 'detail', pageInput: { data: { orderId: 'string' } }, dataSources: [], codeFile: 'detail.tsx' },
+    ],
+    entities: async () => [{ schemaName: 'new_order', displayName: 'Order', primaryAttribute: { schemaName: 'new_name', displayName: 'Name' }, columns: [] }],
+    webResources: async () => [], solution: async () => ({ uniqueName: 'S', publisherPrefix: 'new' }),
+  };
+}
+
+test('a downloaded app that predates directEntry still produces a VALID spec (upgrade path)', async () => {
+  const spec = await hydrateSpec(legacyPageInputRead());
+  const v = validateAppSpec(spec, { profile: 'plan', reconstructed: true });
+  assert.strictEqual(v.ok, true,
+    'download validates before writing, so an invalid spec here means no file is written at all: '
+    + JSON.stringify(v.errors));
+
+  const detail = spec.pages.find((p) => p.key === 'detail');
+  assert.deepStrictEqual(Object.keys(detail.pageInput.data), ['orderId'], 'the input survives');
+  // `emptyState`, not `selector`: the already-deployed .tsx has no picker, so promising one would be
+  // a claim about code that does not exist.
+  assert.strictEqual(detail.directEntry.behavior, 'emptyState');
+  assert.match(detail.directEntry.note, /predates directEntry/i,
+    'the injected value says where it came from, so the author can review rather than discover it');
+});
+
+// The case the test above DODGES, and the one that matters more: a legacy page whose input has NO
+// producing `navigatesTo` edge at all -- it was supplied externally, or by the page's own .tsx.
+// Injecting `directEntry` does not help there, because the ORPHANED-INPUT rule fires instead and is
+// equally fatal, so download would still write no file. Reviewed and caught precisely because the
+// first test supplied a matching edge and never exercised this path.
+function legacyOrphanInputRead() {
+  const read = legacyPageInputRead();
+  return {
+    ...read,
+    // Same two pages, but Overview no longer navigates with `orderId`.
+    pages: async () => (await read.pages()).map((p) => (p.key === 'overview' ? { ...p, navigatesTo: [{ targetKey: 'detail' }] } : p)),
+  };
+}
+
+test('a legacy page whose pageInput has NO producer still downloads (authoring rule, not a deploy rule)', async () => {
+  const spec = await hydrateSpec(legacyOrphanInputRead());
+
+  // As an AUTHORED spec this is still an error -- the rule keeps its teeth for anything hand-written.
+  const authored = validateAppSpec(spec, { profile: 'plan' });
+  assert.strictEqual(authored.ok, false, 'authoring still rejects an input nothing produces');
+  assert.ok((authored.errors || []).some((e) => /no page navigates to it with that data/.test(e)),
+    JSON.stringify(authored.errors));
+
+  // As a RECONSTRUCTION of an app that already exists, it must be writable -- with the finding
+  // surfaced, not swallowed.
+  const reconstructed = validateAppSpec(spec, { profile: 'plan', reconstructed: true });
+  assert.strictEqual(reconstructed.ok, true,
+    'download must still emit a spec: ' + JSON.stringify(reconstructed.errors));
+  assert.ok((reconstructed.warnings || []).some((w) => /no page navigates to it with that data/.test(w)),
+    'the finding is reported as a warning, not dropped: ' + JSON.stringify(reconstructed.warnings));
+});
+
+test('reconstructed mode relaxes ONLY the producer rule, not real structural errors', async () => {
+  // A blanket "reconstructed means anything goes" would be worse than the bug it fixes.
+  const spec = await hydrateSpec(legacyOrphanInputRead());
+  spec.appShell.areas[0].groups[0].subAreas.push({ title: 'Bad', url: 'javascript:alert(1)' });
+  const v = validateAppSpec(spec, { profile: 'plan', reconstructed: true });
+  assert.strictEqual(v.ok, false, 'a javascript: url is still fatal under reconstruction');
+
+  const spec2 = await hydrateSpec(legacyOrphanInputRead());
+  spec2.pages.find((p) => p.key === 'detail').directEntry = { behavior: 'shrug' };
+  const v2 = validateAppSpec(spec2, { profile: 'plan', reconstructed: true });
+  assert.strictEqual(v2.ok, false, 'an illegal directEntry.behavior is still fatal under reconstruction');
+});
+
+test('the defaulted directEntry is reported, not silent', async () => {
+  const spec = await hydrateSpec(legacyPageInputRead());
+  // Non-enumerable, like the other download diagnostics: app-spec.json stays the user-facing
+  // contract and must not gain transient upgrade metadata.
+  assert.deepStrictEqual(spec.directEntryDefaulted, ['detail']);
+  assert.strictEqual(Object.keys(spec).includes('directEntryDefaulted'), false,
+    'diagnostics must not leak into the written spec');
+});
+
+test('directEntry is defaulted ONLY where it is missing and actually required', async () => {
+  // An author-supplied value is never overwritten.
+  const read = legacyPageInputRead();
+  const base = await read.pages();
+  read.pages = async () => base.map((p) => (p.key === 'detail' ? { ...p, directEntry: { behavior: 'selector' } } : p));
+  const kept = await hydrateSpec(read);
+  assert.strictEqual(kept.pages.find((p) => p.key === 'detail').directEntry.behavior, 'selector');
+  assert.deepStrictEqual(kept.directEntryDefaulted, [], 'nothing was defaulted, so nothing is reported');
+
+  // A page with NO pageInput does not need directEntry and must not acquire one — the spec stays
+  // minimal, and an unnecessary field would imply a decision the author never made.
+  const spec = await hydrateSpec(legacyPageInputRead());
+  assert.strictEqual(spec.pages.find((p) => p.key === 'overview').directEntry, undefined);
+
+  // An EMPTY pageInput.data declares no keys, so validation does not require directEntry either.
+  const emptyInput = legacyPageInputRead();
+  const pages = await emptyInput.pages();
+  emptyInput.pages = async () => pages.map((p) => (p.key === 'detail' ? { ...p, pageInput: { data: {} } } : p));
+  const spec2 = await hydrateSpec(emptyInput);
+  assert.strictEqual(spec2.pages.find((p) => p.key === 'detail').directEntry, undefined,
+    'the default tracks the validation condition exactly, not the mere presence of pageInput');
+});
+
+// #583: the routing description round-trips when the deployed app has one. When it has none the field
+// stays ABSENT — never `""` — because the build writes only a field the spec sets, so a download can
+// never plant an empty value that a rebuild would then use to blank a platform-written description.
+test('#583 hydrateSpec carries app.aiDescription only when the deployed app has one', async () => {
+  const read = deployedRead();
+  const app = await read.app();
+  const withRouting = { ...read, app: async () => ({ ...app, aiDescription: 'Route order work here.' }) };
+  assert.strictEqual((await hydrateSpec(withRouting)).app.aiDescription, 'Route order work here.');
+  assert.ok(!('aiDescription' in (await hydrateSpec(deployedRead())).app));
+  const blank = { ...read, app: async () => ({ ...app, aiDescription: '' }) };
+  assert.ok(!('aiDescription' in (await hydrateSpec(blank)).app), 'an empty value is omitted, not emitted as ""');
+  // Whitespace-only is non-empty to the SDK, which sets the key; emitting it would fail the whole
+  // download, because validation refuses a blank routing description.
+  for (const ws of [' ', '\n', ' \t\r\n ']) {
+    const white = { ...read, app: async () => ({ ...app, aiDescription: ws }) };
+    assert.ok(!('aiDescription' in (await hydrateSpec(white)).app), `whitespace-only ${JSON.stringify(ws)} is omitted`);
+  }
+});
+
+
+test('hydrateSpec preserves a downloaded prompt exactly, and includes an explicitly blank prompt', async () => {
+  const exact = '  Conversation with 1 prompts:\r\n1. Keep me exact.\r\n';
+  const base = {
+    app: async () => ({ name: 'A', description: '', siteMap: { areas: [] } }),
+    entities: async () => [], webResources: async () => [], solution: async () => ({ uniqueName: 'S', publisherPrefix: 'new' }),
+  };
+  const withExact = await hydrateSpec({ ...base, pages: async () => [{ name: 'P', prompt: exact, codeFile: 'p.tsx' }] });
+  assert.strictEqual(withExact.pages[0].prompt, exact);
+  const withEmpty = await hydrateSpec({ ...base, pages: async () => [{ name: 'P', prompt: '', codeFile: 'p.tsx' }] });
+  assert.strictEqual(withEmpty.pages[0].prompt, '', 'a present empty prompt is different from a missing prompt');
+  const missing = await hydrateSpec({ ...base, pages: async () => [{ name: 'P', codeFile: 'p.tsx' }] });
+  assert.ok(!('prompt' in missing.pages[0]), 'missing prompt.txt remains omitted');
+  // The keyed (schemaVersion 2) page shape is built by a separate branch; it must agree.
+  const keyed = await hydrateSpec({ ...base, pages: async () => [{ key: 'p', name: 'P', prompt: '', codeFile: 'p.tsx' }] });
+  assert.strictEqual(keyed.pages[0].prompt, '', 'a keyed page keeps a present empty prompt too');
+  const keyedExact = await hydrateSpec({ ...base, pages: async () => [{ key: 'p', name: 'P', prompt: exact, codeFile: 'p.tsx' }] });
+  assert.strictEqual(keyedExact.pages[0].prompt, exact);
 });

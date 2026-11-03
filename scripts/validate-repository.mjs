@@ -82,6 +82,15 @@ const inventory = readJson(inventoryPath);
 if (!inventory.plugins || typeof inventory.plugins !== "object") {
   fail("Plugin inventory must contain a plugins object");
 }
+const dataverseState = readJson(join(repositoryRoot, ".upstream", "dataverse-skills.json"));
+if (
+  dataverseState.repository !== "microsoft/Dataverse-skills" ||
+  !/^[0-9a-f]{40}$/.test(dataverseState.commit) ||
+  inventory.plugins.dataverse?.upstreamCommit !== dataverseState.commit ||
+  inventory.plugins.dataverse?.upstreamRepository !== dataverseState.repository
+) {
+  fail("Dataverse inventory and upstream synchronization state disagree");
+}
 const expectedSkills = new Map(
   Object.entries(inventory.plugins).map(([name, details]) => [
     name,
@@ -199,6 +208,9 @@ for (const [pluginName, expectedCount] of expectedSkills) {
   }
   if (!manifest.description || !manifest.author?.name || !manifest.interface) {
     fail(`Incomplete Codex manifest for ${pluginName}`);
+  }
+  if (manifest.version !== inventory.plugins[pluginName].codexVersion) {
+    fail(`Manifest and inventory version disagree for ${pluginName}`);
   }
   if (manifest.skills !== "./skills/") {
     fail(`Codex manifest for ${pluginName} must reference ./skills/`);

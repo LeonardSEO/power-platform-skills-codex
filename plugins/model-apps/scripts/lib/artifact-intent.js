@@ -11,24 +11,93 @@
 // the SDK's generic mutation surface without hardcoding form-model logic everywhere.
 
 const { entityByLogical } = require('./_graph.js');
-const { lookupColumnsFor } = require('./app-spec.js');
+const { lookupColumnsFor, generatedTabName, generatedSectionName, formColumnsOf, authoredSectionNames, authoredTabNames, FIELD_OPTION_KEYS } = require('./app-spec.js');
 const { SDK_COLUMN_TYPE } = require('./entity-provision.js');
+const { timelineCellIntent, timelineRowsIntent, wantsTimeline } = require('./form-timeline.js');
 
 // Arrange field cells into `columns` cells-per-row.
 // Mirrors rowsFromCells in sdk-build.js but lives here so this module is
 // self-contained — the build engine should call compileFormIntent, not rowsFromCells.
+
+// The width a cell occupies in a section of `columns` columns, clamped exactly as rowsFromCells
+// clamps it. Shared so the RECONCILE path (which appends a cell to an already-deployed section) packs
+// by the same rule the CREATE path uses. They used to disagree: `placeFieldInSection` appended every
+// added field as its own single-cell row and moved every relocated field onto the last row
+// regardless of width, so the same spec produced a different shape depending only on whether the
+// form already existed.
+function clampedCellSpan(cell, columns) {
+  const cols = Math.max(1, Math.min(4, columns || 1));
+  return Math.min(cols, Math.max(1, Number(cell && cell.colspan) || 1));
+}
+
+// True when `cell` still fits on the END of `row`. This is the exact complement of the
+// "start a new row" test in rowsFromCells (`used + span > cols && current.length`): an EMPTY row
+// always accepts the cell, because a span wider than the section is clamped to it rather than
+// overflowing into a row of its own. `reserved` lets the reconcile path apply the SAME packing rule
+// to rows under a row-spanning cell: those carried columns count as used capacity, so a visually empty
+// row fully reserved by a span above must not accept another cell.
+function cellFitsInRow(row, cell, columns, reserved = 0) {
+  const cols = Math.max(1, Math.min(4, columns || 1));
+  const own = ((row && row.cells) || []).reduce((n, c) => n + clampedCellSpan(c, cols), 0);
+  const used = own + Math.max(0, Number(reserved) || 0);
+  return used === 0 || used + clampedCellSpan(cell, cols) <= cols;
+}
+
 function rowsFromCells(cells, columns) {
   const cols = Math.max(1, Math.min(4, columns || 1));
   const rows = [];
-  for (let i = 0; i < cells.length; i += cols) {
-    rows.push({ cells: cells.slice(i, i + cols) });
+  // Pack by the WIDTH each cell occupies, not by cell count: a `colspan: 2` cell fills two of the
+  // section's columns, so counting cells would put 2 cells in a 2-column row whose first cell
+  // already spans it and push the second into an overflowing row. A span wider than the section is
+  // clamped, because Dataverse renders a cell that overruns its section unpredictably and the
+  // author's intent ("as wide as possible") is preserved by the clamp.
+  let current = [];
+  let used = 0;
+  for (const cell of cells) {
+    const declared = Math.max(1, Number(cell && cell.colspan) || 1);
+    const span = Math.min(cols, declared);
+    if (used + span > cols && current.length) {
+      rows.push({ cells: current });
+      current = [];
+      used = 0;
+    }
+    // The clamp has to reach the EMITTED cell, not just the row arithmetic. Packing a `colspan: 4`
+    // cell as width 2 while still serializing `colspan="4"` produces exactly the overrunning cell
+    // this clamp exists to prevent, and contradicts the documented behaviour.
+    //
+    // The clamped value is written EVEN WHEN IT IS 1. Dropping the attribute there looked harmless
+    // ("1 is the default"), but it recreates the omission-vs-value ambiguity one layer down:
+    // reconcile reads a missing span as "no opinion" and LEAVES AN EXISTING WIDE CELL ALONE.
+    // Live-reproduced — a deployed colspan-2 cell, re-declared as `colspan: 4` in a ONE-column
+    // section, stayed at 2 across two applies instead of shrinking to the clamped 1. The author did
+    // declare a span here; 1 is its effective value, not an absence.
+    let out = cell;
+    if (span !== declared) {
+      out = Object.assign({}, cell);
+      out.colspan = span;
+    }
+    current.push(out);
+    used += span;
   }
+  if (current.length) rows.push({ cells: current });
   return rows;
+}
+
+// Widths for a tab's FormColumns when the author did not set them explicitly.
+//
+// A single column is '100%' EXACTLY — that literal is what every previously generated form carries,
+// and changing it would make each rebuild look like a width edit. Remaining columns split evenly with
+// the first absorbing the rounding remainder, so three columns are 34/33/33 rather than 99% total.
+function equalColumnWidths(n) {
+  const count = Math.max(1, n || 1);
+  if (count === 1) return ['100%'];
+  const base = Math.floor(100 / count);
+  return Array.from({ length: count }, (_, i) => (i === 0 ? 100 - base * (count - 1) : base) + '%');
 }
 
 // Minimal push-ready bound-field cell.
 //
-// SDK T4 tenet: mutations express intent; the adapter applies defaults. The SDK
+// SDK tenet: mutations express intent; the adapter applies defaults. The SDK
 // adapter derives classId from the Dataverse attribute type and label from the
 // attribute's display name. Precomputing classId or label here would drift from the
 // adapter's metadata-derived values and mis-render on foreign or renamed attributes.
@@ -40,6 +109,13 @@ function rowsFromCells(cells, columns) {
 // supply an explicit label override (e.g. a renamed lookup whose display name in
 // Dataverse differs from what the App Spec wants to show). Do not pass it for ordinary
 // fields — the adapter handles them.
+//
+// opts.readOnly / opts.hidden are the two per-control attributes the SDK's FormXml serializer
+// actually reads (measured against the vendored bundle, not inferred from its types):
+//   <cell    id="…" showlabel="…" visible="${cell.visible}" colspan="…" rowspan="…">
+//   <control id="…" classid="…" datafieldname="…" disabled="${control.isReadOnly}" isrequired="…">
+// So visibility lives on the CELL and read-only lives on the CONTROL — they are not siblings, and
+// writing either to the wrong object is silently dropped at serialize time.
 function fieldCellIntent(logical, opts) {
   opts = opts || {};
   const control = { fieldName: String(logical).toLowerCase() };
@@ -48,7 +124,123 @@ function fieldCellIntent(logical, opts) {
   if (opts.isRequired) control.isRequired = true;
   // label override: rare; callers should normally let the adapter derive it from metadata.
   if (opts.label) control.label = opts.label;
-  return { control };
+  // Only the ENABLED state is ever written, never the disabled one. Emitting `isReadOnly: false`
+  // for every ordinary field would look harmless but is destructive on a rebuild: it would
+  // overwrite a lock a maker applied by hand in the designer, on a form the spec never claimed to
+  // own that attribute of. Omitting the key leaves the adapter's default (editable) in place.
+  if (opts.readOnly) control.isReadOnly = true;
+  const cell = { control };
+  // Same asymmetry, same reason: only `visible: false` is written. An explicit `true` would
+  // un-hide a control someone deliberately hid outside the spec.
+  if (opts.hidden) cell.visible = false;
+  // Spans are written when the author EXPRESSED one — including an explicit 1.
+  //
+  // The asymmetry that matters here is OMISSION vs VALUE, not 1 vs >1. Omitting a span means the
+  // spec has no opinion, and emitting the adapter default for every ordinary cell would overwrite a
+  // span a maker widened by hand on a form the spec never claimed to own that of — the same reason
+  // `isReadOnly: false` is never written. But an author who WRITES `colspan: 1` is claiming it.
+  //
+  // Collapsing those two cases made a reset unrepresentable: changing an authored span from 2 to 1
+  // compiled to "no colspan", reconcile read that as "no desired span", and the deployed cell stayed
+  // at 2 — live-reproduced across two applies. `undefined` is still omission; a number is intent.
+  // Both serialize to real `colspan`/`rowspan` attributes (verified against the vendored bundle).
+  if (typeof opts.colspan === 'number' && opts.colspan >= 1) cell.colspan = opts.colspan;
+  if (typeof opts.rowspan === 'number' && opts.rowspan >= 1) cell.rowspan = opts.rowspan;
+  return cell;
+}
+
+// Column types that have NO Unified Interface form control.
+//
+// A Big Integer column placed on a form renders the literal text "Error loading control" on every
+// record — UCI has no editor registered for the type, so the control host fails at bind time. The
+// column itself is perfectly valid and stays readable/writable through the API; it simply cannot be
+// shown. Auto layout therefore skips these types rather than producing a visibly broken form out of
+// the box (ADO 6651696). An EXPLICIT layout still honours the author — they may be targeting a
+// custom control — but validateAppSpec emits a warning so the choice is deliberate rather than accidental.
+const NON_FORM_RENDERABLE_TYPES = new Set(['BigInt']);
+
+// A span is `undefined` only when the author SAID NOTHING. An explicit 1 is preserved as 1: the
+// previous rule mapped every value <= 1 to undefined, which made "author asked for the default"
+// and "author said nothing" IDENTICAL — the opposite of what its comment claimed. The consequence
+// was live-reproduced: changing an authored colspan from 2 to 1 compiled to "no colspan",
+// reconcile read that as "no desired span", and the deployed cell stayed at 2 across two applies.
+function optSpan(v) {
+  if (v === undefined || v === null || v === '') return undefined; // said nothing
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : undefined; // an explicit 1 IS intent
+}
+
+// How each per-field option reaches the canonical entry, the same from both routes that declare one
+// (an inline `fields[]` entry and a form-level `fieldOptions` entry). The projection walks
+// FIELD_OPTION_KEYS (app-spec.js), the list validation accepts, so the two cannot drift apart: a key
+// added there without a projector here fails the first compile, and a key that is not there never
+// reaches a form, because the spec gate refuses it instead of this projection dropping it in silence.
+const FIELD_OPTION_PROJECTORS = {
+  readOnly: (v) => v === true,
+  hidden: (v) => v === true,
+  after: (v) => (v ? String(v).toLowerCase() : undefined),
+  colspan: optSpan,
+  rowspan: optSpan,
+};
+
+function projectFieldOptions(name, source) {
+  const entry = { name };
+  for (const key of FIELD_OPTION_KEYS) entry[key] = FIELD_OPTION_PROJECTORS[key](source[key]);
+  return entry;
+}
+
+// Normalize one entry of `tabs[].sections[].fields[]`.
+//
+// An entry is either a bare logical name (the original and still most common shape) or an object
+// carrying per-control options:
+//   "co_duedate"
+//   { "name": "co_ticketnumber",   "readOnly": true }
+//   { "name": "co_storypoints",    "hidden": true }
+//   { "name": "co_daysremaining",  "after": "co_duedate" }
+//   { "name": "co_description",    "colspan": 2 }
+// Returns a canonical { name, readOnly, hidden, after, colspan, rowspan } with `name`/`after`
+// lower-cased, because every downstream comparison (form field logicals, cell pointers, Dataverse
+// attribute logical names) is lower-case. Spans keep optSpan's omission-vs-value rule.
+function normalizeFieldEntry(entry) {
+  if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+    return projectFieldOptions(String(entry.name || '').toLowerCase(), entry);
+  }
+  return projectFieldOptions(String(entry || '').toLowerCase(), {});
+}
+
+// Form-level per-field control options, keyed by column logical name:
+//   "fieldOptions": { "co_ticketnumber": { "readOnly": true }, "co_daysremaining": { "after": "co_duedate" } }
+//
+// This is the ONLY way to reach these attributes under an AUTO layout, which has no field list to
+// hang an inline object off. Under an EXPLICIT layout both work and the inline entry wins, because
+// the more specific declaration should not be silently overridden by a form-wide default.
+function fieldOptionsMap(formSpec) {
+  const map = {};
+  const fo = formSpec && formSpec.fieldOptions;
+  if (!fo || typeof fo !== 'object' || Array.isArray(fo)) return map;
+  for (const key of Object.keys(fo)) {
+    const v = fo[key];
+    if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
+    map[String(key).toLowerCase()] = projectFieldOptions(String(key).toLowerCase(), v);
+  }
+  return map;
+}
+
+// Merge a form-level `fieldOptions` default with an inline field entry: the inline entry wins
+// wherever it says something. Exported so `--verify` expects the span the compiler was ASKED to
+// emit, whichever surface declared it — re-deriving the precedence there left `fieldOptions` spans
+// unverified entirely, so a span the build had to skip went unreported.
+function mergeFieldOptions(base, inline, logical) {
+  if (!base) return inline || { name: logical, readOnly: false, hidden: false, after: undefined };
+  if (!inline) return base;
+  return {
+    name: logical,
+    readOnly: inline.readOnly || base.readOnly,
+    hidden: inline.hidden || base.hidden,
+    after: inline.after !== undefined ? inline.after : base.after,
+    colspan: inline.colspan !== undefined ? inline.colspan : base.colspan,
+    rowspan: inline.rowspan !== undefined ? inline.rowspan : base.rowspan,
+  };
 }
 
 // Cell for the Notes/activity-timeline control.
@@ -58,20 +250,17 @@ function fieldCellIntent(logical, opts) {
 // the GUID lives in the SDK bundle's constants, not in the plugin. Hardcoding it would
 // break when the bundle is re-vendored with a changed GUID.
 // Shape proven by the SDK's form.workflow.test.ts.
+//
+// The cell is the platform's timeline cell — the fixed control id `notescontrol` in a tall cell with
+// `auto="false"` — not just a control in a one-row cell, which Dynamics publishes and never renders (#680).
+// The shape lives in form-timeline.js, shared with the build's repair of an older host and with verify.
 function notesCellIntent(notesClassId) {
-  return {
-    control: {
-      classId: String(notesClassId),
-      fieldName: null,
-      label: 'Notes',
-      showLabel: false,
-      parameters: {}
-    }
-  };
+  return timelineCellIntent(notesClassId);
 }
 
-// The whole Notes SectionIntent — a pre-built section holding only the timeline cell.
-// Appended to the first tab's single FormColumn when the form/entity opts in.
+// The whole Notes SectionIntent — a pre-built section holding the timeline cell and the empty rows that
+// cell spans (the timeline does not render without them). Appended to the first tab's single FormColumn
+// when the form/entity opts in.
 function notesSectionIntent(notesClassId) {
   return {
     name: 'section_notes',
@@ -79,11 +268,11 @@ function notesSectionIntent(notesClassId) {
     visible: true,
     showLabel: true,
     columns: 1,
-    rows: [{ cells: [notesCellIntent(notesClassId)] }]
+    rows: timelineRowsIntent(notesClassId)
   };
 }
 
-// #5 (2026-07-15 review): a full-width (1-column) SectionIntent that hosts ONLY a sub-grid control.
+// A full-width (1-column) SectionIntent that hosts ONLY a sub-grid control.
 // Each authored/auto sub-grid gets its own section so it SPANS the form, instead of being spliced as
 // a single cell into an existing 2-column field section (which rendered the grid half-width with an
 // empty column beside it). `label` is the grid's title — the engine passes the child's plural/display
@@ -166,6 +355,12 @@ function formEventsRegionIntent(events) {
       // 'attribute' is only present on onchange events; including it on onload/onsave would
       // produce invalid form XML (Dataverse only sets it when a field triggers the handler).
       if (ev.attribute) attrs.push(['attribute', ev.attribute]);
+      // FormXML attribute values are strings, so the booleans are rendered rather than passed
+      // through. `enabled` and `passExecutionContext` default to true because that is what an author
+      // wiring a handler almost always wants — and it is what the App Spec contract documents; these
+      // three were previously HARDCODED here and the authored values silently discarded, so
+      // `"enabled": false` produced a handler that ran anyway.
+      const flag = (v) => (v === false ? 'false' : 'true');
       return {
         n: 'event',
         a: attrs,
@@ -177,9 +372,11 @@ function formEventsRegionIntent(events) {
             a: [
               ['functionName', ev.function],
               ['libraryName', ev.library],
-              ['enabled', 'true'],
-              ['parameters', ''],
-              ['passExecutionContext', 'true']
+              ['enabled', flag(ev.enabled)],
+              // Dataverse expects a comma-separated argument list; an absent value is the empty
+              // string, NOT a missing attribute (the platform writes `parameters=""` itself).
+              ['parameters', ev.parameters === undefined || ev.parameters === null ? '' : String(ev.parameters)],
+              ['passExecutionContext', flag(ev.passExecutionContext)]
             ],
             c: []
           }]
@@ -199,6 +396,71 @@ function viewColumnsIntent(cols) {
       order: i
     };
   });
+}
+
+// Reorder a flat auto-layout cell list in place so each anchored field immediately follows its
+// anchor. `positions` is { <logical>: <anchorLogical> }.
+//
+// Runs to a FIXED POINT rather than a single pass. A single pass walks `positions` in key order —
+// which is entity-column order, not dependency order — so when a field's anchor is itself relocated
+// LATER in the same walk, the earlier placement is silently invalidated. Given `y after a` and
+// `x after y`, one pass can emit `[a][y][n][x]`: x is not after y, the create order violates its own
+// anchors, and the first rebuild then "fixes" it — precisely the create/rebuild divergence this
+// function exists to prevent.
+//
+// Bounded by the number of anchors: each pass either changes nothing (done) or applies at least one
+// move, and a contradictory spec (a cycle, or two fields claiming the same anchor) simply exhausts
+// the bound with a deterministic result rather than spinning. Both of those shapes are rejected at
+// author time, so the bound is a safety net, not the normal path.
+//
+// An anchor that is absent (or that resolves to the field itself) is skipped rather than treated as
+// an error — the anchor may name a column that is not on this form.
+function reorderCellsByAnchors(cells, positions) {
+  const keys = Object.keys(positions || {});
+  const indexOfField = function (logical) {
+    return cells.findIndex(function (c) {
+      return c.control && String(c.control.fieldName || '').toLowerCase() === logical;
+    });
+  };
+  for (let pass = 0; pass < keys.length; pass++) {
+    let moved = false;
+    for (const logical of keys) {
+      const anchor = positions[logical];
+      const from = indexOfField(logical);
+      const at = indexOfField(anchor);
+      if (from < 0 || at < 0 || from === at) continue;
+      if (from === at + 1) continue; // already immediately after its anchor
+      const [el] = cells.splice(from, 1);
+      // Recompute the anchor AFTER the removal: splicing out an earlier element shifts the anchor
+      // down by one, and inserting at the stale index would land the field one slot too far right.
+      cells.splice(indexOfField(anchor) + 1, 0, el);
+      moved = true;
+    }
+    if (!moved) break;
+  }
+  return cells;
+}
+
+// The grid width the compiler EMITS for an authored section. This is the ONE place that rule lives:
+// the compiler lays a section out with it, and `--verify` must judge the deployed form against the
+// same value. A second derivation in the verifier drifted — it read the raw `columns`, so a section
+// that omits it (the compiler's default is 1) or one on a QuickCreate form (capped at 1) was reported
+// as wrong even though it deployed exactly as compiled.
+//
+// This is the AUTHORED effective width, not the live one: the reconcile deliberately clamps against
+// the section it is writing into (`convergeCellSpans`), which on an existing form can differ.
+//
+// Quick Create AND Quick View forms must use single-column sections. Dataverse rejects a
+// multi-column section (columns="11"/"111") on either with
+//   HTTP 400 … systemforms: Columns in a section must be set to '1'. Found '11'.
+// — measured live on a Quick View whose auto layout had gone to two columns past six fields. The
+// cap used to cover Quick Create only, so a field-heavy Quick View failed the build mid-run.
+const SINGLE_COLUMN_FORM_TYPES = new Set(['QuickCreate', 'QuickView']);
+function maxSectionColumns(formType) {
+  return SINGLE_COLUMN_FORM_TYPES.has(formType) ? 1 : 4;
+}
+function sectionGridWidth(section, formType) {
+  return Math.min((section && section.columns) || 1, maxSectionColumns(formType));
 }
 
 // Compile an App Spec form entry into the SDK's canonical desired-state intent.
@@ -227,56 +489,102 @@ function compileFormIntent(spec, formSpec, opts) {
   const entity = entityByLogical(spec, entityLogical);
   const formType = formSpec.formType || 'Main';
 
-  // Quick Create forms must use single-column sections. Dataverse rejects multi-column
-  // (columns="11"/"111") quick-create sections with "Columns in a section must be set
-  // to '1'". This cap also blocks notes — quick-create forms don't host the timeline.
-  const maxCols = formType === 'QuickCreate' ? 1 : 4;
+  // The single-column cap for Quick Create and Quick View forms — the same rule `sectionGridWidth`
+  // applies to explicit sections; the auto layout below picks its own 1-or-2 within it. (Notes are
+  // gated separately below: only a Main form hosts the timeline.)
+  const maxCols = maxSectionColumns(formType);
   const explicit = Array.isArray(formSpec.tabs) || formSpec.layout === 'explicit';
 
   // Compute per-field required flag. isRequired is explicit authored intent (the primary
   // field and required===true columns are required regardless of Dataverse defaults).
   // classId and label are NOT computed here — the SDK adapter derives them from Dataverse
-  // attribute metadata (SDK T4). Computing them here would drift from adapter-derived values.
+  // attribute metadata. Computing them here would drift from adapter-derived values.
   const requiredFor = function (logical) {
     if (entity && logical === entity.primaryAttribute.schemaName.toLowerCase()) return true;
     const c = entity && (entity.columns || []).find(function (x) { return x.schemaName.toLowerCase() === logical; });
     return !!(c && c.required === true);
   };
 
+  // Per-field control options come from two places; the inline entry wins (see fieldOptionsMap).
+  const formOptions = fieldOptionsMap(formSpec);
+  // Ordering anchors are collected here rather than written onto the cells. A cell object is pushed
+  // verbatim to the SDK via addElement, and `after` is NOT part of the SDK's cell model — it would
+  // either be rejected by the structural validator or silently serialized into the FormXml. The
+  // engine-only `__`-prefixed keys on the returned def are never sent (createFormShell hand-picks
+  // the fields it passes to createArtifact), so that is where positioning intent belongs.
+  const positions = {};
+  // RAW authored spans, by logical name: { <logical>: { colspan?, rowspan? } }.
+  //
+  // The cells carry the span already CLAMPED to the section the compiler laid out, which is right
+  // for the create path. It is wrong for reconcile on an existing form: an AUTO layout compiles a
+  // synthetic one-column section, but reconcile deliberately KEEPS the deployed section's geometry —
+  // so applying the synthetic clamp narrowed a maker's four-column cell to 1. The raw value has to
+  // survive compilation for the reconcile to re-clamp against the section it actually writes into.
+  //
+  // Kept off the cells, like `positions`, because a cell is pushed verbatim to the SDK and this is
+  // not part of its model.
+  const rawSpans = {};
+  const recordRawSpan = function (opt) {
+    if (!opt || !opt.name) return;
+    const out = {};
+    if (typeof opt.colspan === 'number') out.colspan = opt.colspan;
+    if (typeof opt.rowspan === 'number') out.rowspan = opt.rowspan;
+    if (Object.keys(out).length) rawSpans[opt.name] = out;
+  };
+  const recordPosition = function (opt) {
+    if (opt && opt.after && opt.name && opt.after !== opt.name) positions[opt.name] = opt.after;
+  };
+  // Merge a form-level default with an inline override for one field — see mergeFieldOptions.
+  const optionsFor = function (logical, inline) {
+    return mergeFieldOptions(formOptions[logical], inline, logical);
+  };
+
   let tabs;
 
   if (explicit && Array.isArray(formSpec.tabs)) {
-    // Honor the authored layout verbatim. Wrap each tab's sections in a single FormColumn
-    // (the new topology requires it; old tabs had sections directly without a column layer).
+    // Honor the authored layout verbatim. A tab is one or more FormColumns: `tabs[].sections` is
+    // the single-full-width-column shorthand, `tabs[].columns[]` the explicit multi-column shape.
+    // Declaring both is rejected at the spec gate, so reading `columns` first cannot mask `sections`.
     tabs = formSpec.tabs.map(function (t, ti) {
+      const authoredColumns = formColumnsOf(t);
+      const defaultWidths = equalColumnWidths(authoredColumns.length);
       return {
-        name: t.name || ('tab_' + ti),
+        name: t.name || generatedTabName(ti),
         label: t.label || 'General',
-        expanded: true,
-        visible: true,
-        // Each tab is one FormColumn. width is set explicitly ('100%') for exact control; as of
-        // hardening-3 the SDK's normalizeColumn ALSO defaults a synthesized column's width to '100%'
-        // (a belt-and-suspenders safety net), but we keep setting it here so the value is never left to
-        // an implicit default and older bundles that don't default it still produce valid formxml
-        // (columnToRaw omits an undefined width, which makes Dataverse reject the push).
-        columns: [{
-          width: '100%',
-          sections: (t.sections || []).map(function (s, si) {
-            const cells = (s.fields || []).map(function (fl) {
-              const lg = String(fl).toLowerCase();
-              return fieldCellIntent(lg, { isRequired: requiredFor(lg) });
-            });
-            const secCols = Math.min(s.columns || 1, maxCols);
-            return {
-              name: s.name || ('section_' + ti + '_' + si),
-              label: s.label || 'Details',
-              visible: true,
-              showLabel: s.showLabel !== false,
-              columns: secCols,
-              rows: rowsFromCells(cells, secCols)
-            };
-          })
-        }]
+        // Only an explicit `false` collapses/hides a tab; anything else keeps the previous
+        // always-visible, always-expanded behavior, so existing specs compile unchanged.
+        expanded: t.expanded !== false,
+        visible: t.visible !== false,
+        columns: authoredColumns.map(function (c, ci) {
+          return {
+            // width is set explicitly for exact control; the SDK's normalizeColumn also defaults a
+            // synthesized column's width to '100%', but keeping it explicit works on every bundle
+            // (an undefined width is omitted by columnToRaw and Dataverse would reject it).
+            width: c.width || defaultWidths[ci],
+            sections: (c.sections || []).map(function (s, si) {
+              const cells = (s.fields || []).map(function (fl) {
+                const inline = normalizeFieldEntry(fl);
+                const opt = optionsFor(inline.name, inline);
+                recordPosition(opt);
+                recordRawSpan(opt);
+                return fieldCellIntent(inline.name, { isRequired: requiredFor(inline.name), readOnly: opt.readOnly, hidden: opt.hidden, colspan: opt.colspan, rowspan: opt.rowspan });
+              });
+              const secCols = sectionGridWidth(s, formType);
+              return {
+                // The generated fallback name is the form's identity for this section on a REBUILD
+                // (topology reconcile matches deployed sections by name). Shared with the spec gate
+                // via `generatedSectionName` so the two cannot disagree about what an unnamed
+                // section will be called — see that helper for why the ci segment is conditional.
+                name: s.name || generatedSectionName(ti, ci, si),
+                label: s.label || 'Details',
+                visible: s.visible !== false,
+                showLabel: s.showLabel !== false,
+                columns: secCols,
+                rows: rowsFromCells(cells, secCols)
+              };
+            })
+          };
+        })
       };
     });
   } else {
@@ -285,20 +593,36 @@ function compileFormIntent(spec, formSpec, opts) {
     // Falsy (undefined) means non-scalar (Lookup, Customer, …) — skip them; they
     // come from relationships[], not columns[], and are added via lookupColumnsFor.
     const cells = [];
+    const autoCell = function (logical, extra) {
+      const opt = optionsFor(logical, null);
+      recordPosition(opt);
+      recordRawSpan(opt);
+      return fieldCellIntent(logical, Object.assign({ readOnly: opt.readOnly, hidden: opt.hidden, colspan: opt.colspan, rowspan: opt.rowspan }, extra || {}));
+    };
     if (entity) {
-      cells.push(fieldCellIntent(entity.primaryAttribute.schemaName.toLowerCase(), { isRequired: true }));
+      cells.push(autoCell(entity.primaryAttribute.schemaName.toLowerCase(), { isRequired: true }));
       for (let i = 0; i < (entity.columns || []).length; i++) {
         const c = entity.columns[i];
         if (!SDK_COLUMN_TYPE[c.type || 'Text']) continue;
-        cells.push(fieldCellIntent(c.schemaName.toLowerCase(), { isRequired: c.required === true }));
+        // Skip types UCI cannot render. Auto layout is the DEFAULT, so including one of these
+        // would ship a form with a broken control to every author who never asked for the column
+        // to be on a form in the first place (ADO 6651696). The column is still created and still
+        // reachable through the API — only the form placement is withheld.
+        if (NON_FORM_RENDERABLE_TYPES.has(c.type)) continue;
+        cells.push(autoCell(c.schemaName.toLowerCase(), { isRequired: c.required === true }));
       }
       // Parent lookups live on relationships[], not columns[]. Surface them so the parent
       // link is visible on the form; otherwise a first build shows no way to set the parent.
       const lookups = lookupColumnsFor(spec, entityLogical);
       for (let i = 0; i < lookups.length; i++) {
-        cells.push(fieldCellIntent(lookups[i].logical, {}));
+        cells.push(autoCell(lookups[i].logical));
       }
     }
+    // Apply `after` anchors to the CREATE order as well, not just the reconcile. Auto layout has no
+    // authored order, so without this a fresh build would place the field by column order and the
+    // first rebuild would immediately move it — the same spec producing two different forms
+    // depending on whether the form already existed.
+    reorderCellsByAnchors(cells, positions);
     // 2-column when field-heavy (> 6 cells), else 1; always capped by maxCols.
     const columns = Math.min(cells.length > 6 ? 2 : 1, maxCols);
     tabs = [{
@@ -323,10 +647,28 @@ function compileFormIntent(spec, formSpec, opts) {
     }];
   }
 
+  // Every form-level anchor is recorded, not just those for fields THIS layout places. The reconcile
+  // resolves anchors against the DEPLOYED form, and positioning a control an explicit layout does not
+  // re-declare is precisely the `prune: false` case the anchor exists to serve — recording only
+  // placed fields made that documented (and validation-permitted) combination silently do nothing.
+  // Harmless for the compile-time reorder: it already ran above, and an unplaced field is simply not
+  // found in the cell list.
+  //
+  // Existing keys are NOT overwritten: the explicit-layout loop records the MERGED option (an inline
+  // entry beats the form-level default), and re-recording the raw form-level value here would invert
+  // that documented precedence. Only reachable via a spec validation already rejects, but the
+  // precedence rule should hold in the code that implements it, not only in the gate in front of it.
+  for (const key of Object.keys(formOptions)) {
+    if (!Object.prototype.hasOwnProperty.call(positions, key)) recordPosition(formOptions[key]);
+    // Same catch-all for spans: a form-level `fieldOptions` entry whose field was not placed
+    // inline still carries authored intent the reconcile may need.
+    if (!Object.prototype.hasOwnProperty.call(rawSpans, key)) recordRawSpan(formOptions[key]);
+  }
+
   // Notes section (opt-in: formSpec.notes or entity.hasNotes) — Main forms only.
   // Quick-create / quick-view forms don't host the activity timeline.
   // Appended to the first tab's single FormColumn so it renders below the field sections.
-  const wantNotes = formType === 'Main' && (formSpec.notes === true || (entity && entity.hasNotes === true));
+  const wantNotes = wantsTimeline(spec, formSpec);
   if (wantNotes) {
     // notesClassId is an SDK constant supplied by the engine at call time. If not yet
     // provided, notesCellIntent(undefined) is still emitted (the section must exist in the
@@ -342,9 +684,39 @@ function compileFormIntent(spec, formSpec, opts) {
     // residual case type-scoped resolution can't disambiguate — the author sets forms[].formId to reconcile
     // that exact form. Carried verbatim (validated as a GUID at resolve time). Undefined for most forms.
     formId: formSpec.formId,
+    // The maker-facing "what is this form for". Carried through to createArtifact, and omitted when
+    // absent so an edit never blanks a description someone added in the maker.
+    description: formSpec.description,
     status: 'Active',
     tabs: tabs,
-    __explicitLayout: explicit,
+    // Whether this form asks for the Notes timeline (see wantsTimeline). The engine's reconcile reads it to
+    // repair an older host in place and to add one to an auto layout, which has no topology pass to do it.
+    __notes: wantNotes,
+    // Whether an authored tabs layout was ACTUALLY used, which is NOT the same as `explicit` above.
+    // `explicit` is also true for `layout: 'explicit'` with no `tabs`, and in that case the compiler
+    // falls through to the AUTO branch — so reporting it as explicit would tell the engine's
+    // reconcile to prune fields against a layout nobody authored. The spec gate rejects that
+    // combination, but `compileFormIntent` is called directly too, so the flag states what actually
+    // happened rather than what was asked for.
+    __explicitLayout: Array.isArray(formSpec.tabs),
+    // The section names the author declared (see `authoredSectionNames`), so the engine's reconcile
+    // skips the same containers verify skips. An array, because the compiled def is plain data.
+    __authoredSectionNames: [...authoredSectionNames(formSpec)],
+    // …the tab names, for the same reason (see `authoredTabNames`)…
+    __authoredTabNames: [...authoredTabNames(formSpec)],
+    // …and the subset the author NAMED, which the engine's sweep reads to word its report.
+    __namedSectionNames: [...authoredSectionNames(formSpec, { named: true })],
+    // Ordering anchors: { <logical>: <anchorLogical> }. Consumed by the engine's reconcile, which
+    // MOVES an existing control to sit immediately after its anchor. Kept off the cells because a
+    // cell is pushed verbatim to the SDK and `after` is not part of its model (see `positions`).
+    __fieldPositions: positions,
+    // RAW authored spans, for reconcile to re-clamp against the section it actually writes into.
+    __fieldSpans: rawSpans,
+    // Whether an EXPLICIT layout may prune deployed fields it does not list. Defaults to true (the
+    // long-standing behaviour: an explicit layout is the complete desired state). `prune: false`
+    // lets an author reorder or restyle a SUBSET of the fields without having to re-declare the
+    // whole form just to keep the rest — the destructive coupling reported in ADO 6651439.
+    __prune: formSpec.prune !== false,
     __primaryField: entity ? entity.primaryAttribute.schemaName.toLowerCase() : undefined
   };
 }
@@ -434,12 +806,22 @@ function sectionRowsPointer(ti, ci, si) {
   return '/tabs/' + ti + '/columns/' + ci + '/sections/' + si + '/rows';
 }
 
-// JsonPointer to the cell hosting the BOUND field `logical`, or null if not present.
-// Used by the engine's field-removal reconcile (removeElement(pointer) on the SDK). Non-field
-// controls are skipped even if their fieldName matches, so a prune never targets a quick-view whose
-// host lookup collides with a bound field name. Scans in declaration order — the first match wins.
-function findFieldCellPointer(formJson, logical) {
+// Full structural location of the cell hosting the BOUND field `logical`, or null if absent.
+//
+// findFieldCellPointer answers "where is it" for a remove; a MOVE additionally needs the containing
+// arrays and the indices within them, and deriving those by string-splitting the pointer is both
+// fragile and unreadable. Same scan and same non-field-control exclusions as findFieldCellPointer —
+// that function is kept as the thin wrapper so existing callers are untouched.
+function findFieldCellLocation(formJson, logical) {
+  return findFieldCellLocations(formJson, logical)[0] || null;
+}
+
+// The location (as findFieldCellLocation gives it) of EVERY cell hosting the bound field `logical`, in form
+// order: tabs → columns → sections → rows → cells. A deployed form can hold a field more than once — a maker can
+// place it in a second section — and each placement is a cell of its own, with its own label and control.
+function findFieldCellLocations(formJson, logical) {
   const lg = String(logical || '').toLowerCase();
+  const found = [];
   const tabs = formJson.tabs || [];
   for (let ti = 0; ti < tabs.length; ti++) {
     const cols = tabs[ti].columns || [];
@@ -447,23 +829,187 @@ function findFieldCellPointer(formJson, logical) {
       const sections = cols[ci].sections || [];
       for (let si = 0; si < sections.length; si++) {
         const rows = sections[si].rows || [];
+        // Row-major ordinal of each cell WITHIN the section. A section renders as a grid, so the
+        // reading order that matters is flat — in a 2-column section `[a|b] [c|d]` reads a, b, c, d,
+        // and "c immediately after b" is true even though they are in different rows. Row-local
+        // adjacency is therefore the wrong test for "already in place": it reports a correctly
+        // positioned field as misplaced and moves it on every rebuild.
+        let flat = 0;
         for (let ri = 0; ri < rows.length; ri++) {
           const cells = rows[ri].cells || [];
-          for (let celli = 0; celli < cells.length; celli++) {
+          for (let celli = 0; celli < cells.length; celli++, flat++) {
             const fn = cells[celli].control && cells[celli].control.fieldName;
-            if (fn && String(fn).toLowerCase() === lg && !isNonFieldControl(cells[celli].control)) {
-              return '/tabs/' + ti + '/columns/' + ci + '/sections/' + si + '/rows/' + ri + '/cells/' + celli;
-            }
+            if (!fn || String(fn).toLowerCase() !== lg || isNonFieldControl(cells[celli].control)) continue;
+            const sectionPointer = '/tabs/' + ti + '/columns/' + ci + '/sections/' + si;
+            const rowsPointer = sectionPointer + '/rows';
+            const rowPointer = rowsPointer + '/' + ri;
+            found.push({
+              sectionPointer,
+              rowsPointer,
+              rowPointer,
+              cellsPointer: rowPointer + '/cells',
+              cellPointer: rowPointer + '/cells/' + celli,
+              rowIndex: ri,
+              cellIndex: celli,
+              flatIndex: flat,
+              rowCellCount: cells.length,
+            });
           }
         }
+      }
+    }
+  }
+  return found;
+}
+
+// The cells of the form's HEADER and FOOTER, and of each tab's own `tabheader` and `tabfooter`, that host the bound field `logical` —
+// the form's two parts first, header before footer, then the tabs' in tab order, each in document order. They are the placements
+// findFieldCellLocations does not see, which a field the spec makes read-only or hidden is as much in as a section's.
+//
+// The SDK does not model those parts: it keeps their XML in the bag of the form (header, footer) or of the tab (tabheader, tabfooter), as
+// raw nodes, and writes it back as it read it. A node
+// is `{ n: 'cell', a: [['visible', 'true'], …], c: [child nodes] }` — `a` the attribute pairs in document order, `c` the children —
+// and the markup is a section's own rows:
+//   <header id="…" columns="1"><rows><row><cell id="…" visible="true"><labels>…</labels>
+//     <control id="header_new_code" classid="{4273EDBD-…}" datafieldname="new_code" disabled="false" /></cell></row></rows></header>
+// A tab's own parts are the same markup under `<tab>`, before its `<columns>`: <tab …><labels>…</labels><tabheader …>…</tabheader>
+// <tabfooter …>…</tabfooter><columns>…</columns></tab>.
+// See: https://learn.microsoft.com/en-us/power-apps/developer/model-driven-apps/form-xml-schema
+// A location gives the JSON pointer of the cell and of its control, and the nodes (for the attributes a caller reads). The SDK takes an
+// `updateElement` at `<pointer>/a/<n>` with a new `[name, value]` pair, and an `addElement` at `<pointer>/a` with one to append, and
+// validates nothing else there — so a caller must edit exactly the attribute it means to and leave every other of the node as it is.
+// Same exclusions as the body scan: a control that is not the field itself (a quick view bound to the lookup) is skipped.
+function findFieldOuterCells(formJson, logical) {
+  const lg = String(logical || '').toLowerCase();
+  const found = [];
+  const named = (node, name) => (node && Array.isArray(node.c)
+    ? node.c.map((child, index) => ({ child, index })).filter(({ child }) => child && child.n === name) : []);
+  const attr = (node, name) => {
+    const pair = ((node && node.a) || []).find((p) => Array.isArray(p) && String(p[0]).toLowerCase() === name);
+    return pair ? pair[1] : undefined;
+  };
+  // The cells of one part. `base` is the JSON pointer of the part's node, `tab` the name of the tab that holds it when it is a tab's own.
+  const collect = (part, base, tab) => {
+    for (const rows of named(part, 'rows')) {
+      for (const row of named(rows.child, 'row')) {
+        for (const cell of named(row.child, 'cell')) {
+          for (const control of named(cell.child, 'control')) {
+            const fieldName = attr(control.child, 'datafieldname');
+            if (!fieldName || String(fieldName).toLowerCase() !== lg || isNonFieldControl({ classId: attr(control.child, 'classid') })) continue;
+            const cellPointer = base + '/c/' + rows.index + '/c/' + row.index + '/c/' + cell.index;
+            found.push({ part: part.n, ...(tab === undefined ? {} : { tab }), cellPointer, controlPointer: cellPointer + '/c/' + control.index, cell: cell.child, control: control.child });
+          }
+        }
+      }
+    }
+  };
+  (((formJson && formJson.bag) || {}).c || []).forEach((entry, i) => {
+    const part = entry && entry.node;
+    if (part && (part.n === 'header' || part.n === 'footer')) collect(part, '/bag/c/' + i + '/node');
+  });
+  ((formJson && formJson.tabs) || []).forEach((tab, t) => {
+    (((tab && tab.bag) || {}).c || []).forEach((entry, i) => {
+      const part = entry && entry.node;
+      if (part && (part.n === 'tabheader' || part.n === 'tabfooter')) collect(part, '/tabs/' + t + '/bag/c/' + i + '/node', tab.name);
+    });
+  });
+  return found;
+}
+
+// A deployed section, located by NAME (case-insensitive) across the WHOLE form, or null.
+//
+// The search is form-wide rather than scoped to the expected tab on purpose: section names are
+// unique per form in Dataverse, and a section a maker dragged to another tab is still THAT section.
+// Scoping the lookup to the tab the spec now names would miss it and create a duplicate beside it.
+// `accept`, when given, filters the candidates: an authored section must never resolve to an
+// engine-owned host that happens to share its name (sdk-build.js, the form topology pass).
+function findSectionLocation(formJson, sectionName, accept) {
+  const want = String(sectionName || '').toLowerCase();
+  if (!want) return null;
+  return findSectionWhere(formJson, (section) => String(section.name || '').toLowerCase() === want && (!accept || accept(section)));
+}
+
+// A deployed section, located by its `id` across the WHOLE form, or null.
+//
+// The id is the one identity of a section that survives everything the build does to the sections around it. A
+// section's INDEX shifts whenever one is added ahead of it in its column or taken out of it, and its NAME is not
+// reliable: a real section and the emptied copy an older build left share one, and a section a maker made may have
+// none. So a caller that holds a section across such a change — the build keeps a field it is adding until every
+// positioning step is done, and the sub-grids are placed in between — finds it again by this. The SDK mints a GUID
+// for every section it adds and keeps the one a fetched form carries; compared as text, case-insensitively.
+function findSectionById(formJson, id) {
+  const want = String(id == null ? '' : id).toLowerCase();
+  if (!want) return null;
+  return findSectionWhere(formJson, (section) => String(section.id == null ? '' : section.id).toLowerCase() === want);
+}
+
+// The first section, in document order, that `matches`, with where it is: { pointer, rowsPointer, tabIndex,
+// columnIndex, sectionIndex, section } — or null. The one walk behind the by-name and by-id lookups.
+function findSectionWhere(formJson, matches) {
+  const tabs = formJson.tabs || [];
+  for (let ti = 0; ti < tabs.length; ti++) {
+    const cols = tabs[ti].columns || [];
+    for (let ci = 0; ci < cols.length; ci++) {
+      const sections = cols[ci].sections || [];
+      for (let si = 0; si < sections.length; si++) {
+        if (!matches(sections[si])) continue;
+        const pointer = '/tabs/' + ti + '/columns/' + ci + '/sections/' + si;
+        return { pointer, rowsPointer: pointer + '/rows', tabIndex: ti, columnIndex: ci, sectionIndex: si, section: sections[si] };
       }
     }
   }
   return null;
 }
 
+// Where the COMPILED layout says each bound field belongs: logical name -> section name.
+//
+// Derived from the compiled intent rather than the raw spec so it cannot disagree with the tree the
+// create path builds (the compiler is what resolves generated section names, shorthand columns and
+// field-entry objects). The first placement wins — and that is safe only because the spec gate
+// rejects a field placed twice on one form (`checkUniqueField` in validateFormLayoutKeys). Without
+// that gate this would silently diverge from the create path, which emits one cell per entry: a
+// duplicated field would deploy two cells on a fresh build and one on a rebuild.
+function declaredSectionByField(intentTabs) {
+  const out = {};
+  for (const t of intentTabs || []) {
+    for (const col of t.columns || []) {
+      for (const s of col.sections || []) {
+        for (const r of s.rows || []) {
+          for (const c of r.cells || []) {
+            const fn = c.control && c.control.fieldName;
+            if (!fn || isNonFieldControl(c.control)) continue;
+            const logical = String(fn).toLowerCase();
+            if (out[logical] === undefined) out[logical] = s.name;
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// JsonPointer to the cell hosting the BOUND field `logical`, or null if not present.
+// Used by the engine's field-removal reconcile (removeElement(pointer) on the SDK). Non-field
+// controls are skipped even if their fieldName matches, so a prune never targets a quick-view whose
+// host lookup collides with a bound field name. Scans in declaration order — the first match wins.
+function findFieldCellPointer(formJson, logical) {
+  const loc = findFieldCellLocation(formJson, logical);
+  return loc ? loc.cellPointer : null;
+}
+
 module.exports = {
   compileFormIntent,
+  sectionGridWidth,
+  mergeFieldOptions,
+  clampedCellSpan,
+  cellFitsInRow,
+  // Shared with projection.js, whose changed-only verifier must skip exactly the controls this
+  // compiler skips; a second copy of the class-id set had to be kept in sync by hand.
+  isNonFieldControl,
+  // Exported for the build's in-place repack: a span widened on a DEPLOYED form can overflow its
+  // row, and the reconcile must re-pack it with the SAME rule the create path uses, not a second
+  // implementation that can drift.
+  rowsFromCells,
   fieldCellIntent,
   notesCellIntent,
   notesSectionIntent,
@@ -476,5 +1022,15 @@ module.exports = {
   firstSectionRowsPointer,
   firstColumnSectionsPointer,
   sectionRowsPointer,
-  findFieldCellPointer
+  findFieldCellPointer,
+  findFieldCellLocation,
+  findFieldCellLocations,
+  findFieldOuterCells,
+  findSectionLocation,
+  findSectionById,
+  declaredSectionByField,
+  equalColumnWidths,
+  normalizeFieldEntry,
+  fieldOptionsMap,
+  NON_FORM_RENDERABLE_TYPES
 };

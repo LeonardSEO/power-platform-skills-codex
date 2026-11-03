@@ -5,38 +5,55 @@
 //
 // Usage:
 //   node provision-entities.js --env <orgUrl> --input @<path> [--apply] [--sample-data] [--language-code|--languageCode <lcid>]
-const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
 const { validateProvisionInput } = require('./lib/provision-input.js');
-const { makeRunner, provisionSolution, provisionDataModel, provisionSampleData } = require('./lib/entity-provision.js');
-const { quickCreateEnabledFor, normalizeLanguageCode } = require('./lib/app-spec.js');
+const { makeRunner, provisionSolution, provisionDataModel, provisionSampleData, relationshipsInCreateOrder } = require('./lib/entity-provision.js');
+const { quickCreateEnabledFor, normalizeLanguageCode, askedPrimaryNameLength, keyWaitsForNameLength } = require('./lib/app-spec.js');
 const { createAzHttpClient } = require('./lib/sdk-http-client.js');
-const { parseArgs, readJsonArg, emitResult } = require('./lib/dataverse-auth.js');
+const { parseArgs, validateFlags, readAliasedFlag, readJsonArg, emitResult, readProvisionedLanguages } = require('./lib/dataverse-auth.js');
+const { makeTempWorkspace } = require('./lib/temp-workspace.js');
+const { makeWritesBlocking } = require('./lib/output-redaction.js');
 
 // Construct the SDK against the vendored bundle + an az-token HttpClient. Two clients:
 //   sdk          — carries solutionUniqueName (metadata + record writes auto-join the
 //                  solution via the MSCRM.SolutionUniqueName header).
 //   provision    — header-less; used for discovery reads (findTables/findColumns/
 //                  fetchEntityMetadata/queryRecords).
-function makeSdk(env, input) {
-  const { createMakerSdk } = require('./vendor/cds-maker-sdk.cjs');
+async function makeSdk(env, input) {
+  const { createMakerSdk, createNodeWorkspaceStorage } = require('./lib/maker-sdk.js');
   const httpClient = createAzHttpClient(env);
-  const sdkTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'provision-'));
-  const provisionTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'provision-'));
-  const sdk = createMakerSdk({
-    workspacePath: sdkTempDir,
-    instanceUrl: env,
-    httpClient,
-    solutionUniqueName: input.solution && input.solution.uniqueName,
-  });
-  sdk.initWorkspace();
-  const provision = createMakerSdk({ workspacePath: provisionTempDir, instanceUrl: env, httpClient });
-  provision.initWorkspace();
+  const sdkTempDir = makeTempWorkspace('provision-');
+  const provisionTempDir = makeTempWorkspace('provision-');
   const cleanup = () => {
     fs.rmSync(sdkTempDir, { recursive: true, force: true });
     fs.rmSync(provisionTempDir, { recursive: true, force: true });
   };
+  // Everything fallible after the directories exist runs INSIDE this guard, because the caller's
+  // `finally { cleanup() }` only becomes reachable once this function RETURNS — so anything that
+  // throws before the return strands both temp directories for the life of the machine.
+  //
+  // That deliberately includes the `createMakerSdk` CONSTRUCTORS, not just `initWorkspace`: the
+  // constructor now builds the injected-storage adapter (`createNodeWorkspaceStorage`), so it
+  // touches the filesystem and can fail on its own. Guarding only the init left the first
+  // construction outside the net. Matches provision-solution.js and ai-preflight.js, which already
+  // keep construction inside their protected region for this exact reason.
+  let sdk;
+  let provision;
+  try {
+    sdk = createMakerSdk({
+      workspaceStorage: createNodeWorkspaceStorage(sdkTempDir),
+      instanceUrl: env,
+      httpClient,
+      solutionUniqueName: input.solution && input.solution.uniqueName,
+    });
+    await sdk.initWorkspace();
+    provision = createMakerSdk({ workspaceStorage: createNodeWorkspaceStorage(provisionTempDir), instanceUrl: env, httpClient });
+    await provision.initWorkspace();
+  } catch (err) {
+    cleanup();
+    throw err;
+  }
   return { sdk, provision, cleanup };
 }
 
@@ -47,6 +64,9 @@ function computeTotal(input, opts) {
   // entities + columns + status reasons + alternate keys
   for (const e of input.entities || []) {
     total += 1; // table
+    // primary name column length step — MUST match provisionDataModel's condition (entity-provision.js) and buildPlan below:
+    // one narrated step (run, or skipped with the reason) whenever the input gives the name column a length.
+    if (askedPrimaryNameLength(e) !== undefined) total += 1;
     // quick-create enable step — MUST match provisionDataModel's condition (entity-provision.js) and
     // buildPlan below, or [n/total] drifts. This CLI's input has no forms[], so quickCreateEnabledFor
     // fires only on an explicit entities[].quickCreate === true.
@@ -92,11 +112,13 @@ function buildPlan(input, opts) {
       plan.push(`status reason ${e.schemaName}: ${sr.label}`);
     }
     for (const k of e.alternateKeys || []) {
-      plan.push(`alt key ${e.schemaName}.${k.schemaName}`);
+      if (!keyWaitsForNameLength(e, k)) plan.push(`alt key ${e.schemaName}.${k.schemaName}`);
     }
   }
   
-  for (const rel of input.relationships || []) {
+  // In the order the apply creates them — a lookup labelled in several languages goes first — so the plan lists
+  // the steps in the order the run takes them (lib/entity-provision.js relationshipsInCreateOrder).
+  for (const rel of relationshipsInCreateOrder(input)) {
     if (rel.type === 'OneToMany') {
       plan.push(`relationship 1:N ${rel.referenced}->${rel.referencing}`);
     } else if (rel.type === 'ManyToMany') {
@@ -104,6 +126,20 @@ function buildPlan(input, opts) {
     }
   }
   
+  // After the relationships: where provisionDataModel sets the length of a table it creates (computeTotal counts the step too).
+  for (const e of input.entities || []) {
+    if (askedPrimaryNameLength(e) !== undefined) plan.push(`primary column length ${e.schemaName}.${e.primaryAttribute.schemaName}`);
+  }
+  // Then the alternate keys over a name column whose length is set: the apply makes such a key once that length is right
+  // (keyWaitsForNameLength, which depends on what the key's label is sent as and not on the language), where a table it creates has it.
+  // A key labelled in several languages that the environment made the name column too long to fit beside is made there too, which only the
+  // environment can say, so the plan lists it with its table and the apply makes it after the length step. computeTotal counts them with the other keys.
+  for (const e of input.entities || []) {
+    for (const k of e.alternateKeys || []) {
+      if (keyWaitsForNameLength(e, k)) plan.push(`alt key ${e.schemaName}.${k.schemaName}`);
+    }
+  }
+
   if (opts.sampleData && input.sampleData) {
     for (const [entityKey, records] of Object.entries(input.sampleData)) {
       if (Array.isArray(records) && records.length > 0) {
@@ -167,6 +203,10 @@ async function provisionEntities(input, opts = {}, deps = {}) {
     spec,
     apply: true,
     languageCode: opts.languageCode,
+    // Same guard as the build path: an explicit override the org has not provisioned fails here,
+    // before any write, rather than half-succeeding (labels silently coerced to the base language,
+    // then a hard 400 on the first DateTime/Memo column).
+    provisionedLanguages: deps.provisionedLanguages,
     warn,
   });
   
@@ -271,34 +311,37 @@ async function provisionEntities(input, opts = {}, deps = {}) {
 }
 
 async function main() {
-  const { positional, flags } = parseArgs(process.argv.slice(2));
-  // parseArgs represents a value-less flag as boolean true. These are value-bearing flags, so
-  // coerce bare `--env` / `--input` to missing and let the usage guard produce the same clear error
-  // as an omitted value instead of passing a boolean into auth or path resolution.
-  const env = typeof flags.env === 'string' ? flags.env : undefined;
-  const inputArg = (typeof flags.input === 'string' ? flags.input : undefined) || (typeof positional[0] === 'string' ? positional[0] : undefined);
-  
-  if (!env || !inputArg || flags.input === true) {
-    process.stderr.write(
-      'Usage: node provision-entities.js --env <url> --input @<path> [--apply] [--sample-data] [--language-code|--languageCode <lcid>]\n'
-    );
+  const argv = process.argv.slice(2);
+  const { positional, flags } = parseArgs(argv);
+  const USAGE = 'Usage: node provision-entities.js --env <url> --input @<path> [--apply] [--sample-data] [--language-code|--languageCode <lcid>]';
+  // A value-less `--language-code` must never fall through to the org default, and an unknown flag
+  // must never be dropped while swallowing the token after it.
+  const flagError = validateFlags(argv, {
+    known: ['env', 'input', 'apply', 'sample-data', 'language-code', 'languageCode'],
+    needValue: ['env', 'input', 'language-code', 'languageCode'],
+  });
+  if (flagError) {
+    makeWritesBlocking(process.stdout, process.stderr);
+    process.stderr.write(`✗ ${flagError}\n${USAGE}\n`);
     process.exit(1);
   }
-  // A value-less `--language-code` is a usage error, never a silent fall-through to the org default.
-  const valuelessLang = ['language-code', 'languageCode'].find((k) => flags[k] === true);
-  if (valuelessLang) {
-    process.stderr.write(`✗ --${valuelessLang} requires a value.\n`);
+  const env = flags.env;
+  const inputArg = flags.input || positional[0];
+
+  if (!env || !inputArg) {
+    process.stderr.write(USAGE + '\n');
     process.exit(1);
   }
-  
+
   const inputPath = path.resolve(typeof inputArg === 'string' && inputArg.startsWith('@') ? inputArg.slice(1) : inputArg);
   const input = readJsonArg('@' + inputPath);
   
-  const rawLang = flags['language-code'] ?? flags.languageCode;
+  const rawLang = readAliasedFlag(flags, 'language-code', 'languageCode');
   let languageCode;
   if (rawLang !== undefined) {
     languageCode = normalizeLanguageCode(rawLang);
     if (languageCode === null) {
+      makeWritesBlocking(process.stdout, process.stderr);
       process.stderr.write(`✗ --language-code / --languageCode must be digits only, a positive integer LCID up to 65535 (got '${rawLang}')\n`);
       process.exit(1);
     }
@@ -311,7 +354,7 @@ async function main() {
   };
   
   // Construct SDK clients (offline until first call)
-  const { sdk, provision, cleanup } = makeSdk(env, input);
+  const { sdk, provision, cleanup } = await makeSdk(env, input);
 
   let r;
   try {
@@ -320,6 +363,9 @@ async function main() {
       warn: (m) => process.stderr.write(`⚠ ${m}\n`),
       sdk,
       provision,
+      // Only consulted for an explicit override, and any failure resolves to null so a build never
+      // breaks on the diagnostic itself.
+      provisionedLanguages: () => readProvisionedLanguages(env),
     };
 
     r = await provisionEntities(input, opts, deps);

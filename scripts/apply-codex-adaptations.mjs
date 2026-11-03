@@ -21,6 +21,9 @@ const pluginMappings = new Map([
   ["code-apps-preview", "code-apps"],
   ["mobile-app", "mobile-apps"],
   ["power-automate", "power-automate"],
+  ["pcf", "pcf"],
+  ["power-apps-mobile-extension", "power-apps-mobile-extension"],
+  ["process-intelligence", "process-intelligence"],
 ]);
 
 function fail(message) {
@@ -164,7 +167,17 @@ function upstreamMarketplaceNames() {
   if (!Array.isArray(marketplace.plugins)) {
     fail("Upstream marketplace does not contain a plugins array");
   }
-  return new Set(marketplace.plugins.map((plugin) => plugin.name));
+  const external = marketplace.plugins.find((plugin) => plugin.name === "dataverse");
+  if (
+    external?.source?.source !== "github" ||
+    external.source.repo !== "microsoft/Dataverse-skills" ||
+    external.source.path !== ".github/plugins/dataverse" ||
+    Object.keys(external.source).length !== 3
+  ) {
+    fail("Upstream Dataverse source changed; review the external plugin integration");
+  }
+  // Dataverse is synchronized separately from its owning repository.
+  return new Set(marketplace.plugins.filter((plugin) => plugin !== external).map((plugin) => plugin.name));
 }
 
 if (!existsSync(join(upstreamRoot, "marketplace.json"))) {
@@ -280,6 +293,12 @@ const inventory = {
   totalSkills: 0,
 };
 
+const dataverse = readJson(join(repositoryRoot, "config", "plugin-inventory.json")).plugins.dataverse;
+if (!dataverse) fail("Synchronize Dataverse before the full marketplace sync");
+inventory.plugins.dataverse = dataverse;
+inventory.totalSkills += dataverse.skills;
+const bundledNames = [...pluginMappings.keys(), "dataverse"];
+
 const claudeMarketplace = {
   name: "power-platform-skills-codex",
   owner: {
@@ -290,7 +309,7 @@ const claudeMarketplace = {
       "Power Platform plugins optimized for Codex with native Claude Code compatibility",
     pluginRoot: ".",
   },
-  plugins: [...pluginMappings.keys()].map((pluginName) => ({
+  plugins: bundledNames.map((pluginName) => ({
     name: pluginName,
     source: `./plugins/${pluginName}`,
   })),
@@ -301,6 +320,12 @@ for (const [codexName, upstreamName] of pluginMappings) {
   const upstreamManifest = readJson(
     join(upstreamRoot, "plugins", upstreamName, ".plugin", "plugin.json"),
   );
+  const claudeManifestPath = join(pluginRoot, ".claude-plugin", "plugin.json");
+  if (!existsSync(claudeManifestPath)) {
+    mkdirSync(dirname(claudeManifestPath), { recursive: true });
+    writeJson(claudeManifestPath, upstreamManifest);
+  }
+
   const codexManifestPath = join(
     pluginRoot,
     ".codex-plugin",
@@ -444,6 +469,17 @@ for (const telemetryFile of telemetryFiles) {
   });
 }
 
+const marketplacePath = join(repositoryRoot, ".agents", "plugins", "marketplace.json");
+const marketplace = readJson(marketplacePath);
+marketplace.plugins = bundledNames.map((name) =>
+  marketplace.plugins.find((entry) => entry.name === name) || {
+    name,
+    source: { source: "local", path: `./plugins/${name}` },
+    policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
+    category: "Productivity",
+  },
+);
+writeJson(marketplacePath, marketplace);
 writeJson(join(repositoryRoot, "config", "plugin-inventory.json"), inventory);
 writeJson(
   join(repositoryRoot, ".claude-plugin", "marketplace.json"),
@@ -472,11 +508,11 @@ for (const [pluginName, details] of Object.entries(inventory.plugins)) {
 }
 readme = readme.replace(
   /\*\*Total: \d+ plugins and \d+ skill definitions\.\*\*/,
-  `**Total: ${pluginMappings.size} plugins and ${inventory.totalSkills} skill definitions.**`,
+  `**Total: ${bundledNames.length} plugins and ${inventory.totalSkills} skill definitions.**`,
 );
 writeFileSync(readmePath, readme, "utf8");
 
 console.log(
   `Applied Codex adaptations for upstream ${shortCommit}: ` +
-    `${inventory.totalSkills} skills across ${pluginMappings.size} plugins.`,
+    `${inventory.totalSkills} skills across ${bundledNames.length} plugins.`,
 );

@@ -1,8 +1,10 @@
 'use strict';
+// Also guards AB#6648517 — RequiredLevel (Business Required) could not be set on an EXISTING
+// column, so an explicit `required` change never converged on rebuild.
 const { test } = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
-const { makeRunner, requireSuccessfulPush, provisionDataModel, provisionSampleData, provisionSolution, buildSeedGroup } = require(path.join(__dirname, '..', 'lib', 'entity-provision.js'));
+const { makeRunner, requireSuccessfulPush, reportPartialPush, errorCodeChain, BuildHalt, provisionDataModel, provisionSampleData, provisionSolution, buildSeedGroup, relationshipExists } = require(path.join(__dirname, '..', 'lib', 'entity-provision.js'));
 
 function mockSdk(existing = {}) {
   const calls = [];
@@ -12,6 +14,7 @@ function mockSdk(existing = {}) {
       createTable: async (o) => { calls.push(['createTable', o.schemaName]); return { logicalName: o.schemaName.toLowerCase(), entitySetName: `${o.schemaName.toLowerCase()}s`, metadataId: `tbl-${o.schemaName}` }; },
       updateTable: async (l, o) => { calls.push(['updateTable', l, o]); return {}; },
       createColumn: async (l, o) => { calls.push(['createColumn', l, o.schemaName]); return { logicalName: o.schemaName.toLowerCase(), metadataId: `col-${o.schemaName}` }; },
+      updateColumn: async (l, c, o) => { calls.push(['updateColumn', l, c, o]); return {}; },
       createCustomerColumn: async (l, o) => { calls.push(['createCustomerColumn', l, o.schemaName]); return { logicalName: o.schemaName.toLowerCase(), metadataId: `col-${o.schemaName}` }; },
       createRelationship: async (o) => { calls.push(['createRelationship', o.schemaName]); return { schemaName: o.schemaName, metadataId: `rel-${o.schemaName}`, lookupLogicalName: o.lookupSchemaName ? o.lookupSchemaName.toLowerCase() : undefined }; },
       createGlobalOptionSet: async (o) => { calls.push(['createGlobalOptionSet', o.name]); return { metadataId: `gc-${o.name}` }; },
@@ -65,13 +68,13 @@ test('provisionDataModel recovers from createTable already-exists error and redi
   };
   // findTables returns the existing table with entitySetName
   m.provision.findTables = async (s) => [{ logicalName: s.toLowerCase(), entitySetName: `${s.toLowerCase()}s_custom` }];
-  
+
   const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
     { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' }, columns: [] },
   ], relationships: [] };
   const runner = makeRunner({ emit: () => {}, total: 10 });
   const dm = await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true, concurrency: 2 });
-  
+
   assert.ok(dm.entities['new_ticket'], 'new_ticket entity present');
   assert.strictEqual(dm.entities['new_ticket'].entitySetName, 'new_tickets_custom', 'entitySetName recovered from findTables');
   assert.strictEqual(dm.entities['new_ticket'].logicalName, 'new_ticket', 'logicalName captured');
@@ -99,21 +102,21 @@ test('provisionDataModel recovers from a transient-retry table duplicate ("Entit
 test('provisionDataModel recovers from createColumn already-exists error', async () => {
   const m = mockSdk();
   // createColumn throws an already-exists error
-  m.sdk.createColumn = async () => { 
+  m.sdk.createColumn = async () => {
     const err = new Error('Column already exists');
     err.statusCode = 409;
     throw err;
   };
-  
+
   const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
     { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' },
       columns: [{ schemaName: 'new_priority', type: 'Text' }] },
   ], relationships: [] };
   const runner = makeRunner({ emit: () => {}, total: 10 });
-  
+
   // Should not throw - column create should skip on already-exists
   const dm = await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true, concurrency: 2 });
-  
+
   assert.ok(dm.entities['new_ticket'], 'table created despite column error');
   // Column not captured because skipIf returned undefined
   assert.ok(!dm.columns['new_ticket'] || dm.columns['new_ticket'].length === 0, 'column not captured on skip');
@@ -139,6 +142,403 @@ test('provisionDataModel serializes column creation within an entity (per-entity
   await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true });
   assert.strictEqual(maxInFlight, 1, 'never more than one column create in flight per entity');
   assert.strictEqual(m.calls.filter((c) => c[0] === 'createColumn').length, 3, 'all three columns created');
+});
+
+test('provisionDataModel updates an existing column when explicit required:true differs', async () => {
+  const m = mockSdk({ new_ticket: true });
+  m.provision.findColumns = async () => [
+    { logicalName: 'new_priority', schemaName: 'new_priority', requiredLevel: 'None' },
+  ];
+  const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
+    { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' },
+      columns: [{ schemaName: 'new_priority', type: 'Text', required: true }] },
+  ], relationships: [] };
+  const runner = makeRunner({ emit: () => {}, total: 10 });
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true });
+  assert.deepStrictEqual(
+    m.calls.find((c) => c[0] === 'updateColumn'),
+    ['updateColumn', 'new_ticket', 'new_priority', { required: 'ApplicationRequired' }]
+  );
+});
+
+test('provisionDataModel updates an existing column when explicit required:"recommended" differs', async () => {
+  const m = mockSdk({ new_ticket: true });
+  m.provision.findColumns = async () => [
+    { logicalName: 'new_priority', schemaName: 'new_priority', RequiredLevel: { Value: 'None' } },
+  ];
+  const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
+    { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' },
+      columns: [{ schemaName: 'new_priority', type: 'Text', required: 'recommended' }] },
+  ], relationships: [] };
+  const runner = makeRunner({ emit: () => {}, total: 10 });
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true });
+  assert.deepStrictEqual(
+    m.calls.find((c) => c[0] === 'updateColumn'),
+    ['updateColumn', 'new_ticket', 'new_priority', { required: 'Recommended' }]
+  );
+});
+
+test('provisionDataModel skips the required update when an existing column already matches', async () => {
+  const events = [];
+  const m = mockSdk({ new_ticket: true });
+  m.provision.findColumns = async () => [
+    { logicalName: 'new_priority', schemaName: 'new_priority', RequiredLevel: { Value: 'ApplicationRequired' } },
+  ];
+  const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
+    { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' },
+      columns: [{ schemaName: 'new_priority', type: 'Text', required: true }] },
+  ], relationships: [] };
+  const runner = makeRunner({ emit: (e) => events.push(e), total: 10 });
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true });
+  assert.ok(!m.calls.some((c) => c[0] === 'updateColumn'), 'no metadata PUT when RequiredLevel already matches');
+  assert.ok(events.some((e) => e.status === 'skip' && /required new_ticket\.new_priority \(already ApplicationRequired\)/.test(e.label)));
+});
+
+test('provisionDataModel does not demote an existing required column when the spec omits required', async () => {
+  const m = mockSdk({ new_ticket: true });
+  m.provision.findColumns = async () => [
+    { logicalName: 'new_priority', schemaName: 'new_priority', RequiredLevel: { Value: 'ApplicationRequired' } },
+  ];
+  const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
+    { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' },
+      columns: [{ schemaName: 'new_priority', type: 'Text' }] },
+  ], relationships: [] };
+  const runner = makeRunner({ emit: () => {}, total: 10 });
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true });
+  assert.ok(!m.calls.some((c) => c[0] === 'updateColumn'), 'omitted required is not interpreted as None on an existing column');
+});
+
+test('provisionDataModel leaves a new required column on the create path without updateColumn', async () => {
+  const m = mockSdk();
+  const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
+    { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' },
+      columns: [{ schemaName: 'new_priority', type: 'Text', required: true }] },
+  ], relationships: [] };
+  const runner = makeRunner({ emit: () => {}, total: 10 });
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true });
+  assert.ok(m.calls.some((c) => c[0] === 'createColumn' && c[2] === 'new_priority'), 'new column still uses createColumn');
+  assert.ok(!m.calls.some((c) => c[0] === 'updateColumn'), 'new column required is handled by createColumn only');
+});
+
+test('provisionDataModel warns and continues when an existing-column required update fails', async () => {
+  const warnings = [];
+  const events = [];
+  const m = mockSdk({ new_ticket: true });
+  m.provision.findColumns = async () => [
+    { logicalName: 'new_priority', schemaName: 'new_priority', RequiredLevel: { Value: 'None' } },
+  ];
+  m.sdk.updateColumn = async (l, c, o) => {
+    m.calls.push(['updateColumn', l, c, o]);
+    const err = new Error('metadata lock busy');
+    err.statusCode = 429;
+    throw err;
+  };
+  const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
+    { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' },
+      columns: [{ schemaName: 'new_priority', type: 'Text', required: true }] },
+  ], relationships: [] };
+  const runner = makeRunner({ emit: (e) => events.push(e), total: 10 });
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true, warn: (m) => warnings.push(m) });
+  assert.ok(m.calls.some((c) => c[0] === 'updateColumn'), 'the reconcile was attempted');
+  assert.ok(events.some((e) => e.status === 'error' && /required new_ticket\.new_priority/.test(e.label)), 'the failed best-effort step is visible');
+  assert.ok(warnings.some((w) => /could not update required level for new_ticket\.new_priority/.test(w)));
+});
+
+test('provisionDataModel serializes required-level updates within an entity', async () => {
+  const m = mockSdk({ new_ticket: true });
+  const mapLimits = [];
+  m.provision.findColumns = async () => [
+    { logicalName: 'new_a', schemaName: 'new_a', RequiredLevel: { Value: 'None' } },
+    { logicalName: 'new_b', schemaName: 'new_b', RequiredLevel: { Value: 'None' } },
+  ];
+  const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
+    { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' },
+      columns: [
+        { schemaName: 'new_a', type: 'Text', required: true },
+        { schemaName: 'new_b', type: 'Text', required: 'recommended' },
+      ] },
+  ], relationships: [] };
+  const runner = makeRunner({ emit: () => {}, total: 10 });
+  const realMapLimit = runner.mapLimit;
+  runner.mapLimit = async (items, limit, fn) => { mapLimits.push({ count: items.length, limit }); return realMapLimit(items, limit, fn); };
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true });
+  assert.ok(mapLimits.some((m) => m.count === 2 && m.limit === 1), 'required-level metadata PUTs must be serialized');
+  assert.strictEqual(m.calls.filter((c) => c[0] === 'updateColumn').length, 2);
+});
+
+test('provisionDataModel can reconcile required on the primary name column of an existing table', async () => {
+  const m = mockSdk({ new_ticket: true });
+  m.provision.findColumns = async () => [
+    { logicalName: 'new_name', schemaName: 'new_name', RequiredLevel: { Value: 'None' } },
+  ];
+  const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
+    { schemaName: 'new_ticket', displayName: 'Ticket',
+      primaryAttribute: { schemaName: 'new_name', displayName: 'Name', required: true }, columns: [] },
+  ], relationships: [] };
+  const runner = makeRunner({ emit: () => {}, total: 10 });
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true });
+  assert.deepStrictEqual(
+    m.calls.find((c) => c[0] === 'updateColumn'),
+    ['updateColumn', 'new_ticket', 'new_name', { required: 'ApplicationRequired' }]
+  );
+});
+
+// --- the primary name column's requirement level on a NEW table ---------------------------------------------------------------
+// The table's create asks for it (`primaryColumnRequired`). The platform does not keep it on a plain text name column, so the SDK reads the
+// level back after the create, sets it with an update where it differs, and answers the level it read (`primaryColumnRequired`) — or refuses
+// with PRIMARY_COLUMN_REQUIRED_NOT_APPLIED, where the table WAS created. The build says the level was applied on create only when the SDK says so.
+const primaryRequiredSpec = (primaryAttribute, columns = []) => ({ solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
+  { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name', displayName: 'Name', ...primaryAttribute }, columns },
+], relationships: [] });
+// createTable as the SDK answers it: the level it was asked for, read back, for a level other than None.
+const confirmingCreate = (created) => async (o) => {
+  created.push(o);
+  const result = { logicalName: o.schemaName.toLowerCase(), entitySetName: `${o.schemaName.toLowerCase()}s`, metadataId: `tbl-${o.schemaName}` };
+  if (o.primaryColumnRequired && o.primaryColumnRequired !== 'None') result.primaryColumnRequired = o.primaryColumnRequired;
+  return result;
+};
+// What the SDK throws when the level cannot be confirmed: the table exists.
+const notApplied = (cause) => Object.assign(
+  new Error("Table 'new_ticket' WAS CREATED (MetadataId 11111111-2222-3333-4444-555555555555), but its primary column 'new_name' is still 'None' after the update to 'ApplicationRequired'. Do NOT re-run the create — it will collide on the schema name."),
+  { code: 'PRIMARY_COLUMN_REQUIRED_NOT_APPLIED', ...(cause ? { cause } : {}) }
+);
+const requiredSteps = (events) => events.filter((e) => e.status !== 'start' && /^required /.test(e.label)).map((e) => `${e.status}: ${e.label}`);
+async function buildPrimary(m, spec, extra = {}) {
+  const events = [];
+  const warnings = [];
+  const error = await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner: makeRunner({ emit: (e) => events.push(e), total: 10 }), spec, apply: true, preResolvedLanguageCode: 1033, warn: (w) => warnings.push(w), ...extra })
+    .then(() => null, (err) => err);
+  return { events, warnings, error };
+}
+
+test('a new table asks for its primary name column\'s required level in the create and reports it applied on create once the SDK confirms it', async () => {
+  for (const [required, level] of [[true, 'ApplicationRequired'], ['recommended', 'Recommended']]) {
+    const m = mockSdk();
+    const created = [];
+    m.sdk.createTable = confirmingCreate(created);
+    const { events, warnings, error } = await buildPrimary(m, primaryRequiredSpec({ required }));
+    assert.strictEqual(error, null);
+    assert.strictEqual(created.length, 1);
+    assert.strictEqual(created[0].primaryColumnRequired, level, 'the level is sent in the create');
+    assert.deepStrictEqual(requiredSteps(events), ['skip: required new_ticket.new_name (applied on create)']);
+    assert.ok(!m.calls.some((c) => c[0] === 'updateColumn'), 'the SDK sets a level the create did not keep; the build writes nothing of its own');
+    assert.deepStrictEqual(warnings, []);
+  }
+});
+
+test('an explicit required:false sends None, which has nothing to confirm, and an omitted required sends no level and says nothing about it', async () => {
+  const m = mockSdk();
+  const created = [];
+  m.sdk.createTable = confirmingCreate(created);
+  const none = await buildPrimary(m, primaryRequiredSpec({ required: false }));
+  assert.strictEqual(none.error, null);
+  assert.strictEqual(created[0].primaryColumnRequired, 'None');
+  assert.deepStrictEqual(requiredSteps(none.events), ['skip: required new_ticket.new_name (applied on create)'], 'None is what the create always sent');
+  assert.deepStrictEqual(none.warnings, []);
+
+  const omitted = await buildPrimary(m, primaryRequiredSpec({}));
+  assert.strictEqual(omitted.error, null);
+  assert.ok(!('primaryColumnRequired' in created[1]), 'the create is the one it always was');
+  assert.deepStrictEqual(requiredSteps(omitted.events), []);
+});
+
+test('a level the SDK does not confirm is not reported as applied: a failed step and a warning, and the build goes on', async () => {
+  for (const [what, answer] of [['an SDK that says nothing about it', undefined], ['an answer that names another level', 'Recommended']]) {
+    const m = mockSdk();
+    m.sdk.createTable = async (o) => ({ logicalName: o.schemaName.toLowerCase(), entitySetName: `${o.schemaName.toLowerCase()}s`, metadataId: `tbl-${o.schemaName}`, ...(answer ? { primaryColumnRequired: answer } : {}) });
+    const { events, warnings, error } = await buildPrimary(m, primaryRequiredSpec({ required: true }, [{ schemaName: 'new_priority', type: 'Text' }]));
+    assert.strictEqual(error, null, `${what}: the build goes on`);
+    assert.deepStrictEqual(requiredSteps(events), ['error: required new_ticket.new_name -> ApplicationRequired'], `${what}: never "applied on create"`);
+    assert.strictEqual(warnings.length, 1);
+    assert.strictEqual(warnings[0], `could not confirm the required level of new_ticket.new_name (ApplicationRequired) — a re-run sets it, and the rest of the build continues: the SDK confirmed ${answer ? `'${answer}'` : 'no level'} for the name column of the table it created`);
+    assert.ok(m.calls.some((c) => c[0] === 'createColumn' && c[2] === 'new_priority'), `${what}: the table's other columns are still created`);
+  }
+});
+
+test('a table found after its create (the answer was lost) is not reported as having its required level applied either', async () => {
+  const m = mockSdk();
+  let probes = 0;
+  m.provision.findTables = async (s) => (++probes === 1 ? [] : [{ logicalName: s.toLowerCase(), entitySetName: `${s.toLowerCase()}s` }]);
+  m.sdk.createTable = async () => { throw Object.assign(new Error('Entities already exist: new_ticket'), { statusCode: 400 }); };
+  const { events, warnings, error } = await buildPrimary(m, primaryRequiredSpec({ required: true }));
+  assert.strictEqual(error, null);
+  assert.deepStrictEqual(requiredSteps(events), ['error: required new_ticket.new_name -> ApplicationRequired']);
+  assert.strictEqual(warnings.length, 1);
+  assert.match(warnings[0], /could not confirm the required level of new_ticket\.new_name \(ApplicationRequired\) — a re-run sets it.*: the table was found after its create, so nothing shows that the level was applied$/);
+});
+
+test('a reused table whose columns could not be read is not reported as having its primary name column\'s required level applied either', async () => {
+  const m = mockSdk({ new_ticket: true });
+  m.sdk.createTable = async () => { throw new Error('the table is not created again'); };
+  m.provision.findColumns = async () => []; // what an unreadable column list comes out as: no column, the name column included
+  const { events, warnings, error } = await buildPrimary(m, primaryRequiredSpec({ required: true }));
+  assert.strictEqual(error, null);
+  assert.deepStrictEqual(requiredSteps(events), ['error: required new_ticket.new_name -> ApplicationRequired'], 'nothing is "applied on create" on a table this build did not create');
+  assert.strictEqual(warnings.length, 1);
+  assert.match(warnings[0], /could not confirm the required level of new_ticket\.new_name \(ApplicationRequired\) — a re-run sets it.*: the table exists but its columns could not be read, so its current level is unknown$/);
+  assert.ok(!m.calls.some((c) => c[0] === 'updateColumn'), 'and nothing is written on a level that is not known');
+});
+
+// None is the one level the create can show nothing about even when it succeeds (the SDK has nothing to read back for it), so a build that SAW the create succeed
+// reports it applied (above). A table the build did not see made — found after the answer to its create was lost, or an existing table whose columns could not
+// be read — shows nothing about the level of its name column, None included: it may hold Business Required, set there by a maker or left by an earlier create.
+test('a table found after its create (the answer was lost) is not reported as having required:false applied either', async () => {
+  const m = mockSdk();
+  let probes = 0;
+  m.provision.findTables = async (s) => (++probes === 1 ? [] : [{ logicalName: s.toLowerCase(), entitySetName: `${s.toLowerCase()}s` }]);
+  m.sdk.createTable = async () => { throw Object.assign(new Error('Entities already exist: new_ticket'), { statusCode: 400 }); };
+  const { events, warnings, error } = await buildPrimary(m, primaryRequiredSpec({ required: false }));
+  assert.strictEqual(error, null);
+  assert.deepStrictEqual(requiredSteps(events), ['error: required new_ticket.new_name -> None'], 'never "applied on create": nothing shows this build made the table');
+  assert.strictEqual(warnings.length, 1);
+  assert.match(warnings[0], /could not confirm the required level of new_ticket\.new_name \(None\) — a re-run sets it.*: the table was found after its create, so nothing shows that the level was applied$/);
+  assert.ok(!m.calls.some((c) => c[0] === 'updateColumn'), 'and nothing is written on a level that is not known');
+});
+
+test('a reused table whose columns could not be read is not reported as having required:false applied either', async () => {
+  const m = mockSdk({ new_ticket: true });
+  m.sdk.createTable = async () => { throw new Error('the table is not created again'); };
+  m.provision.findColumns = async () => []; // what an unreadable column list comes out as: no column, the name column included
+  const { events, warnings, error } = await buildPrimary(m, primaryRequiredSpec({ required: false }));
+  assert.strictEqual(error, null);
+  assert.deepStrictEqual(requiredSteps(events), ['error: required new_ticket.new_name -> None'], 'nothing is "applied on create" on a table this build did not create');
+  assert.strictEqual(warnings.length, 1);
+  assert.match(warnings[0], /could not confirm the required level of new_ticket\.new_name \(None\) — a re-run sets it.*: the table exists but its columns could not be read, so its current level is unknown$/);
+  assert.ok(!m.calls.some((c) => c[0] === 'updateColumn'), 'and nothing is written on a level that is not known');
+});
+
+test('a table the build did not see made says nothing about a name column whose spec states no required level', async () => {
+  const found = mockSdk();
+  let probes = 0;
+  found.provision.findTables = async (s) => (++probes === 1 ? [] : [{ logicalName: s.toLowerCase(), entitySetName: `${s.toLowerCase()}s` }]);
+  found.sdk.createTable = async () => { throw Object.assign(new Error('Entities already exist: new_ticket'), { statusCode: 400 }); };
+  const reused = mockSdk({ new_ticket: true });
+  reused.sdk.createTable = async () => { throw new Error('the table is not created again'); };
+  reused.provision.findColumns = async () => [];
+  for (const [what, m] of [['found after its create', found], ['reused with columns that could not be read', reused]]) {
+    const { events, warnings, error } = await buildPrimary(m, primaryRequiredSpec({}));
+    assert.strictEqual(error, null, what);
+    assert.deepStrictEqual(requiredSteps(events), [], `${what}: no step for a level the spec does not state`);
+    assert.deepStrictEqual(warnings, [], what);
+    assert.ok(!m.calls.some((c) => c[0] === 'updateColumn'), what);
+  }
+});
+
+test('a reused table whose name column can be read converges to an explicit required:false, and is left alone once it is None', async () => {
+  const run = async (level) => {
+    const m = mockSdk({ new_ticket: true });
+    m.sdk.createTable = async () => { throw new Error('the table is not created again'); };
+    m.provision.findColumns = async () => [{ logicalName: 'new_name', schemaName: 'new_name', RequiredLevel: { Value: level } }];
+    return { m, ...(await buildPrimary(m, primaryRequiredSpec({ required: false }))) };
+  };
+  const required = await run('ApplicationRequired');
+  assert.strictEqual(required.error, null);
+  assert.deepStrictEqual(required.m.calls.filter((c) => c[0] === 'updateColumn'), [['updateColumn', 'new_ticket', 'new_name', { required: 'None' }]]);
+  assert.deepStrictEqual(requiredSteps(required.events), ['ok: required new_ticket.new_name -> None']);
+  assert.deepStrictEqual(required.warnings, []);
+  const none = await run('None');
+  assert.strictEqual(none.error, null);
+  assert.ok(!none.m.calls.some((c) => c[0] === 'updateColumn'), 'a level that is already there is not written again');
+  assert.deepStrictEqual(requiredSteps(none.events), ['skip: required new_ticket.new_name (already None)']);
+  assert.deepStrictEqual(none.warnings, []);
+});
+
+test('PRIMARY_COLUMN_REQUIRED_NOT_APPLIED: the table was created, so the build stops once, never looks for it as if its name were taken, and says what to do', async () => {
+  const causes = [
+    ['no cause', undefined],
+    ['a 409 from the update', Object.assign(new Error('HTTP 409 Conflict'), { statusCode: 409 })],
+    ['a platform reason that reads like a duplicate', new Error('A record with the same name already exists')],
+  ];
+  for (const [what, cause] of causes) {
+    const m = mockSdk();
+    let creates = 0;
+    let probes = 0;
+    m.sdk.createTable = async () => { creates += 1; throw notApplied(cause); };
+    const findTables = m.provision.findTables;
+    m.provision.findTables = async (...args) => { probes += 1; return findTables(...args); };
+    const { events, warnings, error } = await buildPrimary(m, primaryRequiredSpec({ required: true }, [{ schemaName: 'new_priority', type: 'Text' }]));
+    assert.ok(error instanceof BuildHalt && error.code === 'PRIMARY_COLUMN_REQUIRED_NOT_APPLIED' && error.recoverable === true, `${what}: the halt carries the SDK's code`);
+    assert.match(error.message, /WAS CREATED/, `${what}: and the SDK's own words`);
+    assert.match(error.message, /the table exists\. Run the build again: it finds the table, does not create it again, and sets the required level of its primary name column/);
+    assert.strictEqual(creates, 1, `${what}: the create is not repeated`);
+    assert.strictEqual(probes, 1, `${what}: the table is looked for once, before the create — never "rediscovered" after it`);
+    assert.ok(!m.calls.some((c) => c[0] === 'createColumn'), `${what}: nothing is created beside a table the build stops on`);
+    assert.deepStrictEqual(events.filter((e) => e.status === 'error').map((e) => e.label), ['table new_ticket']);
+    assert.deepStrictEqual(warnings, ['table new_ticket was created, but the required level (ApplicationRequired) of its primary name column new_name could not be confirmed, so the build stops here — the table exists: run the build again, which finds it, does not create it again, and sets that level on the column']);
+  }
+});
+
+test('PRIMARY_COLUMN_REQUIRED_NOT_APPLIED with a name column length asked of a plain text column says the length may not have been applied either', async () => {
+  const run = async (primaryAttribute) => {
+    const m = mockSdk();
+    m.sdk.createTable = async () => { throw notApplied(); };
+    return buildPrimary(m, primaryRequiredSpec({ required: true, ...primaryAttribute }));
+  };
+  const plain = await run({ maxLength: 120 });
+  assert.strictEqual(plain.warnings.length, 1);
+  assert.ok(plain.warnings[0].endsWith('sets that level on the column; the spec also asks for a name column length of 120, which may not have been applied either (some environments make a name column created this way 850 characters long) and a re-run leaves an existing table\'s name column length as it is: after the re-run, check it in Maker and set it there if it matters'), plain.warnings[0]);
+  // The platform keeps the length asked of an auto-numbered name column, and 850 is what the column comes out as either way.
+  for (const unasked of [{ maxLength: 120, autoNumberFormat: 'WO-{SEQNUM:5}' }, { maxLength: 850 }, {}]) {
+    const quiet = await run(unasked);
+    assert.ok(quiet.warnings[0].endsWith('sets that level on the column'), `no length said for ${JSON.stringify(unasked)}`);
+  }
+});
+
+test('the re-run after PRIMARY_COLUMN_REQUIRED_NOT_APPLIED finds the table and sets the level as it does an existing column\'s; the run after that does nothing', async () => {
+  const spec = primaryRequiredSpec({ required: true });
+  const rerun = async (level) => {
+    const m = mockSdk({ new_ticket: true });
+    m.sdk.createTable = async () => { throw new Error('the table is not created again'); };
+    m.provision.findColumns = async () => [{ logicalName: 'new_name', schemaName: 'new_name', RequiredLevel: { Value: level } }];
+    return { m, ...(await buildPrimary(m, spec)) };
+  };
+  const first = await rerun('None');
+  assert.strictEqual(first.error, null);
+  assert.deepStrictEqual(first.m.calls.filter((c) => c[0] === 'updateColumn'), [['updateColumn', 'new_ticket', 'new_name', { required: 'ApplicationRequired' }]]);
+  assert.deepStrictEqual(requiredSteps(first.events), ['ok: required new_ticket.new_name -> ApplicationRequired']);
+  const second = await rerun('ApplicationRequired');
+  assert.strictEqual(second.error, null);
+  assert.ok(!second.m.calls.some((c) => c[0] === 'updateColumn'), 'a level that is already there is not written again');
+  assert.deepStrictEqual(requiredSteps(second.events), ['skip: required new_ticket.new_name (already ApplicationRequired)']);
+});
+
+test('a reused table whose primary name column states no required level is left as it is', async () => {
+  for (const level of ['None', 'ApplicationRequired']) {
+    const m = mockSdk({ new_ticket: true });
+    m.sdk.createTable = async () => { throw new Error('the table is not created again'); };
+    m.provision.findColumns = async () => [{ logicalName: 'new_name', schemaName: 'new_name', RequiredLevel: { Value: level } }];
+    const { events, warnings, error } = await buildPrimary(m, primaryRequiredSpec({}));
+    assert.strictEqual(error, null);
+    assert.ok(!m.calls.some((c) => c[0] === 'updateColumn'), `a name column that is ${level} is not rewritten`);
+    assert.deepStrictEqual(requiredSteps(events), []);
+    assert.deepStrictEqual(warnings, []);
+  }
+});
+
+test('provisionDataModel reads RequiredLevel once when discovery omits it', async () => {
+  const m = mockSdk({ new_ticket: true });
+  const rawGets = [];
+  m.provision.findColumns = async () => [
+    { logicalName: 'new_priority', schemaName: 'new_priority' },
+  ];
+  m.sdk.dataverse = {
+    get: async (url) => {
+      rawGets.push(url);
+      return {
+        status: 200,
+        body: { value: [{ LogicalName: 'new_priority', RequiredLevel: { Value: 'None' } }] },
+      };
+    },
+  };
+  const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
+    { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' },
+      columns: [{ schemaName: 'new_priority', type: 'Text', required: true }] },
+  ], relationships: [] };
+  const runner = makeRunner({ emit: () => {}, total: 10 });
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true });
+  assert.strictEqual(rawGets.length, 1, 'one entity-level metadata read supplies all required levels');
+  assert.match(rawGets[0], /\/EntityDefinitions\(LogicalName='new_ticket'\)\/Attributes\?\$select=LogicalName,RequiredLevel/);
+  assert.ok(m.calls.some((c) => c[0] === 'updateColumn' && c[3].required === 'ApplicationRequired'));
 });
 
 test('provisionDataModel binds the reused global-choice metadataId on an idempotent re-run (SDK probe-then-reuse)', async () => {
@@ -237,17 +637,17 @@ test('provisionDataModel enables quick-create even for an EXISTING (reused) tabl
 test('provisionDataModel still throws on NON-already-exists createTable error', async () => {
   const m = mockSdk();
   // createTable throws a different error (bad request, not already-exists)
-  m.sdk.createTable = async () => { 
+  m.sdk.createTable = async () => {
     const err = new Error('Invalid schema name');
     err.statusCode = 400;
     throw err;
   };
-  
+
   const spec = { solution: { uniqueName: 'S', publisherPrefix: 'new' }, entities: [
     { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' }, columns: [] },
   ], relationships: [] };
   const runner = makeRunner({ emit: () => {}, total: 10 });
-  
+
   // Should throw - this is NOT an already-exists error
   await assert.rejects(
     async () => await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true, concurrency: 2 }),
@@ -256,34 +656,34 @@ test('provisionDataModel still throws on NON-already-exists createTable error', 
   );
 });
 
-test('provisionDataModel recovers from createRelationship already-exists error (1:N)', async () => {
+test('provisionDataModel does not skip a relationship already-exists error it cannot identify', async () => {
   const m = mockSdk({ new_ticket: true, new_customer: true });
-  // createRelationship throws an already-exists error
-  m.sdk.createRelationship = async () => { 
+  // createRelationship throws an already-exists error, and nothing can say which relationship holds the name.
+  m.sdk.createRelationship = async () => {
     const err = new Error('Relationship with the same name already exists');
     err.statusCode = 409;
     throw err;
   };
-  
-  const spec = { 
-    solution: { uniqueName: 'S', publisherPrefix: 'new' }, 
+
+  const spec = {
+    solution: { uniqueName: 'S', publisherPrefix: 'new' },
     entities: [
       { schemaName: 'new_ticket', displayName: 'Ticket', primaryAttribute: { schemaName: 'new_name' }, columns: [] },
       { schemaName: 'new_customer', displayName: 'Customer', primaryAttribute: { schemaName: 'new_name' }, columns: [] }
     ],
     relationships: [
-      { type: 'OneToMany', referenced: 'new_customer', referencing: 'new_ticket', 
+      { type: 'OneToMany', referenced: 'new_customer', referencing: 'new_ticket',
         lookup: { schemaName: 'new_customerId', displayName: 'Customer' } }
     ]
   };
   const runner = makeRunner({ emit: () => {}, total: 10 });
-  
-  // Should not throw - relationship create should skip on already-exists
-  const dm = await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true, concurrency: 2 });
-  
-  assert.ok(dm.entities['new_ticket'], 'tables created despite relationship error');
-  // Relationship not captured because skipIf returned undefined
-  assert.strictEqual(dm.relationships.length, 0, 'relationship not captured on skip');
+
+  // A blind skip was the bug: the name is taken, and with no metadata client the build cannot
+  // tell whether the holder is this relationship. Halt instead of reporting success.
+  await assert.rejects(
+    () => provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true, concurrency: 2 }),
+    /could not identify/,
+  );
 });
 
 // --- buildSeedGroup: App Spec -> seedRecordGraph group translation -----------------------------
@@ -324,6 +724,15 @@ test('buildSeedGroup translates $parent.match into a lookup bind (parentIndex) a
   assert.strictEqual(group.records[0].body['new_CustomerId@odata.bind'], undefined, 'no @odata.bind baked in (SDK forms it)');
 });
 
+test('buildSeedGroup rejects unsupported _seedKey before it reaches the outbound body', () => {
+  const spec = seedSpec();
+  spec.sampleData.new_ticket[0]._seedKey = 'ticket-1';
+  assert.throws(
+    () => buildSeedGroup({ spec, e: spec.entities[1], records: spec.sampleData.new_ticket, statusReasonValues: {} }),
+    /_seedKey[\s\S]*not supported[\s\S]*alternate key/,
+  );
+});
+
 test('#1 buildSeedGroup THROWS (not silently drops) when a $parent.match resolves to no parent row', () => {
   const spec = seedSpec();
   // No new_customer row matches this -> the bind cannot be formed. Before #1 this was a silent skip
@@ -332,6 +741,19 @@ test('#1 buildSeedGroup THROWS (not silently drops) when a $parent.match resolve
   assert.throws(
     () => buildSeedGroup({ spec, e: spec.entities[1], records: spec.sampleData.new_ticket, statusReasonValues: {} }),
     /found no 'new_customer' sample record|left unset/,
+  );
+});
+
+test('buildSeedGroup THROWS when a $parent.match resolves to more than one parent row', () => {
+  const spec = seedSpec();
+  spec.sampleData.new_customer = [
+    { new_name: 'Same', new_tier: 'Free' },
+    { new_name: 'Same', new_tier: 'Pro' },
+  ];
+  spec.sampleData.new_ticket[0].$parent.match = { new_name: 'Same' };
+  assert.throws(
+    () => buildSeedGroup({ spec, e: spec.entities[1], records: spec.sampleData.new_ticket, statusReasonValues: {} }),
+    /parent match[\s\S]*matched 2 'new_customer' sample records[\s\S]*new_CustomerId/,
   );
 });
 
@@ -372,6 +794,35 @@ test('buildSeedGroup prefers a single-column alternate key as matchOn over the p
   assert.strictEqual(group.matchOn, 'new_code', 'alt-key column wins over primary name');
 });
 
+test('buildSeedGroup rejects duplicate primary-name values when matchOn would fall back to name', () => {
+  const spec = seedSpec();
+  spec.sampleData.new_customer = [
+    { new_name: 'Same', new_tier: 'Free' },
+    { new_name: 'Same', new_tier: 'Pro' },
+  ];
+  assert.throws(
+    () => buildSeedGroup({ spec, e: spec.entities[0], records: spec.sampleData.new_customer, statusReasonValues: {} }),
+    /duplicate new_name value 'Same'[\s\S]*single-column alternate key/,
+  );
+});
+
+// An alternate key is enforced-unique by Dataverse, but the SAMPLE ROWS are not checked by anything
+// before they are sent — so duplicate key values resolve two authored records to the same row, the
+// same wrong-row resolve the primary-name rule rejects. The rule must follow whichever column
+// actually becomes matchOn.
+test('buildSeedGroup rejects duplicate values in the single-column alternate key it selects as matchOn', () => {
+  const spec = seedSpec();
+  spec.entities[0].alternateKeys = [{ schemaName: 'new_codekey', columns: ['new_code'] }];
+  spec.sampleData.new_customer = [
+    { new_name: 'A', new_code: 'DUP', new_tier: 'Free' },
+    { new_name: 'B', new_code: 'DUP', new_tier: 'Pro' },
+  ];
+  assert.throws(
+    () => buildSeedGroup({ spec, e: spec.entities[0], records: spec.sampleData.new_customer, statusReasonValues: {} }),
+    /duplicate new_code value 'DUP'/,
+  );
+});
+
 test('buildSeedGroup omits matchOn (no dedup) when the key value is empty in a record', () => {
   const spec = seedSpec();
   // A record with no primary name value and no alternate key -> no safe dedup key -> omit matchOn.
@@ -381,9 +832,177 @@ test('buildSeedGroup omits matchOn (no dedup) when the key value is empty in a r
   assert.ok(!('primaryAttribute' in group));
 });
 
-// --- provisionSampleData: F9 keyless-seeding warning ------------------------------------------
+// --- #544: self-referencing $parent (a hierarchy on one table) ---------------------------------
+// seedRecordGraph resolves EVERY bind in a group before creating ANY of that group's rows, and only
+// publishes the group's ids afterwards. Topological ordering BETWEEN entities therefore does not
+// help WITHIN one, so a `$parent` pointing at the row's own entity could never resolve — the whole
+// sample-data phase halted, several phases into a build that had already written data. The spec
+// cannot work around it either: the plugin, not the author, decides the grouping.
+const hierarchySpec = () => ({
+  solution: { uniqueName: 'S', publisherPrefix: 'new' },
+  entities: [{ schemaName: 'new_org', displayName: 'Org', primaryAttribute: { schemaName: 'new_name' }, columns: [] }],
+  relationships: [
+    { type: 'OneToMany', referenced: 'new_org', referencing: 'new_org', lookup: { schemaName: 'new_ParentOrgId', displayName: 'Parent Org' } },
+  ],
+  sampleData: {
+    new_org: [
+      { new_name: 'Root' },
+      { new_name: 'Child', $parent: { entity: 'new_org', match: { new_name: 'Root' } } },
+      { new_name: 'Grandchild', $parent: { entity: 'new_org', match: { new_name: 'Child' } } },
+    ],
+  },
+});
+
+// Capture every seedRecordGraph call so the WAVES are observable, and return ids the way the real
+// bundle does: one id per record of the group it was handed, in order.
+function recordingSdk() {
+  const calls = [];
+  let n = 0;
+  return {
+    calls,
+    seedRecordGraph: async (groups, opts) => {
+      const g = groups[0];
+      calls.push({ names: g.records.map((r) => r.body.new_name), binds: g.records.map((r) => r.binds), createdIds: JSON.parse(JSON.stringify(opts.createdIds || {})) });
+      return { createdIds: { [g.entityLogical]: g.records.map(() => `id-${n++}`) } };
+    },
+  };
+}
+
+async function runHierarchy(spec) {
+  const runner = makeRunner({ emit: () => {}, total: 1 });
+  const sdk = recordingSdk();
+  const dataModel = { entities: { new_org: { logicalName: 'new_org', entitySetName: 'new_orgs' } }, statusReasonValues: {} };
+  const res = await provisionSampleData({ sdk, provision: {}, runner, spec, dataModel });
+  return { sdk, res };
+}
+
+test('#544 a self-referencing $parent seeds in waves instead of failing the whole phase', async () => {
+  const { sdk } = await runHierarchy(hierarchySpec());
+  assert.deepStrictEqual(sdk.calls.map((c) => c.names), [['Root'], ['Child'], ['Grandchild']],
+    'one wave per depth: a row is seeded only after the row it points at');
+});
+
+test('#544 each wave receives its parents ids at their ORIGINAL record index', async () => {
+  const { sdk, res } = await runHierarchy(hierarchySpec());
+  // The bind carries parentIndex = the parent's index in the entity's FULL sample list, and the SDK
+  // looks it up as createdIds[entity][parentIndex]. A wave-local array would misresolve every bind.
+  assert.deepStrictEqual(sdk.calls[1].binds[0], [{ navProperty: 'new_ParentOrgId', parentEntity: 'new_org', parentIndex: 0 }]);
+  assert.strictEqual(sdk.calls[1].createdIds.new_org[0], 'id-0', "wave 2 sees Root's id at index 0");
+  assert.strictEqual(sdk.calls[2].createdIds.new_org[1], 'id-1', "wave 3 sees Child's id at index 1");
+  assert.deepStrictEqual(res.records.new_org, ['id-0', 'id-1', 'id-2'], 'the entity reports one id per ORIGINAL row, in order');
+});
+
+test('#544 a spec with no self-reference still seeds in exactly one call (no behaviour change)', async () => {
+  const spec = hierarchySpec();
+  delete spec.sampleData.new_org[1].$parent;
+  delete spec.sampleData.new_org[2].$parent;
+  const { sdk } = await runHierarchy(spec);
+  assert.strictEqual(sdk.calls.length, 1, 'unchanged specs must not be split into waves');
+  assert.deepStrictEqual(sdk.calls[0].names, ['Root', 'Child', 'Grandchild']);
+  assert.strictEqual(sdk.calls[0].createdIds.new_org, undefined, 'and must not gain a self-entity key in options');
+});
+
+// Waves are by DEPTH, not by row order: independent rows at the same depth go in one call, and a row
+// declared BEFORE its parent still lands after it. Order in the array must not matter.
+test('#544 rows at the same depth share a wave, and a parent declared LATER still goes first', async () => {
+  const spec = hierarchySpec();
+  spec.sampleData.new_org = [
+    { new_name: 'Leaf', $parent: { entity: 'new_org', match: { new_name: 'Mid' } } },     // depth 2, declared first
+    { new_name: 'Mid', $parent: { entity: 'new_org', match: { new_name: 'Root' } } },     // depth 1
+    { new_name: 'Root' },                                                                 // depth 0, declared last
+    { new_name: 'OtherRoot' },                                                            // depth 0
+    { new_name: 'OtherMid', $parent: { entity: 'new_org', match: { new_name: 'OtherRoot' } } }, // depth 1
+  ];
+  const { sdk, res } = await runHierarchy(spec);
+  assert.deepStrictEqual(sdk.calls.map((c) => c.names), [
+    ['Root', 'OtherRoot'],
+    ['Mid', 'OtherMid'],
+    ['Leaf'],
+  ], 'one call per depth, independent rows batched together');
+  // Ids still come back indexed by the ORIGINAL declaration order, which is what every bind means.
+  assert.strictEqual(res.records.new_org.length, 5);
+  assert.ok(res.records.new_org.every((id) => typeof id === 'string'), JSON.stringify(res.records.new_org));
+});
+
+// `$parents` (the array form used by junction rows) must be treated identically — it is the same
+// bind list, so a self-reference through it has to drive the waves too.
+test('#544 a self-reference expressed through $parents drives the waves as well', async () => {
+  const spec = hierarchySpec();
+  spec.sampleData.new_org = [
+    { new_name: 'Child', $parents: [{ entity: 'new_org', match: { new_name: 'Root' } }] },
+    { new_name: 'Root' },
+  ];
+  const { sdk } = await runHierarchy(spec);
+  assert.deepStrictEqual(sdk.calls.map((c) => c.names), [['Root'], ['Child']]);
+});
+
+// A CROSS-entity parent must not be mistaken for a self-reference: it is already handled by the
+// topological ordering BETWEEN entities, and splitting on it would add calls for no reason.
+test('#544 a cross-entity $parent does not trigger wave splitting', async () => {
+  const spec = hierarchySpec();
+  spec.entities.push({ schemaName: 'new_owner', displayName: 'Owner', primaryAttribute: { schemaName: 'new_name' }, columns: [] });
+  spec.relationships.push({ type: 'OneToMany', referenced: 'new_owner', referencing: 'new_org', lookup: { schemaName: 'new_OwnerId', displayName: 'Owner' } });
+  spec.sampleData.new_owner = [{ new_name: 'Acme' }];
+  spec.sampleData.new_org = [
+    { new_name: 'A', $parent: { entity: 'new_owner', match: { new_name: 'Acme' } } },
+    { new_name: 'B', $parent: { entity: 'new_owner', match: { new_name: 'Acme' } } },
+  ];
+  const { sdk } = await runHierarchy(spec);
+  const orgCalls = sdk.calls.filter((c) => c.names.includes('A') || c.names.includes('B'));
+  assert.strictEqual(orgCalls.length, 1, 'both org rows seed in one call');
+});
+
+test('#544 a self-reference CYCLE fails with a message naming the rows, not a hang', async () => {
+  const spec = hierarchySpec();
+  spec.sampleData.new_org[0].$parent = { entity: 'new_org', match: { new_name: 'Grandchild' } };
+  await assert.rejects(runHierarchy(spec), (err) => {
+    assert.match(err.message, /cycle/i);
+    assert.match(err.message, /new_org/);
+    assert.match(err.message, /Root|Grandchild/, `the message must name the rows involved: ${err.message}`);
+    return true;
+  });
+});
+
+test('#544 a row that is its own parent is reported as a cycle', async () => {
+  const spec = hierarchySpec();
+  spec.sampleData.new_org = [{ new_name: 'Loop', $parent: { entity: 'new_org', match: { new_name: 'Loop' } } }];
+  await assert.rejects(runHierarchy(spec), /cycle/i);
+});
+
+// The ambiguity this fix makes REACHABLE: `$parent` resolves through relationshipFor, which returns
+// the FIRST OneToMany for the pair. A hierarchy table commonly has two self-lookups, and silently
+// binding the wrong one asserts something false about the data.
+test('#544 two relationships for the same pair are rejected unless $parent names the lookup', () => {
+  const spec = hierarchySpec();
+  spec.relationships.push({ type: 'OneToMany', referenced: 'new_org', referencing: 'new_org', lookup: { schemaName: 'new_GroupAncestorId', displayName: 'Group Ancestor' } });
+  assert.throws(
+    () => buildSeedGroup({ spec, e: spec.entities[0], records: spec.sampleData.new_org, statusReasonValues: {} }),
+    /ambiguous|more than one/i
+  );
+});
+
+test('#544 $parent.lookup selects which relationship to bind', () => {
+  const spec = hierarchySpec();
+  spec.relationships.push({ type: 'OneToMany', referenced: 'new_org', referencing: 'new_org', lookup: { schemaName: 'new_GroupAncestorId', displayName: 'Group Ancestor' } });
+  spec.sampleData.new_org[1].$parent.lookup = 'new_GroupAncestorId';
+  spec.sampleData.new_org[2].$parent.lookup = 'new_ParentOrgId';
+  const group = buildSeedGroup({ spec, e: spec.entities[0], records: spec.sampleData.new_org, statusReasonValues: {} });
+  assert.strictEqual(group.records[1].binds[0].navProperty, 'new_GroupAncestorId');
+  assert.strictEqual(group.records[2].binds[0].navProperty, 'new_ParentOrgId');
+});
+
+test('#544 an unknown $parent.lookup names the valid ones', () => {
+  const spec = hierarchySpec();
+  spec.sampleData.new_org[1].$parent.lookup = 'new_NopeId';
+  assert.throws(
+    () => buildSeedGroup({ spec, e: spec.entities[0], records: spec.sampleData.new_org, statusReasonValues: {} }),
+    /new_NopeId[\s\S]*new_ParentOrgId/
+  );
+});
+
+// --- provisionSampleData: keyless-seeding warning ------------------------------------------
 function runSample(spec) {
-  // The F9 warning goes to stderr (non-fatal), so capture stderr for the duration of the run.
+  // The keyless-seeding warning goes to stderr (non-fatal), so capture stderr for the duration of the run.
   const origWrite = process.stderr.write.bind(process.stderr);
   const warnings = [];
   process.stderr.write = (s) => { warnings.push(String(s)); return true; };
@@ -395,7 +1014,7 @@ function runSample(spec) {
     .finally(() => { process.stderr.write = origWrite; });
 }
 
-test('provisionSampleData WARNS in the op label when a group has no idempotency key — a re-run would duplicate (F9)', async () => {
+test('provisionSampleData WARNS in the op label when a group has no idempotency key — a re-run would duplicate', async () => {
   const spec = {
     solution: { uniqueName: 'S', publisherPrefix: 'new' },
     entities: [{ schemaName: 'new_log', displayName: 'Log', primaryAttribute: { schemaName: 'new_name' }, columns: [] }],
@@ -406,7 +1025,7 @@ test('provisionSampleData WARNS in the op label when a group has no idempotency 
   assert.ok(labels.some((l) => /no idempotency key/.test(l)), `expected a keyless-seeding warning; got ${JSON.stringify(labels)}`);
 });
 
-test('provisionSampleData does NOT warn when the primary name gives a stable key (F9)', async () => {
+test('provisionSampleData does NOT warn when the primary name gives a stable key', async () => {
   const spec = {
     solution: { uniqueName: 'S', publisherPrefix: 'new' },
     entities: [{ schemaName: 'new_log', displayName: 'Log', primaryAttribute: { schemaName: 'new_name' }, columns: [] }],
@@ -417,7 +1036,7 @@ test('provisionSampleData does NOT warn when the primary name gives a stable key
   assert.ok(!labels.some((l) => /no idempotency key/.test(l)), 'a keyed spec must not warn');
 });
 
-test('provisionSolution ESCAPES the solution uniquename in the OData filter (F12 — no injection/break)', async () => {
+test('provisionSolution ESCAPES the solution uniquename in the OData filter (no injection/break)', async () => {
   const calls = [];
   const provision = { queryRecords: async (set, opts) => { calls.push({ set, filter: opts.filter }); return set === 'solution' ? [{ solutionid: 's' }] : []; } };
   const runner = makeRunner({ emit: () => {}, total: 1 });
@@ -437,6 +1056,51 @@ test('requireSuccessfulPush halts (BuildHalt) on a 412 version-conflict result',
     () => requireSuccessfulPush(conflict, 'app a1'),
     (err) => err.name === 'BuildHalt' && /re-download the app and rebuild/.test(err.message) && err.code === 'version-conflict'
   );
+});
+
+// The SDK renamed `PushResult.success` to `saved` deliberately — its own type comment says the
+// rename exists to "force every existing call site to be looked at once". This guard is such a call
+// site, and it is the ONLY thing standing between a 412 and a silently dropped Maker edit.
+//
+// The danger is that the rename is invisible at runtime: a `success === false` check against a
+// bundle that returns `saved` reads `undefined === false` -> false, so the guard just stops firing.
+// Nothing fails, nothing logs, and a concurrent edit is overwritten. These pin BOTH spellings so the
+// guard cannot be silently disarmed by a re-vendor in either direction.
+test('requireSuccessfulPush halts on the RENAMED PushResult shape (saved:false), not just success:false', () => {
+  const conflict = { type: 'form', id: 'f9', saved: false, shipped: false, error: new Error('Version conflict (412)') };
+  assert.throws(
+    () => requireSuccessfulPush(conflict, 'form f9'),
+    (err) => err.name === 'BuildHalt' && err.code === 'version-conflict' && /Version conflict \(412\)/.test(err.message),
+    'a saved:false result MUST halt — otherwise a 412 silently drops the edit'
+  );
+});
+
+test('requireSuccessfulPush accepts a saved:true result and does not confuse saved with shipped', () => {
+  // `shipped:false` is normal — it means the change is committed but the runtime still serves the
+  // previously published copy. That is NOT a push failure and must not halt the build; the publish
+  // phase is what makes it live.
+  const saved = { type: 'view', id: 'v1', saved: true, shipped: false, publish: { kind: 'notRequested' } };
+  assert.strictEqual(requireSuccessfulPush(saved, 'view v1'), saved);
+});
+
+test('requireSuccessfulPush halts on a result that carries an error but neither flag', () => {
+  // Fail closed: an unrecognised shape that still reports an error must not be treated as success.
+  const odd = { type: 'chart', id: 'c1', error: new Error('boom') };
+  assert.throws(() => requireSuccessfulPush(odd, 'chart c1'), (err) => err.name === 'BuildHalt');
+});
+
+// Both spellings of the commit flag are read — `saved` first, the older bundle's `success` when `saved` is
+// absent — and pushFailed is the one place that decides it, for the halt and for the app-header reset.
+test('pushFailed reads saved, then the legacy success flag, then a bare error', () => {
+  const { pushFailed } = require(path.join(__dirname, '..', 'lib', 'entity-provision.js'));
+  assert.strictEqual(pushFailed({ success: false }), true, 'an older bundle reporting a failure with no error object');
+  assert.throws(() => requireSuccessfulPush({ type: 'app', id: 'a1', success: false }, 'app a1'), (err) => err.name === 'BuildHalt');
+  assert.strictEqual(pushFailed({ saved: true, success: false }), false, '`saved` wins when both are present');
+  assert.strictEqual(pushFailed({ saved: false }), true);
+  assert.strictEqual(pushFailed({ success: true, error: new Error('partial') }), false, 'a committed push with a note is not a failure');
+  assert.strictEqual(pushFailed({ error: new Error('boom') }), true);
+  assert.strictEqual(pushFailed({}), false);
+  assert.strictEqual(pushFailed(undefined), false);
 });
 
 // #447 regression net. The bug this fixes was a SINGLE label-emitting call that forgot to pass a
@@ -517,5 +1181,783 @@ test('EVERY label-emitting SDK call carries the resolved language code (#447)', 
   assert.deepStrictEqual(
     missing.map((c) => c.name), [],
     'these label-emitting calls did not carry the resolved LCID: ' + JSON.stringify(missing.map((c) => c.name))
+  );
+});
+
+// The SDK moved publishArtifact from THROWING to reporting by value, exactly as it did for
+// pushArtifact. Nothing in the engine read the result, so every publish failure vanished into a
+// build that reported ok:true -- and because those failures no longer throw, the transient-retry
+// path (429 / 503 / customization-lock, which is the everyday PublishXml failure in a real tenant)
+// became unreachable for them. These pin the reporting so it cannot silently regress again.
+test('a FAILED publish is reported, not swallowed', () => {
+  const warnings = [];
+  const result = { type: 'form', id: 'f1', shipped: false, publish: { kind: 'failed', error: new Error('PublishXml 503') } };
+  reportPartialPush(result, 'form Contact Main', (m) => warnings.push(m));
+  assert.strictEqual(warnings.length, 1, 'a failed publish must produce exactly one warning');
+  assert.match(warnings[0], /publish form Contact Main FAILED/);
+  assert.match(warnings[0], /PublishXml 503/, 'the underlying cause is named');
+  assert.match(warnings[0], /SAVED but/, 'it must say the write survived — this is not a lost edit');
+});
+
+test('an UNVERIFIABLE publish is reported as unproven rather than as success', () => {
+  const warnings = [];
+  reportPartialPush({ type: 'app', id: 'a1', shipped: false, publish: { kind: 'unverifiable', reason: 'projection not readable' } }, 'app Contoso', (m) => warnings.push(m));
+  assert.strictEqual(warnings.length, 1);
+  assert.match(warnings[0], /could not be CONFIRMED/);
+  assert.match(warnings[0], /projection not readable/);
+});
+
+test('a verified publish and a not-requested publish are both silent', () => {
+  const warnings = [];
+  reportPartialPush({ type: 'view', id: 'v1', shipped: true, publish: { kind: 'verified' } }, 'view V', (m) => warnings.push(m));
+  reportPartialPush({ type: 'view', id: 'v2', shipped: false, publish: { kind: 'notRequested' } }, 'view V2', (m) => warnings.push(m));
+  assert.deepStrictEqual(warnings, [], 'success and no-publish-requested must not warn');
+});
+
+// PushResult.warnings exists specifically so a partial success is not read as a clean one. The SDK's
+// own comment on the app path says a failed system-admin role assignment "must not fail app creation,
+// but it is reported so a create that produced an UNOPENABLE app is not read as a clean success".
+test('a push that COMMITTED but carries warnings surfaces them (an unopenable app is not a clean success)', () => {
+  const warnings = [];
+  const result = {
+    type: 'app', id: 'a2', saved: true, shipped: false, publish: { kind: 'notRequested' },
+    warnings: ['one or more components were not pinned', 'system administrator role could not be assigned'],
+  };
+  assert.strictEqual(requireSuccessfulPush(result, 'app Contoso', (m) => warnings.push(m)), result, 'it still passes — the write committed');
+  assert.strictEqual(warnings.length, 2, 'both warnings surface: ' + JSON.stringify(warnings));
+  assert.ok(warnings.every((w) => /^app Contoso: /.test(w)), 'each names the artifact');
+});
+
+test('a saved push whose publish failed is reported even though the push itself passes', () => {
+  // App CREATE publishes inside the SDK, so this arrives as saved:true + publish:failed with no
+  // top-level error — the shape the push guard alone would wave straight through.
+  const warnings = [];
+  const result = { type: 'app', id: 'a3', saved: true, shipped: false, publish: { kind: 'failed', error: new Error('saved, but publishing failed') } };
+  requireSuccessfulPush(result, 'app Contoso', (m) => warnings.push(m));
+  assert.ok(warnings.some((w) => /publish app Contoso FAILED/.test(w)), JSON.stringify(warnings));
+});
+
+test('requireSuccessfulPush distinguishes an already-exists collision from a version conflict', () => {
+  // Both are by-value failures, but the remedies are opposite: re-download for a concurrent edit, a
+  // fresh workspace for a create that committed unrecorded. Reporting one as the other sends the
+  // operator to re-download when nothing changed under them.
+  const err = new Error('a record already exists at that id');
+  err.code = 'ARTIFACT_ALREADY_EXISTS';
+  assert.throws(
+    () => requireSuccessfulPush({ type: 'view', id: 'v9', saved: false, error: err }, 'view V9'),
+    (e) => {
+      assert.strictEqual(e.name, 'BuildHalt');
+      assert.strictEqual(e.code, 'already-exists');
+      assert.match(e.message, /To reset it, stop any other build or teardown using the \.maker-workspace directory \(or the --workspace one\), then delete everything in it except last-applied\.json, destructive-approval\.json, web-resource-unconfirmed\.\*\.json \(the durable ids needed to recover unconfirmed web-resource writes\), dashboard-creation\.\*\.json \(the ids of the dashboards an interrupted build created before they joined the solution\) and the page-ownership\.\*\.json records \(the receipts and pending records of the pages the app created: nothing else can find them\), and re-run the build to adopt the existing row\./, 'the halt must name the step that clears it, keeping the baseline, the approval record and the page and resource records');
+      assert.match(e.message, /halts here again/, 'and say why a plain re-run does not');
+      assert.doesNotMatch(e.message, /re-download the app/);
+      assert.doesNotMatch(e.message, /adopt it \(fetchArtifact\)/, 'a plain fetch adopts nothing here — it must not be prescribed');
+      return true;
+    }
+  );
+});
+
+// The remedy above, FOLLOWED against the real bundle rather than asserted. A business process flow is
+// only the vehicle — the cheapest artifact to drive into the state with a fake server — and the state
+// is type-independent: the facade maps a create's 412 to ARTIFACT_ALREADY_EXISTS for every artifact,
+// and the workspace keeps a never-pushed local copy the same way for every artifact.
+// The fake models the measured `workflows` contract: a keyed create of an existing id → 412
+// `0x80040237`; a stale `If-Match` → 412 `0x80060882`; an echoed write carries the row version.
+test('REAL BUNDLE: the already-exists remedy works — the same workspace halts again, a fresh one adopts the row', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const { createMakerSdk, createNodeWorkspaceStorage } = require(path.join(__dirname, '..', 'vendor', 'cds-maker-sdk.cjs'));
+  const rows = new Map();
+  const wire = [];
+  const srv = { honourPrefer: false };
+  const tok = (r) => `W/"${r.version}"`;
+  const echo = (o) => srv.honourPrefer && /return=representation/i.test(String(((o && o.headers) || {}).Prefer || ''));
+  const idOf = (url) => { const m = /\/workflows\(([^)]+)\)/i.exec(String(url)); return m ? m[1].replace(/'/g, '').toLowerCase() : null; };
+  const rowBody = (id, r) => ({ workflowid: id, ...r.fields, statecode: r.statecode, statuscode: r.statuscode, '@odata.etag': tok(r) });
+  const http = {
+    get: async (url) => {
+      const id = idOf(url);
+      if (!id) return { status: 200, headers: {}, body: { value: [] } };
+      const r = rows.get(id);
+      if (!r) return { status: 404, headers: {}, body: { error: { code: '0x80040217', message: 'Does Not Exist' } } };
+      return { status: 200, headers: { etag: tok(r) }, body: rowBody(id, r) };
+    },
+    post: async (url, body, o) => {
+      const id = String(body.workflowid).toLowerCase();
+      wire.push(`POST ${id}`);
+      if (rows.has(id)) return { status: 412, headers: {}, body: { error: { code: '0x80040237', message: 'Cannot insert duplicate key.' } } };
+      rows.set(id, { fields: { ...body }, statecode: 0, statuscode: 1, version: 1 });
+      const r = rows.get(id);
+      return echo(o) ? { status: 201, headers: {}, body: rowBody(id, r) } : { status: 204, headers: {}, body: undefined };
+    },
+    patch: async (url, body, o) => {
+      const id = idOf(url); const r = rows.get(id);
+      const ifMatch = ((o && o.headers) || {})['If-Match'];
+      wire.push(`PATCH ${id} If-Match=${ifMatch || '-'}`);
+      if (!r) return { status: 404, headers: {}, body: {} };
+      if (ifMatch && ifMatch !== tok(r)) return { status: 412, headers: {}, body: { error: { code: '0x80060882', message: 'The version of the existing record doesn\'t match the RowVersion property provided.' } } };
+      const { statecode, statuscode, ...rest } = body;
+      if (statecode !== undefined) r.statecode = statecode;
+      if (statuscode !== undefined) r.statuscode = statuscode;
+      Object.assign(r.fields, rest);
+      r.version += 1;
+      return echo(o) ? { status: 200, headers: { etag: tok(r) }, body: rowBody(id, r) } : { status: 204, headers: {}, body: undefined };
+    },
+    put: async () => ({ status: 204, headers: {}, body: {} }),
+    delete: async () => ({ status: 204, headers: {}, body: {} }),
+  };
+  const dirs = [];
+  const sdkOn = async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'already-exists-'));
+    dirs.push(dir);
+    const sdk = createMakerSdk({ workspaceStorage: createNodeWorkspaceStorage(dir), instanceUrl: 'https://contoso.crm.dynamics.com', httpClient: http });
+    await sdk.initWorkspace();
+    return sdk;
+  };
+  try {
+    // 1. A create that commits while the workspace never records it. An environment that ignores
+    //    `Prefer` gets there deterministically; a lost response to a committed POST does the same.
+    const first = await sdkOn();
+    const def = { name: 'Ticket Handling', entityLogicalName: 'new_ticket', status: 'Draft',
+      stages: [{ name: 'Triage', entityLogicalName: 'new_ticket', steps: [{ name: 'Subject', fieldName: 'new_subject' }] }] };
+    const art = await first.createArtifact('bpf', def);
+    await assert.rejects(() => first.pushArtifact('bpf', art.id), (e) => e.code === 'BPF_CREATE_NO_TOKEN');
+    assert.ok(rows.has(art.id.toLowerCase()), 'precondition: the row committed');
+    srv.honourPrefer = true; // from here on, an ordinary org
+    // 2. A re-run on the SAME workspace — the build's existing-artifact path is a plain fetch.
+    await first.fetchArtifact('bpf', art.id);
+    const again = await first.pushArtifact('bpf', art.id);
+    assert.throws(() => requireSuccessfulPush(again, 'business process flow Ticket Handling'),
+      (e) => e.code === 'already-exists' && /\.maker-workspace/.test(e.message),
+      'a re-run on the same workspace must halt again, which is why the halt does not say "re-run"');
+    // 3. The remedy: a fresh workspace, then the same plain fetch.
+    wire.length = 0;
+    const fresh = await sdkOn();
+    await fresh.fetchArtifact('bpf', art.id);
+    await fresh.updateElement('bpf', art.id, '/stages/0', { name: 'Triage (renamed)' });
+    const adopted = requireSuccessfulPush(await fresh.pushArtifact('bpf', art.id), 'business process flow Ticket Handling');
+    assert.ok(adopted && adopted.saved, 'the push after a fresh fetch must commit');
+    assert.ok(!wire.some((w) => w.startsWith('POST')), `no create may be re-issued; wire was ${JSON.stringify(wire)}`);
+    assert.ok(wire.some((w) => /^PATCH .* If-Match=W\/"\d+"$/.test(w)), `the push must be a CONDITIONAL update; wire was ${JSON.stringify(wire)}`);
+    assert.match(String(rows.get(art.id.toLowerCase()).fields.xaml || ''), /Triage \(renamed\)/, 'the edit must land');
+  } finally {
+    for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+// The set of by-value push failures is OPEN and it grows: the SDK keeps moving failures from a throw
+// to a return. Every newly-returned one used to land on the "changed in Maker" wording, which named
+// a cause that could not possibly apply and sent the operator to re-download an untouched app.
+test('requireSuccessfulPush reports an UNRECOGNISED SDK code verbatim, and propagates the code', () => {
+  const err = new Error("Business-rule authoring (preview) is not enabled on this environment yet: it does not expose 'Microsoft.Dynamics.CRM.CreateProcessWithWfomJson'.");
+  err.code = 'BUSINESS_RULE_API_UNAVAILABLE';
+  assert.throws(
+    () => requireSuccessfulPush({ type: 'businessRule', id: 'br1', saved: false, error: err }, 'business rule R'),
+    (e) => {
+      assert.strictEqual(e.name, 'BuildHalt');
+      // The code is propagated so a phase-level `skipIf` can still match on it after the wrap.
+      assert.strictEqual(e.code, 'BUSINESS_RULE_API_UNAVAILABLE', `got ${e.code}`);
+      assert.strictEqual(e.cause, err, 'the SdkError must remain reachable as the cause');
+      assert.match(e.message, /not enabled on this environment/, 'the SDK\'s own diagnosis is what the operator needs');
+      assert.doesNotMatch(e.message, /changed in Maker since it was fetched/,
+        'a cause the SDK named must not be overwritten with a guess');
+      return true;
+    }
+  );
+});
+
+test('errorCodeChain reads codes through the cause chain, and cannot spin on a cycle', () => {
+  // `skipIf` predicates are handed whatever reached the runner. A failure the SDK reports BY VALUE
+  // arrives wrapped in a BuildHalt, so the SDK's own code is one level down; reading only the top
+  // level silently misses it.
+  const inner = Object.assign(new Error('inner'), { code: 'SDK_CODE' });
+  const outer = new BuildHalt('outer', { code: 'push-failed', cause: inner });
+  assert.deepStrictEqual(errorCodeChain(outer), ['push-failed', 'SDK_CODE']);
+  assert.deepStrictEqual(errorCodeChain(inner), ['SDK_CODE']);
+  assert.deepStrictEqual(errorCodeChain(new Error('no code')), []);
+  assert.deepStrictEqual(errorCodeChain(null), []);
+  assert.deepStrictEqual(errorCodeChain(undefined), []);
+
+  // A self-referential cause is not hypothetical — it happens when an error is re-wrapped with
+  // itself — and an unbounded walk would hang the build rather than fail it.
+  const loop = Object.assign(new Error('loop'), { code: 'A' });
+  loop.cause = loop;
+  assert.deepStrictEqual(errorCodeChain(loop), ['A']);
+
+  // Depth is bounded even for a long, non-cyclic chain.
+  let deep = Object.assign(new Error('d0'), { code: 'C0' });
+  for (let i = 1; i < 10; i += 1) deep = Object.assign(new Error(`d${i}`), { code: `C${i}`, cause: deep });
+  assert.strictEqual(errorCodeChain(deep).length, 5, 'the walk stops at maxDepth');
+});
+
+// #455 wiring: the CLI resolves the authoring LCID BEFORE constructing the SDK (because
+// MakerSdkOptions.languageCode is a construction-time option) and then hands the SAME value to the
+// data-model phase. Two things must hold, and neither is covered by testing resolveLanguageCode
+// alone: the pre-resolved value must be USED, and it must NOT be re-resolved.
+//
+// Re-resolution is not merely wasteful — the data-model phase would repeat the org read and the
+// provisioned-languages probe, and any disagreement would label columns in one language while the
+// SDK stamps FormXML and sitemap titles in another.
+test('a pre-resolved authoring language is used verbatim by the data-model phase', async () => {
+  const spec = {
+    solution: { uniqueName: 'S', publisherPrefix: 'cr' },
+    entities: [{ schemaName: 'cr_t', displayName: 'T', pluralName: 'Ts', primaryAttribute: { schemaName: 'cr_name' }, columns: [{ schemaName: 'cr_note', displayName: 'Note', type: 'text' }] }],
+    relationships: [],
+  };
+  const seen = [];
+  let orgReads = 0;
+  let probes = 0;
+  const sdk = {
+    createTable: async (o) => { seen.push(['createTable', o]); return { logicalName: 'cr_t', metadataId: 't' }; },
+    createColumn: async (l, o) => { seen.push(['createColumn', o]); return { logicalName: (o.schemaName || '').toLowerCase(), metadataId: 'c' }; },
+  };
+  const provision = {
+    queryRecords: async (set) => { if (set === 'organization') { orgReads += 1; return [{ languagecode: 1033 }]; } return []; },
+    findTables: async () => [], findColumns: async () => [], fetchEntityMetadata: async () => ({}),
+  };
+  const runner = makeRunner({ emit: () => {}, total: 10 });
+
+  await provisionDataModel({
+    sdk, provision, runner, spec, apply: true,
+    preResolvedLanguageCode: 3082,
+    // Deliberately CONTRADICTORY inputs: if the pre-resolved value is honoured, neither of these is
+    // consulted. If it is ignored, the explicit 1031 would win and the probe would fire.
+    languageCode: 1031,
+    provisionedLanguages: async () => { probes += 1; return [1031, 1033]; },
+  });
+
+  const withLang = seen.filter(([, o]) => o && o.languageCode !== undefined);
+  assert.ok(withLang.length > 0, 'at least one label-bearing write happened');
+  for (const [what, o] of withLang) {
+    assert.strictEqual(o.languageCode, 3082, `${what} must use the pre-resolved LCID, not re-resolve one`);
+  }
+  assert.strictEqual(orgReads, 0, 'the org language must NOT be read again once it is already resolved');
+  assert.strictEqual(probes, 0, 'the provisioned-languages probe must NOT fire again');
+});
+
+test('without a pre-resolved language the data-model phase still resolves one itself', async () => {
+  // The self-resolving path is not dead code: provision-entities.js and every existing unit test
+  // reach provisionDataModel without a pre-resolved value, so removing it would break them.
+  const spec = {
+    solution: { uniqueName: 'S', publisherPrefix: 'cr' },
+    entities: [{ schemaName: 'cr_t', displayName: 'T', pluralName: 'Ts', primaryAttribute: { schemaName: 'cr_name' }, columns: [] }],
+    relationships: [],
+  };
+  const seen = [];
+  const sdk = {
+    createTable: async (o) => { seen.push(o); return { logicalName: 'cr_t', metadataId: 't' }; },
+    createColumn: async (l, o) => { seen.push(o); return { logicalName: 'x', metadataId: 'c' }; },
+  };
+  const provision = {
+    queryRecords: async (set) => (set === 'organization' ? [{ languagecode: 1031 }] : []),
+    findTables: async () => [], findColumns: async () => [], fetchEntityMetadata: async () => ({}),
+  };
+  await provisionDataModel({ sdk, provision, runner: makeRunner({ emit: () => {}, total: 10 }), spec, apply: true });
+  const withLang = seen.filter((o) => o && o.languageCode !== undefined);
+  assert.ok(withLang.length > 0 && withLang.every((o) => o.languageCode === 1031),
+    'the org base language is still resolved when nothing was pre-resolved');
+});
+
+test('requireSuccessfulPush keeps the re-download remedy for the SDK\u0027s own VERSION_CONFLICT code', () => {
+  // The regression this pins: the "report an unrecognised code verbatim" branch swallowed the 412
+  // remedy, because the REAL bundle attaches `code: "VERSION_CONFLICT"` to a version conflict while
+  // every fixture here used a code-less error. So the guard still halted, but the one instruction
+  // the operator needs — re-download, never overwrite a concurrent edit — silently disappeared.
+  const err = Object.assign(new Error('Version conflict'), { code: 'VERSION_CONFLICT' });
+  assert.throws(
+    () => requireSuccessfulPush({ type: 'form', id: 'f1', saved: false, error: err }, 'form F'),
+    (e) => {
+      assert.strictEqual(e.name, 'BuildHalt');
+      assert.strictEqual(e.code, 'version-conflict', `got ${e.code}`);
+      assert.match(e.message, /re-download the app and rebuild/, 'the remedy must survive');
+      return true;
+    }
+  );
+});
+
+
+// ── AB#6686428: the relationship existence probe must not fall back to the POISONING broad read ──
+// `fetchEntityMetadata` -> `createRelationship` is one of the three broad-read -> create pairs that
+// makes Dataverse keep only the base-language label. The narrow probe exists to avoid it; an
+// inconclusive narrow probe falling through to the broad read silently reintroduces the bug, and
+// invisibly, because the create's request body is byte-identical either way.
+const relSpec = (lookupDisplayName) => ({
+  solution: { uniqueName: 'S', publisherPrefix: 'new' },
+  entities: [],
+  relationships: [{ type: 'OneToMany', referenced: 'new_a', referencing: 'new_b', lookup: { schemaName: 'new_aid', displayName: lookupDisplayName } }],
+});
+// A raw client whose narrow probe is INCONCLUSIVE (a transient 5xx), which is the trigger.
+const inconclusiveRaw = () => ({ get: async () => ({ status: 503, headers: {}, body: {} }) });
+
+test('AB#6686428: an inconclusive probe for a LOCALIZED lookup label skips the broad metadata read', async () => {
+  const m = mockSdk();
+  const broadReads = [];
+  m.provision.dataverse = inconclusiveRaw();
+  m.provision.fetchEntityMetadata = async (l) => { broadReads.push(l); return { logicalName: l, entitySetName: l + 's', relationships: [] }; };
+  const runner = makeRunner({ emit: () => {}, total: 4 });
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec: relSpec({ 1033: 'Account', 3082: 'Cuenta' }), apply: true });
+
+  assert.deepStrictEqual(broadReads, [],
+    'the broad read must NOT run for a localized label -- it is what strips every non-base language');
+  assert.ok(m.calls.some((c) => c[0] === 'createRelationship'),
+    'and the relationship is still created: "could not tell" is treated as absent, as it always was');
+});
+
+test('AB#6686428: a PLAIN lookup label keeps the broad-read fallback unchanged', async () => {
+  // The narrowing must not cost the existence check for the common case. Nothing is at risk there:
+  // a plain string has one label, so the broad read cannot strip anything.
+  const m = mockSdk();
+  const broadReads = [];
+  m.provision.dataverse = inconclusiveRaw();
+  m.provision.fetchEntityMetadata = async (l) => { broadReads.push(l); return { logicalName: l, entitySetName: l + 's', relationships: [] }; };
+  const runner = makeRunner({ emit: () => {}, total: 4 });
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec: relSpec('Account'), apply: true });
+
+  assert.deepStrictEqual(broadReads, ['new_a'], 'the fallback still runs when no label can be poisoned');
+});
+
+const { isTransientHalt } = require(path.join(__dirname, '..', 'build-model-app.js'));
+
+function collisionSpec(relationships) {
+  return {
+    solution: { uniqueName: 'S', publisherPrefix: 'contoso' },
+    entities: [
+      { schemaName: 'contoso_project', displayName: 'Project', primaryAttribute: { schemaName: 'contoso_name' }, columns: [] },
+      { schemaName: 'contoso_task', displayName: 'Task', primaryAttribute: { schemaName: 'contoso_name' }, columns: [] },
+    ],
+    relationships,
+  };
+}
+
+function metadataClient(handler) {
+  const paths = [];
+  return {
+    paths,
+    get: async (p) => {
+      paths.push(p);
+      return handler(p);
+    },
+  };
+}
+
+const ONE_TO_MANY = { type: 'OneToMany', referenced: 'contoso_project', referencing: 'contoso_task', lookup: { schemaName: 'contoso_ProjectId', displayName: 'Project' } };
+const MANY_TO_MANY = { type: 'ManyToMany', entity1: 'contoso_project', entity2: 'contoso_task' };
+
+function alreadyExists(statusCode) {
+  const err = new Error('Relationship with the same name already exists');
+  if (statusCode) err.statusCode = statusCode;
+  throw err;
+}
+
+function holderBody() {
+  return {
+    SchemaName: 'contoso_project_contoso_task',
+    ReferencedEntity: 'contoso_project',
+    ReferencingEntity: 'contoso_task',
+    ReferencingAttribute: 'contoso_projectid',
+  };
+}
+
+test('createRelationship already-exists with the same holder skips (exists)', async () => {
+  const m = mockSdk();
+  m.sdk.createRelationship = async () => alreadyExists(409);
+  m.provision.dataverse = metadataClient((p) => {
+    if (p.includes('RelationshipType')) return { status: 200, body: { RelationshipType: 'OneToManyRelationship', SchemaName: 'contoso_project_contoso_task' } };
+    if (p.includes('OneToManyRelationshipMetadata')) return { status: 200, body: holderBody() };
+    return { status: 200, body: { value: [] } };
+  });
+  const events = [];
+  const runner = makeRunner({ emit: (e) => events.push(e), total: 8 });
+  const dm = await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([ONE_TO_MANY]), apply: true });
+  const skip = events.find((e) => e.status === 'skip' && /relationship/.test(e.label));
+  assert.ok(skip, JSON.stringify(events));
+  assert.match(skip.label, /\(exists\)/);
+  assert.strictEqual(dm.relationships.length, 0);
+  assert.ok(m.provision.dataverse.paths.some((p) => p.includes('/RelationshipDefinitions(')),
+    'the same-holder skip must be decided by identifying the holder, not by the name collision alone');
+});
+
+test('an N:N whose name is held by a 1:N halts and names both', async () => {
+  const m = mockSdk();
+  m.sdk.createRelationship = async () => alreadyExists(400);
+  m.provision.dataverse = metadataClient((p) => {
+    if (p.includes('RelationshipType')) return { status: 200, body: { RelationshipType: 'OneToManyRelationship', SchemaName: 'contoso_project_contoso_task' } };
+    if (p.includes('OneToManyRelationshipMetadata')) return { status: 200, body: holderBody() };
+    return { status: 200, body: { value: [] } };
+  });
+  const runner = makeRunner({ emit: () => {}, total: 8 });
+  await assert.rejects(
+    () => provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([MANY_TO_MANY]), apply: true }),
+    (e) => {
+      assert.strictEqual(e.name, 'BuildHalt');
+      assert.strictEqual(e.cause && e.cause.transient, false);
+      assert.strictEqual(isTransientHalt(e), false);
+      assert.match(e.message, /1:N contoso_project -> contoso_task \(lookup contoso_projectid\)/);
+      assert.match(e.message, /N:N contoso_project <-> contoso_task/);
+      assert.match(e.message, /schemaName/);
+      return true;
+    },
+  );
+});
+
+test('a case-sensitive 404 falls back and skips when the other casing is the same relationship', async () => {
+  const m = mockSdk();
+  m.sdk.createRelationship = async () => alreadyExists(409);
+  m.provision.dataverse = metadataClient((p) => {
+    if (p.startsWith('/RelationshipDefinitions(')) {
+      return { status: 404, body: { error: { message: "RelationshipMetadataBase With Id = SchemaName='contoso_project_contoso_task' does not exist." } } };
+    }
+    if (p.includes("/EntityDefinitions(LogicalName='contoso_task')/ManyToOneRelationships")) {
+      return { status: 200, body: { value: [{ SchemaName: 'Contoso_Project_Contoso_Task', ReferencedEntity: 'contoso_project', ReferencingAttribute: 'contoso_projectid' }] } };
+    }
+    return { status: 200, body: { value: [] } };
+  });
+  const events = [];
+  const runner = makeRunner({ emit: (e) => events.push(e), total: 8 });
+  await provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([ONE_TO_MANY]), apply: true });
+  assert.ok(events.some((e) => e.status === 'skip' && /\(exists\)/.test(e.label)), JSON.stringify(events));
+  assert.ok(m.provision.dataverse.paths.some((p) => p.includes("/EntityDefinitions(LogicalName='contoso_task')/ManyToOneRelationships")),
+    'a case-sensitive 404 on the exact name must fall back to the candidate collections');
+});
+
+test('an unidentifiable already-exists holder halts rather than skipping', async () => {
+  const m = mockSdk();
+  m.sdk.createRelationship = async () => alreadyExists(409);
+  m.provision.dataverse = metadataClient(() => ({ status: 404, body: { error: { message: 'does not exist' } } }));
+  const runner = makeRunner({ emit: () => {}, total: 8 });
+  await assert.rejects(
+    () => provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([ONE_TO_MANY]), apply: true, sleep: async () => {} }),
+    (e) => {
+      assert.match(e.message, /could not identify/);
+      assert.strictEqual(e.cause && e.cause.transient, false);
+      assert.strictEqual(isTransientHalt(e), false);
+      return true;
+    },
+  );
+});
+
+test('a 429 while identifying an already-exists holder stays transient', async () => {
+  const m = mockSdk();
+  m.sdk.createRelationship = async () => alreadyExists(409);
+  m.provision.dataverse = metadataClient((p) => (
+    p.startsWith('/RelationshipDefinitions(')
+      ? { status: 429, body: { error: { message: 'try again later' } } }
+      : { status: 200, body: { value: [] } }
+  ));
+  const runner = makeRunner({ emit: () => {}, total: 8 });
+  await assert.rejects(
+    () => provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([ONE_TO_MANY]), apply: true }),
+    (e) => {
+      assert.strictEqual(isTransientHalt(e), true);
+      assert.strictEqual(e.cause && e.cause.statusCode, 429);
+      assert.match(e.message, /already exists/);
+      return true;
+    },
+  );
+});
+
+// The read that would identify the holder is the engine's own request (lib/relationship-metadata.js), and the halt around it is the engine's error, which carries the OData error of that
+// answer (serviceFailure's `answered`): a condition the service names by its code is run again on any status, as when the SDK reads the answer; another code on a status that says no is final.
+test('a condition the service names by its code, while identifying an already-exists holder, is run again on any status — another code is final, whatever the words', async () => {
+  for (const [what, status, error, transient] of [
+    ['SQL giving up waiting (500, 0x80044151)', 500, { code: '0x80044151', message: 'SQL timeout expired.' }, true],
+    ['a customization lock (409, 0x8004F064)', 409, { code: '0x8004F064', message: 'Cannot start the requested operation [Update] because there is another [EntityCustomization] running at this moment.' }, true],
+    ['a 500 under another code, whose words name a timeout', 500, { code: '0x80040216', message: 'SQL timeout expired. Please try again later.' }, false],
+  ]) {
+    const m = mockSdk();
+    m.sdk.createRelationship = async () => alreadyExists(409);
+    m.provision.dataverse = metadataClient((p) => (p.startsWith('/RelationshipDefinitions(') ? { status, body: { error } } : { status: 200, body: { value: [] } }));
+    const runner = makeRunner({ emit: () => {}, total: 8 });
+    await assert.rejects(
+      () => provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([ONE_TO_MANY]), apply: true }),
+      (e) => {
+        assert.match(e.message, /could not identify/, what);
+        assert.strictEqual(isTransientHalt(e), transient, what);
+        return true;
+      },
+    );
+  }
+});
+
+test('a same-type probe that finds the name on different endpoints halts before create', async () => {
+  const m = mockSdk();
+  let created = 0;
+  m.sdk.createRelationship = async () => { created += 1; return { schemaName: 'x' }; };
+  m.provision.dataverse = metadataClient((p) => {
+    if (p.includes("/EntityDefinitions(LogicalName='contoso_project')/OneToManyRelationships")) {
+      return { status: 200, body: { value: [{ SchemaName: 'contoso_project_contoso_task', ReferencingEntity: 'contoso_task', ReferencingAttribute: 'contoso_ownerid' }] } };
+    }
+    return { status: 200, body: { value: [] } };
+  });
+  const runner = makeRunner({ emit: () => {}, total: 8 });
+  await assert.rejects(
+    () => provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([ONE_TO_MANY]), apply: true }),
+    (e) => {
+      assert.match(e.message, /already used by 1:N contoso_project -> contoso_task \(lookup contoso_ownerid\)/);
+      // A name held by another relationship is the spec's to fix: a run again finds it held, so the halt is never run again (halt-retry-policy.test.js holds its table row).
+      assert.strictEqual(e.code, 'relationship-name-taken');
+      assert.strictEqual(isTransientHalt(e), false);
+      return true;
+    },
+  );
+  assert.strictEqual(created, 0, 'a name held by a different lookup must not be created under that name');
+});
+
+test('the fetchEntityMetadata fallback does not treat a 1:N row as an existing N:N', async () => {
+  const m = mockSdk();
+  let created = 0;
+  m.sdk.createRelationship = async () => { created += 1; return { schemaName: 'contoso_project_contoso_task', metadataId: 'r' }; };
+  m.provision.fetchEntityMetadata = async () => ({
+    relationships: [{ schemaName: 'contoso_project_contoso_task', type: 'OneToMany', relatedEntity: 'contoso_task', relatedAttribute: 'contoso_projectid' }],
+  });
+  const runner = makeRunner({ emit: () => {}, total: 8 });
+  await assert.rejects(
+    () => provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([MANY_TO_MANY]), apply: true }),
+    /already used by 1:N contoso_project -> contoso_task \(lookup contoso_projectid\)/,
+  );
+  assert.strictEqual(created, 0);
+});
+
+test('an already-exists name that appears on the second holder read is skipped when it is the same relationship', async () => {
+  const m = mockSdk();
+  m.sdk.createRelationship = async () => alreadyExists(409);
+  let exact = 0;
+  const sleeps = [];
+  m.provision.dataverse = metadataClient((p) => {
+    if (p.startsWith('/RelationshipDefinitions(')) {
+      exact += 1;
+      if (exact < 2) return { status: 404, body: { error: { message: "RelationshipMetadataBase With Id = SchemaName='contoso_project_contoso_task' does not exist." } } };
+      if (p.includes('RelationshipType')) return { status: 200, body: { RelationshipType: 'OneToManyRelationship', SchemaName: 'contoso_project_contoso_task' } };
+      if (p.includes('OneToManyRelationshipMetadata')) return { status: 200, body: holderBody() };
+    }
+    return { status: 200, body: { value: [] } };
+  });
+  const events = [];
+  const runner = makeRunner({ emit: (e) => events.push(e), total: 8 });
+  await provisionDataModel({
+    sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([ONE_TO_MANY]), apply: true,
+    sleep: async (ms) => { sleeps.push(ms); },
+  });
+  assert.deepStrictEqual(sleeps, [2000], 'the lag retry waits once, then the holder is visible');
+  assert.strictEqual(exact, 3, 'a 404, then the base read and its cast once the holder is visible');
+  assert.ok(events.some((e) => e.status === 'skip' && /\(exists\)/.test(e.label)), JSON.stringify(events));
+});
+
+test('an already-exists name that appears on a later read as a different relationship halts naming it', async () => {
+  const m = mockSdk();
+  m.sdk.createRelationship = async () => alreadyExists(409);
+  let exact = 0;
+  const sleeps = [];
+  m.provision.dataverse = metadataClient((p) => {
+    if (p.startsWith('/RelationshipDefinitions(')) {
+      exact += 1;
+      if (exact < 2) return { status: 404, body: { error: { message: 'does not exist' } } };
+      if (p.includes('RelationshipType')) return { status: 200, body: { RelationshipType: 'OneToManyRelationship', SchemaName: 'contoso_project_contoso_task' } };
+      if (p.includes('OneToManyRelationshipMetadata')) {
+        return { status: 200, body: { ...holderBody(), ReferencingAttribute: 'contoso_ownerid' } };
+      }
+    }
+    return { status: 200, body: { value: [] } };
+  });
+  const runner = makeRunner({ emit: () => {}, total: 8 });
+  await assert.rejects(
+    () => provisionDataModel({
+      sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([ONE_TO_MANY]), apply: true,
+      sleep: async (ms) => { sleeps.push(ms); },
+    }),
+    (e) => {
+      assert.match(e.message, /already used by 1:N contoso_project -> contoso_task \(lookup contoso_ownerid\)/);
+      assert.strictEqual(e.cause && e.cause.transient, false);
+      assert.strictEqual(isTransientHalt(e), false);
+      return true;
+    },
+  );
+  assert.deepStrictEqual(sleeps, [2000]);
+  assert.strictEqual(exact, 3, 'a 404, then the base read and its cast');
+});
+
+test('an already-exists name that never appears halts after two lag re-reads', async () => {
+  const m = mockSdk();
+  m.sdk.createRelationship = async () => alreadyExists(409);
+  let exact = 0;
+  const sleeps = [];
+  m.provision.dataverse = metadataClient((p) => {
+    if (p.startsWith('/RelationshipDefinitions(')) {
+      exact += 1;
+      return { status: 404, body: { error: { message: "RelationshipMetadataBase With Id = SchemaName='contoso_project_contoso_task' does not exist." } } };
+    }
+    return { status: 200, body: { value: [] } };
+  });
+  const runner = makeRunner({ emit: () => {}, total: 8 });
+  await assert.rejects(
+    () => provisionDataModel({
+      sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([ONE_TO_MANY]), apply: true,
+      sleep: async (ms) => { sleeps.push(ms); },
+    }),
+    /could not identify/,
+  );
+  assert.deepStrictEqual(sleeps, [2000, 4000]);
+  assert.strictEqual(exact, 3, 'initial read plus two lag re-reads, then halt');
+});
+
+test('a lookup that already belongs to another relationship halts with the deployed name', async () => {
+  const m = mockSdk();
+  m.sdk.createRelationship = async () => alreadyExists(409);
+  const sleeps = [];
+  m.provision.dataverse = metadataClient((p) => {
+    if (p.startsWith('/RelationshipDefinitions(')) return { status: 404, body: { error: { message: 'does not exist' } } };
+    if (p.includes("/EntityDefinitions(LogicalName='contoso_task')/ManyToOneRelationships")) {
+      return { status: 200, body: { value: [{ SchemaName: 'legacy_ProjectTask', ReferencedEntity: 'contoso_project', ReferencingAttribute: 'contoso_projectid' }] } };
+    }
+    return { status: 200, body: { value: [] } };
+  });
+  const runner = makeRunner({ emit: () => {}, total: 8 });
+  await assert.rejects(
+    () => provisionDataModel({
+      sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([ONE_TO_MANY]), apply: true,
+      sleep: async (ms) => { sleeps.push(ms); },
+    }),
+    (e) => {
+      assert.match(e.message, /lookup 'contoso_projectid' on 'contoso_task' already belongs to relationship 'legacy_ProjectTask'/);
+      assert.match(e.message, /1:N contoso_project -> contoso_task/);
+      assert.match(e.message, /relationships\[0\]\.schemaName to 'legacy_ProjectTask'/);
+      assert.strictEqual(e.cause && e.cause.transient, false);
+      assert.strictEqual(isTransientHalt(e), false);
+      return true;
+    },
+  );
+  assert.deepStrictEqual(sleeps, [], 'a known lookup owner is not a lag retry');
+});
+
+const { describeRelationship } = require(path.join(__dirname, '..', 'lib', 'relationship-metadata.js'));
+
+test('the metadata projection of a self-reference is the OneToMany row, not the parent key', async () => {
+  const declared = {
+    type: 'OneToMany',
+    referenced: 'contoso_item',
+    referencing: 'contoso_item',
+    lookup: { schemaName: 'contoso_ParentId' },
+  };
+  const provision = {
+    fetchEntityMetadata: async () => ({
+      relationships: [
+        { schemaName: 'contoso_item_contoso_item', type: 'ManyToOne', relatedEntity: 'contoso_item', relatedAttribute: 'contoso_itemid' },
+        { schemaName: 'contoso_item_contoso_item', type: 'OneToMany', relatedEntity: 'contoso_item', relatedAttribute: 'contoso_parentid' },
+      ],
+    }),
+  };
+  const exists = await relationshipExists(provision, 'contoso_item', 'contoso_item_contoso_item', 'OneToMany', { declared });
+  assert.strictEqual(exists, true, 'the ManyToOne relatedAttribute is the parent key, not a conflicting lookup');
+});
+
+test('a 1:N probed from its parent matches the OneToMany projection', async () => {
+  const declared = {
+    type: 'OneToMany',
+    referenced: 'contoso_project',
+    referencing: 'contoso_task',
+    lookup: { schemaName: 'contoso_ProjectId' },
+  };
+  const provision = {
+    fetchEntityMetadata: async () => ({
+      relationships: [
+        { schemaName: 'contoso_project_contoso_task', type: 'OneToMany', relatedEntity: 'contoso_task', relatedAttribute: 'contoso_projectid' },
+      ],
+    }),
+  };
+  assert.strictEqual(
+    await relationshipExists(provision, 'contoso_project', 'contoso_project_contoso_task', 'OneToMany', { declared }),
+    true,
+  );
+});
+
+test('reversed projection ends are a conflict, not the same relationship', async () => {
+  const declared = {
+    type: 'OneToMany',
+    referenced: 'contoso_project',
+    referencing: 'contoso_task',
+    lookup: { schemaName: 'contoso_ProjectId' },
+  };
+  const provision = {
+    fetchEntityMetadata: async () => ({
+      relationships: [
+        { schemaName: 'contoso_project_contoso_task', type: 'OneToMany', relatedEntity: 'contoso_other', relatedAttribute: 'contoso_projectid' },
+      ],
+    }),
+  };
+  const exists = await relationshipExists(provision, 'contoso_project', 'contoso_project_contoso_task', 'OneToMany', { declared });
+  assert.strictEqual(exists && exists.mismatch, true);
+  assert.match(describeRelationship(exists.holder), /contoso_other/);
+});
+
+test('a ManyToOne-only projection cannot match a 1:N whose lookup it does not carry', async () => {
+  // Vendored fetchEntityMetadata shape: ManyToOne relatedAttribute is the parent key.
+  // Two self-references can share a derived name and differ only by lookup. Matching here
+  // skipped the CREATE.
+  const declared = {
+    type: 'OneToMany',
+    schemaName: 'contoso_item_contoso_item',
+    referenced: 'contoso_item',
+    referencing: 'contoso_item',
+    lookup: { schemaName: 'contoso_OwnerId' },
+  };
+  const provision = {
+    fetchEntityMetadata: async () => ({
+      relationships: [
+        { schemaName: 'contoso_item_contoso_item', type: 'ManyToOne', relatedEntity: 'contoso_item', relatedAttribute: 'contoso_itemid' },
+      ],
+    }),
+  };
+  const exists = await relationshipExists(provision, 'contoso_item', 'contoso_item_contoso_item', 'OneToMany', { declared });
+  assert.strictEqual(exists, null, 'lookup unknown is inconclusive, not a match');
+});
+
+test('a lookup owner that is the declared relationship is skipped, not halted', async () => {
+  const m = mockSdk();
+  m.sdk.createRelationship = async () => alreadyExists(409);
+  let taskManyToOne = 0;
+  m.provision.dataverse = metadataClient((p) => {
+    if (p.startsWith('/RelationshipDefinitions(')) return { status: 404, body: { error: { message: 'does not exist' } } };
+    if (p.includes("/EntityDefinitions(LogicalName='contoso_task')/ManyToOneRelationships")) {
+      taskManyToOne += 1;
+      if (taskManyToOne < 2) return { status: 200, body: { value: [] } };
+      return { status: 200, body: { value: [{ SchemaName: 'contoso_project_contoso_task', ReferencedEntity: 'contoso_project', ReferencingAttribute: 'contoso_projectid' }] } };
+    }
+    return { status: 200, body: { value: [] } };
+  });
+  const events = [];
+  const runner = makeRunner({ emit: (e) => events.push(e), total: 8 });
+  await provisionDataModel({
+    sdk: m.sdk, provision: m.provision, runner, spec: collisionSpec([ONE_TO_MANY]), apply: true,
+    sleep: async () => { throw new Error('a matching owner is not a lag retry'); },
+  });
+  assert.ok(events.some((e) => e.status === 'skip' && /\(exists\)/.test(e.label)), JSON.stringify(events));
+  assert.ok(!events.some((e) => e.status === 'error'));
+});
+
+test('a self-referencing lookup owned under another name halts with the remedy', async () => {
+  const self = { type: 'OneToMany', referenced: 'contoso_item', referencing: 'contoso_item', lookup: { schemaName: 'contoso_ParentId', displayName: 'Parent' } };
+  const spec = {
+    solution: { uniqueName: 'S', publisherPrefix: 'contoso' },
+    entities: [{ schemaName: 'contoso_item', displayName: 'Item', primaryAttribute: { schemaName: 'contoso_name' }, columns: [] }],
+    relationships: [self],
+  };
+  const m = mockSdk();
+  m.sdk.createRelationship = async () => alreadyExists(409);
+  m.provision.dataverse = metadataClient((p) => {
+    if (p.startsWith('/RelationshipDefinitions(')) return { status: 404, body: { error: { message: 'does not exist' } } };
+    if (p.includes("/EntityDefinitions(LogicalName='contoso_item')/ManyToOneRelationships")) {
+      return { status: 200, body: { value: [{ SchemaName: 'legacy_ItemParent', ReferencedEntity: 'contoso_item', ReferencingAttribute: 'contoso_parentid' }] } };
+    }
+    return { status: 200, body: { value: [] } };
+  });
+  const runner = makeRunner({ emit: () => {}, total: 8 });
+  await assert.rejects(
+    () => provisionDataModel({ sdk: m.sdk, provision: m.provision, runner, spec, apply: true, sleep: async () => {} }),
+    (e) => {
+      assert.match(e.message, /lookup 'contoso_parentid' on 'contoso_item' already belongs to relationship 'legacy_ItemParent'/);
+      assert.match(e.message, /relationships\[0\]\.schemaName to 'legacy_ItemParent'/);
+      assert.strictEqual(e.cause && e.cause.transient, false);
+      return true;
+    },
   );
 });

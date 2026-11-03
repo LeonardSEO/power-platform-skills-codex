@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Checks and optionally fixes the blockedattachments setting on a
-// Dataverse environment. Power Pages code sites use .js files in their
+// Dataverse environment. Power Pages SPA sites use .js files in their
 // compiled output; environments with .js in blockedattachments reject
 // uploads (pac pages upload-code-site) and solution imports (deploy-pipeline).
 //
@@ -11,7 +11,7 @@
 //
 // The blocked-attachment list is semicolon-separated (e.g.,
 // "exe;dll;js;vbs;..."). This script removes only the extensions that are
-// needed by Power Pages code sites (.js; optionally .css if blocked).
+// needed by Power Pages SPA sites (.js; optionally .css if blocked).
 //
 // Usage:
 //   node fix-blocked-attachments.js
@@ -35,7 +35,7 @@
 
 'use strict';
 
-const { execFileSync } = require('child_process');
+const { runPac: runPacCommand } = require('./pac-command');
 const { validateDataverseEnvironmentUrl } = require('./validation-helpers');
 
 function parseArgs(argv) {
@@ -61,19 +61,18 @@ function log(msg, quiet) {
   if (!quiet) process.stderr.write(`[fix-blocked-attachments] ${msg}\n`);
 }
 
-function makePacRunner(execImpl) {
-  const exec = execImpl || execFileSync;
+function makePacRunner(execImpl, platform = process.platform) {
   return function runPac(args) {
-    try {
-      const out = exec('pac', args, {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-        shell: false,
-      });
-      return { ok: true, stdout: typeof out === 'string' ? out : (out || '') };
-    } catch (e) {
-      return { ok: false, stdout: e.stdout || '', stderr: e.stderr || '', error: e.message };
-    }
+    const result = runPacCommand(args, {
+      platform,
+      ...(execImpl ? { runCommand: execImpl } : {}),
+    });
+    return {
+      ok: result.status === 0,
+      stdout: result.stdout || '',
+      stderr: result.stderr || '',
+      error: result.error && result.error.message,
+    };
   };
 }
 
@@ -92,8 +91,8 @@ function parseBlockedAttachmentsFromPacOutput(pacOutput) {
   return null;
 }
 
-async function fixBlockedAttachments({ envUrl, extensions, dryRun, quiet, execImpl } = {}) {
-  const runPac = makePacRunner(execImpl);
+async function fixBlockedAttachments({ envUrl, extensions, dryRun, quiet, execImpl, platform } = {}) {
+  const runPac = makePacRunner(execImpl, platform);
   const trustedEnvUrl = envUrl ? validateDataverseEnvironmentUrl(envUrl) : null;
   const envArgs = trustedEnvUrl ? ['--environment', trustedEnvUrl] : [];
 

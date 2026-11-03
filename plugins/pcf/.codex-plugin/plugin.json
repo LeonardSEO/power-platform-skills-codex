@@ -1,0 +1,38 @@
+{
+  "name": "pcf",
+  "version": "1.0.1+codex.96d16d0718e4",
+  "description": "Preview. Build, test, diagnose, upgrade, deploy, verify and inventory Power Apps component framework (PCF) code components for model-driven apps, with guided setup for Power Pages standard field controls and canvas apps, from Microsoft-maintained templates and recipes pinned to a tested version matrix. Requires Node.js 20+; PAC CLI and the .NET SDK to deploy; Azure CLI (az) to verify and inventory.",
+  "author": {
+    "name": "LeonardSEO",
+    "url": "https://github.com/LeonardSEO"
+  },
+  "homepage": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "repository": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "license": "MIT",
+  "keywords": [
+    "pcf",
+    "code-components",
+    "power-apps-component-framework",
+    "model-driven",
+    "power-pages",
+    "canvas-apps",
+    "dataverse",
+    "pac-cli",
+    "react",
+    "fluent-ui"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "PCF for Codex",
+    "shortDescription": "Build Power Apps components",
+    "longDescription": "Preview. Build, test, diagnose, upgrade, deploy, verify and inventory Power Apps component framework (PCF) code components for model-driven apps, with guided setup for Power Pages standard field controls and canvas apps, from Microsoft-maintained templates and recipes pinned to a tested version matrix. Requires Node.js 20+; PAC CLI and the .NET SDK to deploy; Azure CLI (az) to verify and inventory.",
+    "developerName": "LeonardSEO",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
+    "defaultPrompt": "Build a Power Apps component."
+  }
+}

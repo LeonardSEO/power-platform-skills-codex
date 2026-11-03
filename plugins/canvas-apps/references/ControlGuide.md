@@ -25,12 +25,15 @@ Choosing a control type, and writing properties and enum values that the compile
 
 ## Discover before you choose
 
-**⚠️ Required — not optional:** run `list_controls` before planning your layout. Controls
-you don't know exist can't influence your design, and the catalog includes high-level
-controls (`ModernTabList`, `ModernCard`, and others) that are easy to miss and expensive
-to reinvent with primitives.
+Run `list_controls` before planning the layout when a required control's discovery name
+is unknown or control selection is still open. Skip the inventory when the approved plan
+already names every required control and their discovery names are known. The catalog
+includes high-level controls (`ModernTabList`, `ModernCard`, and others) that are easy to
+miss and expensive to reinvent with primitives.
 
-The resulting list will also specify if any Code Components or Canvas Components are available as control instances in the app. The result identifies the `ComponentName` to pass to `describe_control`.
+When required, the list also specifies whether Code Components or Canvas Components are
+available as control instances in the app and identifies the `ComponentName` to pass to
+`describe_control`.
 
 Run `describe_control` on every type you plan to use.
 
@@ -65,32 +68,35 @@ cross-device apps MUST use AutoLayout. See `${PLUGIN_ROOT}/references/LayoutGuid
 end when building card UI: the container lays out perfectly but tapping it does nothing.
 
 - **Clickable cards:** use `ModernCard` instead — it has `OnSelect` and is designed for it.
-- **Clickable non-card areas:** overlay a transparent `Button` or `Rectangle` (both have
+- **Clickable non-card areas:** overlay a transparent `ModernButton` or `Rectangle` (both have
   `OnSelect`) at the same position and size. Set the `Appearance` property to transparent
   where available; otherwise `Fill: =RGBA(0,0,0,0)` and `BorderThickness: =0`.
 
 ⚠️ **`ModernCard` fills unset slots with placeholder content.** It is not an empty
-surface. A card that sets only `Title` renders a large stock photograph above it and the
+surface. A card that sets only `Title` renders a placeholder photograph above it and the
 literal words `Subtitle` and `Description` below it, and the photo consumes most of the
 card's height — so the value you did set ends up clipped. Nothing about this reaches
 `compile_canvas`.
 
-Set every slot the card displays, and blank the ones you do not want:
+Set every slot the card displays. Image-bearing cards use the exact stock-image URL or
+media asset assigned by the planner's `## Imagery` section:
 
 ```yaml
 - KpiOpenCard:
     Control: ModernCard
     Properties:
-      Image: =Blank()          # required — otherwise a stock photo appears
-      HeaderImage: =Blank()    # when supported — otherwise header artwork can remain
+      Image: ="https://assigned.example/image.jpg"
       Title: =CountRows(colTasks) & ""
       Subtitle: ="Open tasks"
       Description: ="Across all projects"
 ```
 
 Use only properties returned by `describe_control`; some card versions expose
-`HeaderImage`, `ImageAccessibleLabel` and `HeaderImageAccessibleLabel`. When present,
-blank both image slots for a text-only card and set their accessible labels explicitly.
+`HeaderImage`, `ImageAccessibleLabel` and `HeaderImageAccessibleLabel`. The planner must
+assign every image slot rendered by the selected card variant, and the builder must copy
+those assignments and accessible labels exactly. For an intentionally text-only KPI,
+plan a suitable AutoLayout surface instead of using `ModernCard` and suppressing its
+imagery.
 Do not compress Title, Subtitle and Description into a short fixed-height KPI card; let
 the card size naturally, reduce the displayed slots, or choose a height that fits them.
 
@@ -121,7 +127,20 @@ child-column contract, do not create a new grid for a local collection. It can c
 and still render "There are no fields in this data table." Use an explicit header row
 plus a Gallery row shell and implement sorting through the Gallery `Items` formula.
 
-## Selection controls — `ItemDisplayText` is a per-item formula
+## Selection controls and filters — `ItemDisplayText` is a per-item formula
+
+Choose the interaction before styling the control. These rules apply equally to form
+fields, filters, sort choices, periods, statuses, and category selectors:
+
+- For a short static required set, prefer `ModernRadio` or visible choice buttons when the options fit, then a `ModernDropdown` that selects an option by click or tap.
+- Use `ModernCombobox` only for a large set that benefits from search or when free-form entry is explicitly required. Do not use it for a short required set merely because modern controls are preferred.
+- Give a required short-choice field a valid initial selection when the business rule permits one. If an explicit choice is required, show a visible placeholder and validation, but keep selection independent of typed filtering or keyboard-only commitment.
+- A populated `Items` formula is not enough. The planned control must expose readable options and commit the selected record or value through its normal pointer interaction.
+- Record the exact selected-value property returned by `describe_control` and bind it into
+  the consumer formula. Never guess `Selected.Value`, invent a child listbox, or assume
+  that opening a popup commits a value.
+- For a filter, show the active choice and provide a reachable clear/reset action. Verify
+  the consumer against at least two matching records and one non-matching record.
 
 `ItemDisplayText` and `ItemKey` on `ModernDropdown`, `ModernCombobox` and similar controls
 are evaluated once per row with `ThisItem` in scope. They take an expression, not a column
@@ -139,6 +158,40 @@ ItemDisplayText: =ThisItem.Value
 
 A dropdown whose options all appear empty is almost always this mistake. When `Items` is
 already a single-column table you can omit `ItemDisplayText` entirely.
+
+Required data-entry controls must satisfy the persistent visible-label contract in
+`${PLUGIN_ROOT}/references/LayoutGuide.md`; `AccessibleLabel` and `HintText` do not replace it.
+
+For Dropdown, ComboBox, and other controls with a `Default` property, `Items` is not an
+output property and cannot be referenced as `Self.Items` from the default formula. Use an
+explicit value or record compatible with `Items`, or derive it directly from the same
+source expression:
+
+```yaml
+Items: '=[{Value:"All"},{Value:"Open"},{Value:"Closed"}]'
+Default: '=First([{Value:"All"},{Value:"Open"},{Value:"Closed"}])'
+```
+
+`TemplateSize` is an input property used in authored YAML to configure each Gallery
+item's size. Give the Gallery a conservative viewport/fixed `Height` and set
+`TemplateSize` and `TemplatePadding` explicitly:
+
+```yaml
+Height: =320
+TemplateSize: =64
+TemplatePadding: =8
+```
+
+Do not self-size a Gallery from `CountRows(...)` and `Self.TemplateHeight`,
+`Self.TemplateWidth`, or `Self.TemplatePadding`. That circular exported shape can render
+zero rows even when `Items` is populated.
+
+For charts, `ItemColorSet` expects a single-column table of color values. Supply the
+colors directly instead of wrapping them in records with custom field names:
+
+```yaml
+ItemColorSet: =[RGBA(0,102,204,1), RGBA(16,124,65,1)]
+```
 
 ## Properties are per-control — never transfer them by analogy
 
@@ -160,33 +213,35 @@ properties.
 
 ### Trap 2 — assuming text styling is spelled the same everywhere
 
-The modern React controls and the FluentV9 controls disagree about basic names. This is
-the most common single-property mistake:
+Property support differs across modern controls. This is the most common single-property
+mistake:
 
-| Intent | `ModernText`, `ModernButton`, `ModernDropdown`, `ModernTextInput`, `ModernNumberInput`, `PieChart` | `Badge` | `ModernCard` |
-|--------|---------------------------------------------------------------------------------------------------|---------|--------------|
-| Text color | `Color` | `FontColor` | `TitleColor` / `SubtitleColor` / `DescriptionColor` |
-| Font size | `Size` | `FontSize` | `TitleSize` / `SubtitleSize` / `DescriptionSize` |
+| Intent | `ModernText`, `ModernButton`, `ModernDropdown`, `ModernTextInput`, `ModernNumberInput`, `PieChart` | `ModernBadge` | `ModernCard` |
+|--------|---------------------------------------------------------------------------------------------------|---------------|--------------|
+| Text color | `Color` | `Color` | `TitleColor` / `SubtitleColor` / `DescriptionColor` |
+| Font size | `Size` | `Size` | `TitleSize` / `SubtitleSize` / `DescriptionSize` |
 | Displayed string | `Text` | `Content` | `Title` / `Subtitle` / `Description` |
-| Corner rounding | `RadiusTopLeft` … `RadiusBottomRight` | none | `BorderRadius` |
+| Corner rounding | `RadiusTopLeft` … `RadiusBottomRight` | `RadiusTopLeft` … `RadiusBottomRight` | `BorderRadius` |
 
-`Progress` is narrower still: no `Fill`, no `Color`, no `Font*`. It is styled through
-`BasePaletteColor` and its three `Progress.*` enums.
+`ModernProgressBar` is narrower still: no `Fill`, no `Color`, no `Font*`. It is styled
+through `BasePaletteColor`, `FillColor`, `TrackColor`, and its `ProgressColor`,
+`ProgressThickness`, and `ProgressShape` enums.
 
 `Gallery` has `Fill` but no text properties at all — style the labels inside it, not the
 container.
 
-### Trap 3 — writing a template version on `Control:`
+### Trap 3 — deriving creation keywords from `list_controls`
 
-Never write `Control: ModernText@1.5.0`. Use the bare name that `list_controls` returned.
+`list_controls` returns the name used to query `describe_control`; it is not the authored
+YAML contract. The `Control creation keywords` block in `describe_control` is
+authoritative. Copy its `Control:` value and any required `ComponentName`,
+`ComponentLibraryUniqueName`, `Variant`, and `Layout` keywords verbatim.
 
 ## Control template versions
 
-Every control type resolves to exactly one template version per app. You do not choose it
-and you do not need to: write the bare control name everywhere and the app stays
-consistent.
-
-Writing an explicit `@version` on even one control breaks that:
+Do not add, remove, or replace an `@version` suffix yourself. If compilation reports a
+template-version conflict, re-run `describe_control` and make every instance use the
+exact `Control:` value currently returned for that type:
 
 ```text
 Another instance of control type 'ModernText' has already been referenced using a
@@ -204,12 +259,9 @@ not the one you wrote:
 Unknown property 'Color' for control type 'Text'.
 ```
 
-Those properties are valid on `ModernText`. Nothing is wrong with them. The only defect is
-the version suffix, and removing every suffix clears the entire cascade in one compile.
-
-- ✅ `Control: ModernText`
-- ❌ `Control: ModernText@1.5.0`
-- ❌ mixing `Control: Badge` in one file with `Control: Badge@1.2.0` in another
+Those properties may be valid on `ModernText`; resolve the creation-keyword mismatch
+before changing them. Do not assume the bare or versioned form is correct without
+checking `describe_control`.
 
 ## Enum type names
 
@@ -223,28 +275,28 @@ one, and it cannot be derived from the control name:
 | `ModernTextInput` | `Appearance` | `Appearance` |
 | `ModernNumberInput` | `Appearance` | `Appearance` |
 | `ModernButton` | `Appearance` | `ButtonAppearance` |
-| `Badge` | `Appearance` | `BadgeCanvas.Appearance` |
-| `Badge` | `Shape` | `BadgeCanvas.Shape` |
-| `Badge` | `ThemeColor` | `BadgeCanvas.ThemeColor` |
-| `Progress` | `Shape` | `Progress.Shape` |
-| `Progress` | `Thickness` | `Progress.Thickness` |
+| `ModernBadge` | `Appearance` | `BadgeAppearance` |
+| `ModernBadge` | `Shape` | `BadgeShape` |
+| `ModernBadge` | `ThemeColor` | `BadgeColor` |
+| `ModernProgressBar` | `ProgressColor` | `ProgressColor` |
+| `ModernProgressBar` | `Shape` | `ProgressShape` |
+| `ModernProgressBar` | `Thickness` | `ProgressThickness` |
 | `ModernNumberInput` | `Precision` | `DecimalPrecision` |
 
 Five controls, one property name, four different enum types. Guessed names like
-`BadgeAppearance`, `DropdownAppearance` or `ProgressBar.ProgressColor` all fail with
-`Name isn't recognized`.
+`DropdownAppearance` or `ProgressBar.ProgressColor` fail with `Name isn't recognized`.
 
 Wrap the enum **name** in `'` whenever it contains a dot, a space, or a special
 character. Then append `.Member`:
 
 ```yaml
-# Enum name contains a dot -> quote the name, not the member
+# Modern Badge enum names do not require quoting
 - StatusBadge:
-    Control: Badge
+    Control: ModernBadge
     Properties:
-      Appearance: ='BadgeCanvas.Appearance'.Tint
-      Shape: ='BadgeCanvas.Shape'.Rounded
-      ThemeColor: ='BadgeCanvas.ThemeColor'.Success
+      Appearance: =BadgeAppearance.Tint
+      Shape: =BadgeShape.Circular
+      ThemeColor: =BadgeColor.Success
 
 # Plain enum name -> no quoting needed
 - ProjectPicker:
@@ -355,8 +407,8 @@ appearance is derived from the current screen.
 
 ## Semantic display values
 
-Semantic controls need their visible value property. `Badge.AccessibleLabel` does not
-replace `Badge.Content`; omitting Content can render placeholder text such as `AB`.
+Semantic controls need their visible value property. `ModernBadge.AccessibleLabel` does not
+replace `ModernBadge.Content`; omitting Content can render placeholder text such as `AB`.
 
 ## Common property reference
 
@@ -369,10 +421,10 @@ replace `Badge.Content`; omitting Content can render placeholder text such as `A
 
 **Styling:**
 
-- `Fill` — background color (absent on `Badge` and `Progress`)
-- `Color` — text color on the modern React controls; `Badge` spells it `FontColor`
-- `BasePaletteColor` — theme color for `Badge`, `Progress`, and the modern inputs
-- `Size` — font size on the modern React controls; `Badge` spells it `FontSize`
+- `Fill` — background color (absent on `ModernProgressBar`)
+- `Color` — text color on modern controls
+- `BasePaletteColor` — theme color for `ModernBadge`, `ModernProgressBar`, and the modern inputs
+- `Size` — font size on modern controls
 - `FontWeight` — Bold, Semibold, Normal, Lighter
 
 **Behavior:**
@@ -390,18 +442,19 @@ replace `Badge.Content`; omitting Content can render placeholder text such as `A
 - `LayoutGap` — spacing between items
 - `LayoutOverflowY` — vertical overflow (`Scroll` for scrollable containers)
 - `FillPortions` — proportional sizing
-- `PaddingTop`/`Bottom`/`Left`/`Right` — container padding
+- `PaddingTop`/`PaddingBottom`/`PaddingLeft`/`PaddingRight` — container padding
 
 ## Troubleshooting
 
 - **`Unknown property`:** run `describe_control` and use only the properties it returns
   for that exact control type.
 - **Many `Unknown property` errors naming a control type you never wrote** (e.g. `'Text'`
-  when your YAML says `ModernText`): a template version conflict. Strip every `@version`
-  suffix from every `Control:` value and re-compile.
+  when your YAML says `ModernText`): a template version conflict. Re-run
+  `describe_control`, copy its complete creation-keyword block to every instance of that
+  type, and re-compile.
 - **A property works on one control but not a similar one:** property support is per
-  control type, and the modern React, FluentV9 and Classic families disagree. Check the
-  per-control table above rather than reasoning by analogy.
+  control type, and modern and Classic controls disagree. Check the per-control table
+  above rather than reasoning by analogy.
 - **`Name isn't recognized` on an enum:** the enum type name is wrong. Copy the
   `Enum name:` line from `describe_control` verbatim; quote it with `'` if it contains a
   dot. Deleting the qualifier is not a fix.
@@ -412,7 +465,7 @@ replace `Badge.Content`; omitting Content can render placeholder text such as `A
 - **A `ModernCard` renders a large stock photograph, or the words "Title" / "Subtitle" /
   "Description":** those slots were left unset. `ModernCard` fills unset slots with
   placeholder content rather than collapsing them. Set `Image`, `Title`, `Subtitle` and
-  `Description` for every slot the card shows, and set `Image: =Blank()` when the card is
-  meant to be text-only.
+  `Description` for every slot the card shows, using the exact image assignment from the
+  shared plan. If the intended surface is text-only, use the planned non-card surface.
 - **Button text is too small:** set `Size` on `ModernButton` — but confirm the font
   property exists on that control first.

@@ -1,8 +1,9 @@
 'use strict';
 // REAL-BUNDLE contract tests for app deletion (teardown's primary destructive step).
 //
-// An app is TWO rows: an `appmodule` and a `sitemaps` row, with NO lookup between them and no
-// server-side cascade — the only link is `sitemap.sitemapnameunique === appmodule.uniquename`.
+// An app is TWO rows: an `appmodule` and a `sitemaps` row, with no server-side cascade. Its CURRENT
+// appmoduleidunique layer links type-62 appmodulecomponents to the sitemap; only an absent component
+// permits a safe same-name fallback. A component-linked sitemap may legitimately have another name.
 // Deleting just the appmodule strands the sitemap forever AND, because `sitemapnameunique` is
 // unique-constrained, permanently BURNS that unique name: a later build of an app with the same
 // name fails with "The name <x> is already in use by an existing site map", which the user cannot
@@ -12,9 +13,9 @@
 //
 // The SDK now deletes both rows in ONE atomic OData `$batch` change set, so it requires an
 // `HttpClient.postRaw` and refuses (APP_DELETE_NOT_ATOMIC) without one. It also fails closed on
-// every read it cannot trust: the app must carry an ETag (so the DELETE can be conditional on the
-// row actually inspected) and the sitemap must still carry the app's `sitemapnameunique` (so a
-// row re-pointed between read and delete is not destroyed).
+// every read it cannot trust: the app must carry an ETag and the sitemap's by-id read must return its
+// ROW token (so each DELETE can be conditional on the row actually inspected). Shared or changed links
+// are refused; a name-fallback candidate must still carry the app's name.
 const test = require('node:test');
 const assert = require('node:assert');
 const os = require('node:os');
@@ -23,6 +24,7 @@ const fs = require('node:fs');
 
 const BUNDLE = path.resolve(__dirname, '..', 'vendor', 'cds-maker-sdk.cjs');
 const { createAzHttpClient } = require('../lib/sdk-http-client.js');
+const { appSitemapLinkRows } = require('./helpers/app-sitemap-link-rows.js');
 
 const APP_ID = '11111111-1111-1111-1111-111111111111';
 const APP_UNIQUE_ID = '22222222-2222-2222-2222-222222222222';
@@ -72,17 +74,44 @@ function batchResponseFor(requestBody, statusFor = () => 204) {
 
 /** The rows a fake Dataverse hands back, shared by the injected-client and real-transport fakes. */
 function appRow(opts = {}) {
-  const row = { appmoduleid: APP_ID, appmoduleidunique: APP_UNIQUE_ID, uniquename: APP_UNIQUE, name: 'Support Desk' };
+  const row = { appmoduleid: APP_ID, appmoduleidunique: APP_UNIQUE_ID, componentstate: 0, uniquename: APP_UNIQUE, name: 'Support Desk' };
   if (!opts.noAppEtag) row['@odata.etag'] = 'W/"1001"';
   return row;
 }
+// A sitemap has TWO concurrency tokens, and only one of them is valid on a write. The unpublished-
+// aware collection read carries a CONTENT token for the authored layer, which runs ahead of the row
+// version while an edit is unpublished; Dataverse validates `If-Match` against the ROW version, which
+// a plain by-id GET returns. Sending the content token made every delete of an app with a pending
+// sitemap edit answer 412. Clean, the two are equal — so they differ here by default, and a delete
+// carrying the wrong one is visible.
+const SITEMAP_ROW_ETAG = 'W/"2002"';
+const SITEMAP_CONTENT_ETAG = 'W/"2003"';
 function sitemapRow(opts = {}) {
   return {
-    '@odata.etag': 'W/"2002"',
+    '@odata.etag': SITEMAP_CONTENT_ETAG,
     sitemapid: SITEMAP_ID,
     sitemapnameunique: opts.foreignSitemap ? 'co_someotherapp' : APP_UNIQUE,
     sitemapxml: '<SiteMap></SiteMap>',
   };
+}
+// A by-id GET answers with the single ROW, not a collection, and carries its token twice — as the
+// `ETag` response header and as `@odata.etag` in the body:
+//   GET /sitemaps(<id>)?$select=sitemapid
+//   200  ETag: W/"2002"   { "@odata.etag": "W/\"2002\"", "sitemapid": "<id>" }
+// Node delivers header names lower-cased, so the fake does too.
+function sitemapByIdResponse(opts = {}) {
+  if (opts.noSitemapRowEtag) return { headers: {}, body: { sitemapid: SITEMAP_ID } };
+  return { headers: { etag: SITEMAP_ROW_ETAG }, body: { '@odata.etag': SITEMAP_ROW_ETAG, sitemapid: SITEMAP_ID } };
+}
+const SITEMAP_BY_ID = /\/sitemaps\([^)]+\)/;
+
+function linkRows(url, opts = {}) {
+  return appSitemapLinkRows(url, {
+    apps: [appRow(opts)],
+    components: opts.noSitemap || opts.foreignSitemap ? [] : [{
+      _appmoduleidunique_value: APP_UNIQUE_ID, objectid: SITEMAP_ID, componenttype: 62,
+    }],
+  });
 }
 
 /**
@@ -91,13 +120,14 @@ function sitemapRow(opts = {}) {
  *   sitemapLookupStatus - HTTP status for the sitemaps lookup
  *   noSitemap           - the app owns no sitemap row
  *   noAppEtag           - the app read returns no ETag (delete cannot be made conditional)
+ *   noSitemapRowEtag    - the sitemap's by-id read returns no ETag
  *   foreignSitemap      - the sitemap no longer carries this app's unique name
  *   omitPostRaw         - the injected HttpClient does not support atomic $batch
  *   batchStatusFor      - per-Content-ID status override for the batch response
  *   batchBody           - replace the batch response body entirely (models an unparseable answer)
  */
-function freshSdk(opts = {}) {
-  const { createMakerSdk } = require(BUNDLE);
+async function freshSdk(opts = {}) {
+  const { createMakerSdk, createNodeWorkspaceStorage } = require(BUNDLE);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'appdel-'));
   tempDirs.push(dir);
   const calls = [];
@@ -109,12 +139,20 @@ function freshSdk(opts = {}) {
       // argument. e.g. /EntityDefinitions(LogicalName='appmodulecomponent')?$select=EntitySetName
       const meta = /EntityDefinitions\(LogicalName='([^']+)'\)/.exec(url);
       if (meta) return { status: 200, headers: {}, body: { LogicalName: meta[1], EntitySetName: `${meta[1]}s` } };
-      // By-id app retrieve — the source of the `uniquename` the sitemap is linked by, and of the
-      // ETag the conditional delete is issued against.
+      const linked = linkRows(url, opts);
+      if (linked !== undefined) return { status: 200, headers: {}, body: { value: linked } };
+      // By-id app retrieve supplies the name-fallback identity and the conditional delete's ETag.
       if (/\/appmodules\([^)]+\)/.test(url)) {
         const status = opts.appReadStatus || 200;
         if (status !== 200) return { status, headers: {}, body: null };
         return { status, headers: {}, body: appRow(opts) };
+      }
+      // By-id sitemap read — the source of the ROW token the conditional delete is issued against.
+      // Must precede the collection branch below, which would otherwise answer it in the wrong shape.
+      if (SITEMAP_BY_ID.test(url)) {
+        const status = opts.sitemapLookupStatus || 200;
+        if (status !== 200) return { status, headers: {}, body: null };
+        return { status, ...sitemapByIdResponse(opts) };
       }
       // Sitemaps are read UNPUBLISHED (RetrieveUnpublishedMultiple) so a newly authored sitemap is
       // visible before its app is published.
@@ -138,8 +176,8 @@ function freshSdk(opts = {}) {
       return { status: 200, headers: {}, body: respBody };
     };
   }
-  const sdk = createMakerSdk({ workspacePath: dir, instanceUrl: 'https://example.crm.dynamics.com', httpClient });
-  sdk.initWorkspace();
+  const sdk = createMakerSdk({ workspaceStorage: createNodeWorkspaceStorage(dir), instanceUrl: 'https://example.crm.dynamics.com', httpClient });
+  await sdk.initWorkspace();
   return { sdk, calls };
 }
 
@@ -155,7 +193,7 @@ function deletedPaths(calls) {
 }
 
 test('REAL BUNDLE: deleting an app also deletes its sitemap row (the unique name is not burned)', async () => {
-  const { sdk, calls } = freshSdk();
+  const { sdk, calls } = await freshSdk();
   const r = await sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID);
   const urls = deletedPaths(calls);
   assert.ok(urls.some((u) => u.includes(`/appmodules(${APP_ID})`)), `app not deleted: ${JSON.stringify(urls)}`);
@@ -166,7 +204,7 @@ test('REAL BUNDLE: deleting an app also deletes its sitemap row (the unique name
 test('REAL BUNDLE: both rows are deleted in ONE atomic $batch change set, never as two calls', async () => {
   // The whole point of the atomic path: two sequential DELETEs can strand the sitemap if the
   // process dies (or the second call fails) between them, which burns the unique name forever.
-  const { sdk, calls } = freshSdk();
+  const { sdk, calls } = await freshSdk();
   await sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID);
   const b = batches(calls);
   assert.strictEqual(b.length, 1, `expected exactly one $batch, got ${b.length}`);
@@ -182,9 +220,8 @@ test('REAL BUNDLE: both rows are deleted in ONE atomic $batch change set, never 
 });
 
 test('REAL BUNDLE: the sitemap is resolved BEFORE the app delete, never after', async () => {
-  // Afterwards the `uniquename` -> sitemap link is unrecoverable, so ordering is the whole
-  // guarantee: read first, then destroy.
-  const { sdk, calls } = freshSdk();
+  // Afterwards the app's layer/component link is unrecoverable: read first, then destroy.
+  const { sdk, calls } = await freshSdk();
   await sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID);
   const sitemapLookup = calls.findIndex((c) => c.method === 'GET' && c.url.includes('/sitemaps'));
   const appDelete = calls.findIndex(
@@ -199,7 +236,7 @@ test('REAL BUNDLE: an INCONCLUSIVE sitemap lookup refuses to delete the app (fai
   // The dangerous case: the lookup fails transiently. Deleting anyway strands the sitemap and burns
   // the name permanently, so the delete must not run on a guess. Teardown surfaces the rejection.
   for (const opts of [{ appReadStatus: 503 }, { sitemapLookupStatus: 503 }]) {
-    const { sdk, calls } = freshSdk(opts);
+    const { sdk, calls } = await freshSdk(opts);
     await assert.rejects(() => sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID), `expected a rejection for ${JSON.stringify(opts)}`);
     assert.ok(
       !deletedPaths(calls).some((u) => u.includes('/appmodules(')),
@@ -208,10 +245,10 @@ test('REAL BUNDLE: an INCONCLUSIVE sitemap lookup refuses to delete the app (fai
   }
 });
 
-test("REAL BUNDLE: a sitemap that no longer carries this app's unique name is NOT deleted", async () => {
-  // Ownership is name equality only. If the row was re-pointed between the read and the delete it
-  // belongs to a different app now, and destroying it would be cross-app data loss.
-  const { sdk, calls } = freshSdk({ foreignSitemap: true });
+test("REAL BUNDLE: a NAME-FALLBACK candidate renamed after lookup is NOT deleted", async () => {
+  // No component links this fixture, so the fallback name must survive the subsequent by-id read.
+  // A valid type-62 link with a different name is a separate, supported identity.
+  const { sdk, calls } = await freshSdk({ foreignSitemap: true });
   await assert.rejects(() => sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID), /no longer this app|APP_SITEMAP_UNRESOLVED/);
   assert.strictEqual(deletedPaths(calls).length, 0, 'nothing may be deleted when ownership cannot be proven');
 });
@@ -219,15 +256,47 @@ test("REAL BUNDLE: a sitemap that no longer carries this app's unique name is NO
 test('REAL BUNDLE: an app read with no ETag refuses to delete (the DELETE cannot be made conditional)', async () => {
   // Without an If-Match the delete is unconditional, so a row renamed or re-pointed between the
   // read and the delete would be destroyed anyway. Refuse instead.
-  const { sdk, calls } = freshSdk({ noAppEtag: true, noSitemap: true });
+  const { sdk, calls } = await freshSdk({ noAppEtag: true, noSitemap: true });
   await assert.rejects(() => sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID), /ETag|APP_SITEMAP_UNRESOLVED/);
   assert.strictEqual(deletedPaths(calls).length, 0, 'nothing may be deleted without a concurrency token');
+});
+
+/** The `If-Match` each DELETE in a $batch change set carries, keyed by the path it targets. */
+function batchIfMatch(body) {
+  const out = {};
+  for (const part of String(body).split(/^--changeset_\S*/m)) {
+    const target = /^DELETE\s+(\S+)/im.exec(part);
+    if (target) out[target[1]] = (/^If-Match:\s*(.+?)\s*$/im.exec(part) || [])[1] || null;
+  }
+  return out;
+}
+
+test("REAL BUNDLE: the sitemap delete is conditioned on its ROW token, never the unpublished read's content token", async () => {
+  // Teardown of an app whose sitemap carries an unpublished edit — a build that halted between its
+  // sitemap push and the publish leaves exactly that — answered 412 on every attempt while the
+  // delete carried the content token, so the app could not be torn down at all.
+  const { sdk, calls } = await freshSdk();
+  await sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID);
+  const [batch] = batches(calls);
+  assert.ok(batch, 'the atomic delete must be issued');
+  const ifMatch = batchIfMatch(batch.body);
+  const sitemapTarget = Object.keys(ifMatch).find((u) => u.includes(SITEMAP_ID));
+  assert.ok(sitemapTarget, `the sitemap must be in the change set: ${JSON.stringify(ifMatch)}`);
+  assert.strictEqual(ifMatch[sitemapTarget], SITEMAP_ROW_ETAG, `the sitemap DELETE must carry the ROW token; got ${JSON.stringify(ifMatch)}`);
+  const appTarget = Object.keys(ifMatch).find((u) => u.includes(`/appmodules(${APP_ID})`));
+  assert.strictEqual(ifMatch[appTarget], 'W/"1001"', 'the app DELETE stays conditional on the app row it read');
+});
+
+test('REAL BUNDLE: a sitemap by-id read with no ETag refuses to delete (fails CLOSED)', async () => {
+  const { sdk, calls } = await freshSdk({ noSitemapRowEtag: true });
+  await assert.rejects(() => sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID), /ETag|APP_SITEMAP_UNRESOLVED/);
+  assert.strictEqual(deletedPaths(calls).length, 0, 'an unconditional delete of either row must never be issued');
 });
 
 test('REAL BUNDLE: an HttpClient without postRaw REFUSES the delete rather than doing it non-atomically', async () => {
   // This is why lib/sdk-http-client.js must implement postRaw: the SDK does NOT silently degrade
   // to two sequential deletes. A plugin transport missing postRaw breaks teardown outright.
-  const { sdk, calls } = freshSdk({ omitPostRaw: true });
+  const { sdk, calls } = await freshSdk({ omitPostRaw: true });
   await assert.rejects(() => sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID), /APP_DELETE_NOT_ATOMIC|atomic/);
   assert.strictEqual(deletedPaths(calls).length, 0, 'a non-atomic fallback delete must never happen');
 });
@@ -235,18 +304,18 @@ test('REAL BUNDLE: an HttpClient without postRaw REFUSES the delete rather than 
 test('REAL BUNDLE: a failed operation INSIDE the change set is not reported as a successful delete', async () => {
   // The batch envelope can return 200 while an embedded operation failed; reading only the outer
   // status would report a delete that never happened.
-  const { sdk } = freshSdk({ batchStatusFor: (id) => (id === '2' ? 400 : 204) });
+  const { sdk } = await freshSdk({ batchStatusFor: (id) => (id === '2' ? 400 : 204) });
   await assert.rejects(() => sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID));
 });
 
 test('REAL BUNDLE: an unparseable batch response is treated as UNKNOWN, not as success', async () => {
   // A 200 with a body that is not a multipart envelope proves nothing about what the server did.
-  const { sdk } = freshSdk({ batchBody: 'OK' });
+  const { sdk } = await freshSdk({ batchBody: 'OK' });
   await assert.rejects(() => sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID));
 });
 
 test('REAL BUNDLE: an app that owns no sitemap still deletes cleanly', async () => {
-  const { sdk, calls } = freshSdk({ noSitemap: true });
+  const { sdk, calls } = await freshSdk({ noSitemap: true });
   const r = await sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID);
   assert.ok(deletedPaths(calls).some((u) => u.includes(`/appmodules(${APP_ID})`)), 'the app is still deleted');
   assert.ok(r.success, `cascade reported failure: ${JSON.stringify(r.failures)}`);
@@ -258,7 +327,7 @@ test('REAL BUNDLE: an app that owns no sitemap still deletes cleanly', async () 
 // plugin ships, so a transport bug (re-serializing the payload, JSON-parsing the response, or
 // dropping the boundary Content-Type) fails HERE instead of live during a teardown.
 test('REAL BUNDLE + REAL TRANSPORT: the plugin HttpClient satisfies the SDK atomic-delete contract', async () => {
-  const { createMakerSdk } = require(BUNDLE);
+  const { createMakerSdk, createNodeWorkspaceStorage } = require(BUNDLE);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'appdel-'));
   tempDirs.push(dir);
   const wire = [];
@@ -267,14 +336,20 @@ test('REAL BUNDLE + REAL TRANSPORT: the plugin HttpClient satisfies the SDK atom
     wire.push({ url, method, body, headers });
     const meta = /EntityDefinitions\(LogicalName='([^']+)'\)/.exec(url);
     if (meta) return { statusCode: 200, headers: {}, body: JSON.stringify({ LogicalName: meta[1], EntitySetName: `${meta[1]}s` }) };
+    const linked = linkRows(url);
+    if (linked !== undefined) return { statusCode: 200, headers: {}, body: JSON.stringify({ value: linked }) };
     if (/\/\$batch$/.test(url)) return { statusCode: 200, headers: {}, body: batchResponseFor(body) };
     if (/\/appmodules\([^)]+\)/.test(url)) return { statusCode: 200, headers: {}, body: JSON.stringify(appRow()) };
+    // The row token travels ONLY in the response header here (real Dataverse also puts it in the
+    // body), so a transport that dropped or mangled response headers fails this test instead of
+    // teardown refusing every app with APP_SITEMAP_UNRESOLVED.
+    if (SITEMAP_BY_ID.test(url)) return { statusCode: 200, headers: { etag: SITEMAP_ROW_ETAG }, body: JSON.stringify({ sitemapid: SITEMAP_ID }) };
     if (url.includes('/sitemaps')) return { statusCode: 200, headers: {}, body: JSON.stringify({ value: [sitemapRow()] }) };
     return { statusCode: 200, headers: {}, body: JSON.stringify({ value: [] }) };
   };
   const httpClient = createAzHttpClient('https://example.crm.dynamics.com', { getToken: () => 'TOK', request });
-  const sdk = createMakerSdk({ workspacePath: dir, instanceUrl: 'https://example.crm.dynamics.com', httpClient });
-  sdk.initWorkspace();
+  const sdk = createMakerSdk({ workspaceStorage: createNodeWorkspaceStorage(dir), instanceUrl: 'https://example.crm.dynamics.com', httpClient });
+  await sdk.initWorkspace();
 
   const r = await sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID);
   assert.ok(r.success, `cascade reported failure: ${JSON.stringify(r.failures)}`);
@@ -283,4 +358,129 @@ test('REAL BUNDLE + REAL TRANSPORT: the plugin HttpClient satisfies the SDK atom
   assert.match(batch.headers['Content-Type'], /^multipart\/mixed;\s*boundary=/, 'the boundary Content-Type must survive the transport');
   assert.ok(batch.body.startsWith('--batch_'), 'the multipart payload must be sent verbatim, not JSON-serialized');
   assert.strictEqual([...String(batch.body).matchAll(/^DELETE\s+/gim)].length, 2, 'both rows travel in one change set');
+  const sitemapIfMatch = Object.entries(batchIfMatch(batch.body)).find(([u]) => u.includes(SITEMAP_ID));
+  assert.strictEqual(sitemapIfMatch && sitemapIfMatch[1], SITEMAP_ROW_ETAG,
+    'the header-borne row token must reach the SDK through the real transport');
+});
+
+// Measured live: a teardown's app delete — this change set — lost a SQL deadlock, and the whole teardown
+// stopped with nothing removed. A change set is atomic, so that answer proves nothing committed, and the
+// transport re-sends the same batch (sdk-http-client.js, isBatchDeadlockVictim). The first answer below is
+// the captured one: HTTP 500 for the batch, and only the failing operation answered inside it.
+test('REAL BUNDLE + REAL TRANSPORT: an app delete whose change set lost a SQL deadlock is re-sent and succeeds', async () => {
+  const { createMakerSdk, createNodeWorkspaceStorage } = require(BUNDLE);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'appdel-'));
+  tempDirs.push(dir);
+  const batches = [];
+  const slept = [];
+  const deadlocked = [
+    '--batchresponse_x', 'Content-Type: multipart/mixed; boundary=changesetresponse_x', '',
+    '--changesetresponse_x', 'Content-Type: application/http', 'Content-Transfer-Encoding: binary', 'Content-ID: 1', '',
+    'HTTP/1.1 500 Internal Server Error', 'Content-Type: application/json; odata.metadata=minimal; odata.streaming=true', 'OData-Version: 4.0', '',
+    JSON.stringify({ error: { code: '0x80044150', message: ' Sql error: Generic SQL error. CRM ErrorCode: -2147204784 Sql ErrorCode: -2146232060 Sql Number: 1205' } }),
+    '--changesetresponse_x--', '--batchresponse_x--', '',
+  ].join('\r\n');
+  const request = async ({ url, body }) => {
+    const meta = /EntityDefinitions\(LogicalName='([^']+)'\)/.exec(url);
+    if (meta) return { statusCode: 200, headers: {}, body: JSON.stringify({ LogicalName: meta[1], EntitySetName: `${meta[1]}s` }) };
+    const linked = linkRows(url);
+    if (linked !== undefined) return { statusCode: 200, headers: {}, body: JSON.stringify({ value: linked }) };
+    if (/\/\$batch$/.test(url)) {
+      batches.push(body);
+      return batches.length === 1 ? { statusCode: 500, headers: {}, body: deadlocked } : { statusCode: 200, headers: {}, body: batchResponseFor(body) };
+    }
+    if (/\/appmodules\([^)]+\)/.test(url)) return { statusCode: 200, headers: {}, body: JSON.stringify(appRow()) };
+    if (SITEMAP_BY_ID.test(url)) return { statusCode: 200, headers: { etag: SITEMAP_ROW_ETAG }, body: JSON.stringify({ sitemapid: SITEMAP_ID }) };
+    if (url.includes('/sitemaps')) return { statusCode: 200, headers: {}, body: JSON.stringify({ value: [sitemapRow()] }) };
+    return { statusCode: 200, headers: {}, body: JSON.stringify({ value: [] }) };
+  };
+  const httpClient = createAzHttpClient('https://example.crm.dynamics.com', { getToken: () => 'TOK', request, sleep: async (ms) => { slept.push(ms); } });
+  const sdk = createMakerSdk({ workspaceStorage: createNodeWorkspaceStorage(dir), instanceUrl: 'https://example.crm.dynamics.com', httpClient });
+  await sdk.initWorkspace();
+
+  const r = await sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID);
+  assert.ok(r.success, `cascade reported failure: ${JSON.stringify(r.failures)}`);
+  assert.strictEqual(batches.length, 2, 'the deadlocked change set was sent once more');
+  assert.strictEqual(batches[1], batches[0], 'the same change set, byte for byte (the same conditional DELETEs)');
+  assert.deepStrictEqual(slept, [1000]);
+});
+
+// A 429 is the other answer that proves nothing ran: the server refused to START the request. Two shapes
+// are re-sent (sdk-http-client.js, isBatchThrottled): the whole batch refused before any operation was read
+// (service protection answers with a plain error), and a change set whose one answered operation is a 429
+// (the customization lock the platform holds right after a table delete).
+for (const [shape, refusal] of [
+  ['the whole request refused (service protection)', { statusCode: 429, headers: { 'retry-after': '3' }, body: JSON.stringify({ error: { code: '0x80072322', message: 'Number of requests exceeded the limit of 6000 over time window of 300 seconds.' } }) }],
+  ['its change set refused (customization lock)', { statusCode: 429, headers: {}, body: [
+    '--batchresponse_y', 'Content-Type: multipart/mixed; boundary=changesetresponse_y', '',
+    '--changesetresponse_y', 'Content-Type: application/http', 'Content-Transfer-Encoding: binary', 'Content-ID: 1', '',
+    'HTTP/1.1 429 Too Many Requests', 'Content-Type: application/json; odata.metadata=minimal', 'OData-Version: 4.0', '',
+    JSON.stringify({ error: { code: '0x80071151', message: 'Cannot start the requested operation [Delete] because there is another [EntityCustomization] running at this moment.' } }),
+    '--changesetresponse_y--', '--batchresponse_y--', '',
+  ].join('\r\n') }],
+]) {
+  test(`REAL BUNDLE + REAL TRANSPORT: an app delete refused with 429 — ${shape} — is re-sent and succeeds`, async () => {
+    const { createMakerSdk, createNodeWorkspaceStorage } = require(BUNDLE);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'appdel-'));
+    tempDirs.push(dir);
+    const batches = [];
+    const slept = [];
+    const request = async ({ url, body }) => {
+      const meta = /EntityDefinitions\(LogicalName='([^']+)'\)/.exec(url);
+      if (meta) return { statusCode: 200, headers: {}, body: JSON.stringify({ LogicalName: meta[1], EntitySetName: `${meta[1]}s` }) };
+      const linked = linkRows(url);
+      if (linked !== undefined) return { statusCode: 200, headers: {}, body: JSON.stringify({ value: linked }) };
+      if (/\/\$batch$/.test(url)) {
+        batches.push(body);
+        return batches.length === 1 ? refusal : { statusCode: 200, headers: {}, body: batchResponseFor(body) };
+      }
+      if (/\/appmodules\([^)]+\)/.test(url)) return { statusCode: 200, headers: {}, body: JSON.stringify(appRow()) };
+      if (SITEMAP_BY_ID.test(url)) return { statusCode: 200, headers: { etag: SITEMAP_ROW_ETAG }, body: JSON.stringify({ sitemapid: SITEMAP_ID }) };
+      if (url.includes('/sitemaps')) return { statusCode: 200, headers: {}, body: JSON.stringify({ value: [sitemapRow()] }) };
+      return { statusCode: 200, headers: {}, body: JSON.stringify({ value: [] }) };
+    };
+    const httpClient = createAzHttpClient('https://example.crm.dynamics.com', { getToken: () => 'TOK', request, random: () => 0, sleep: async (ms) => { slept.push(ms); } });
+    const sdk = createMakerSdk({ workspaceStorage: createNodeWorkspaceStorage(dir), instanceUrl: 'https://example.crm.dynamics.com', httpClient });
+    await sdk.initWorkspace();
+
+    const r = await sdk.deleteAppCascade(APP_ID, APP_UNIQUE_ID);
+    assert.ok(r.success, `cascade reported failure: ${JSON.stringify(r.failures)}`);
+    assert.strictEqual(batches.length, 2, 'the refused change set was sent once more');
+    assert.strictEqual(batches[1], batches[0], 'the same change set, byte for byte');
+    assert.deepStrictEqual(slept, [refusal.headers['retry-after'] ? 3000 : 1000], 'the throttle backoff, or longer when Retry-After asks');
+  });
+}
+
+// Measured live, in two teardowns: the solution delete that ends a teardown was refused with
+// `[Uninstall] … another [EntityCustomization] running … Please try again later`, and both finished with the
+// solution left behind. The same answer, through the real SDK's deleteSolution and the plugin transport.
+test('REAL BUNDLE + REAL TRANSPORT: a solution delete refused with 429 is re-sent; one refused every time surfaces as the failure it is', async () => {
+  const { createMakerSdk, createNodeWorkspaceStorage } = require(BUNDLE);
+  const SOLUTION_ID = '44444444-4444-4444-4444-444444444444';
+  const refused = { statusCode: 429, headers: {}, body: JSON.stringify({ error: { code: '0x80071151', message: 'Cannot start the requested operation [Uninstall] because there is another [EntityCustomization] running at this moment. Use Solution History for more details. -- The solution installation or removal failed due to the installation or removal of another solution at the same time. Please try again later.' } }) };
+  const run = async (answers) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soldel-'));
+    tempDirs.push(dir);
+    const deletes = [];
+    const request = async ({ url, method }) => {
+      if (method === 'DELETE') { deletes.push(url); return answers(deletes.length); }
+      return { statusCode: 200, headers: {}, body: JSON.stringify({ value: [] }) };
+    };
+    const httpClient = createAzHttpClient('https://example.crm.dynamics.com', { getToken: () => 'TOK', request, sleep: async () => {} });
+    const sdk = createMakerSdk({ workspaceStorage: createNodeWorkspaceStorage(dir), instanceUrl: 'https://example.crm.dynamics.com', httpClient });
+    await sdk.initWorkspace();
+    let error = null;
+    try { await sdk.deleteSolution(SOLUTION_ID); } catch (e) { error = e; }
+    return { deletes, error };
+  };
+
+  const recovered = await run((n) => (n <= 2 ? refused : { statusCode: 204, headers: {}, body: '' }));
+  assert.strictEqual(recovered.error, null, recovered.error && recovered.error.message);
+  assert.strictEqual(recovered.deletes.length, 3, 'two refusals, then the delete that ran');
+  assert.ok(recovered.deletes.every((u) => u.includes(`solutions(${SOLUTION_ID})`)));
+
+  const stuck = await run(() => refused);
+  assert.ok(stuck.error, 'a lock that never clears is still reported, not swallowed');
+  assert.match(String(stuck.error.message), /429|EntityCustomization/);
+  assert.strictEqual(stuck.deletes.length, 6, 'six attempts, like any other throttled request');
 });

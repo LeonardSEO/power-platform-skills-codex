@@ -46,7 +46,7 @@ You will be invoked by `/create-mobile-app` Step 11 or `/edit-app` screen-rebuil
 
 - **HARD RULE — Route Intent Matrix + tap idempotency.** Navigation APIs are NOT interchangeable. Apply this matrix exactly: (1) **singleton destinations** (`/(app)/workout/form`, `/(app)/recovery/form`, `/login`, and any route the plan marks singleton) use `router.navigate(...)`, never `router.push(...)`; (2) **entity detail drill-down** routes use `router.push(...)`; (3) **auth/guard redirects** use `router.replace(...)`. Any primary navigation CTA (`Start`, `Continue`, `Open`, `Next`) must be double-tap safe: lock with `isNavigating`, early-return when true, set lock before calling router, and unlock in `finally` (or after transition callback). On iOS this prevents duplicate transitions and accidental double stack entries.
 
-- **HARD RULE — Profile owns sign-out, but is not sign-out-only.** Every generated app has a Profile screen at `/(app)/profile`. If your assigned screen is Profile, render the planned app-specific profile sections first, then a visible text button labeled `Sign out` exactly where the spec places it. Use `signOut` from `useAuth()`; do not call `npx power-apps logout`, clear storage manually, or invent a custom auth service. Confirm before signing out, then call `signOut()` and `router.replace('/login')`. Non-Profile screens must not add sign-out actions.
+- **HARD RULE — Profile owns sign-out, but is not sign-out-only.** Every generated app has a Profile screen at `/(app)/profile`. If your assigned screen is Profile, render the planned app-specific profile sections first, then a visible text button labeled `Sign out` exactly where the spec places it. Use `signOut` from `useAuth()`; do not call `pa auth logout`, clear storage manually, or invent a custom auth service. Confirm before signing out, then call `signOut()` and `router.replace('/login')`. Non-Profile screens must not add sign-out actions.
 
 - **HARD RULE — `useLocalSearchParams<{}>` type for THIS screen MUST be the EXACT union from the Navigation Contracts row, not a synthesized "what this screen needs" type.** The planner enforces param-union: every param ANY sender pushes to your route is listed in the contracts table for your route. Your `useLocalSearchParams<{}>` declaration MUST include every one of those params (path params required, query params optional with `?`). Even if your screen's content only uses some of them, the OTHERS are still received from senders and must be declared so they're typed correctly — undeclared params are silently dropped at runtime, breaking the senders.
 
@@ -106,6 +106,7 @@ You will be invoked by `/create-mobile-app` Step 11 or `/edit-app` screen-rebuil
   3. **If your spec's service is NOT in the table** (or your fallback Glob doesn't find it) — the data source has not been generated yet. Write the screen with the expected import path from your spec and add `// TODO(connector-not-yet-added): run /add-dataverse to generate <ServiceName>` above the call. Do NOT invent a service or rename to something that does exist.
   4. **Method missing on a service that does exist** (table lists `getAll, get` but spec calls `update`) — do NOT silently substitute. Add `// TODO(method-missing): <ServiceName>.update not generated; expected per plan` and write the call as-if; orchestrator's tsc pass will catch it and surface to user.
 - **Generated service results are non-throwing and create results may be sparse.** Power Apps generated services return `IOperationResult<T>` (`success`, `data`, `error`) and may not throw on failed network/API calls. After every `get`, `getAll`, `create`, `update`, or `delete` call, check `result.success`. If false, throw or surface `result.error` immediately. Never rely on `try/catch` alone and never read `result.data` without a preceding success check. For `create()`, success does **not** guarantee `result.data` contains the new primary ID; the SDK may return 204-style success with sparse/empty data. If the screen needs the new record ID for navigation, child rows, lookup binds, or file/photo upload, follow the create-then-navigate rule below and pre-generate the ID with `newId()`. Bug prevented: visible buttons that silently no-op because the initial load/create failed and `record` stayed null; detail routes like `/scanner/undefined` that call Dataverse as `table(undefined)`.
+- **Custom events are explicit and app-defined.** If and only if the assigned screen spec contains a `Custom events` entry, import `getCustomEventsLogger` from `@microsoft/power-apps-native-host` and emit exactly those named events at the specified successful/failure trigger. Never use `getAppLogger()` for custom events. Pass only the approved scalar properties from the spec; do not add operation results or response payloads, form values, free text, record titles, personal identifiers, tokens, precise coordinates, nested objects, or complete URLs. For a measured duration, use the logger's `trackScenario()` tracker rather than a hand-supplied `duration_ms` property. If custom events are disabled, the custom-events logger is a safe no-op.
 - **Dataverse display labels — use the `lookupName` / `formattedValue` helpers from `@/utils`, never inline annotation reads or guessed `*name` fields.** This is a hard rule for list rows, detail fields, search/filter fields, and empty-state summaries. Do NOT select, read, search, or destructure invented lookup/choice display fields such as separate `*idname`, `*statusname`, `*owneridname`, `*createdbyname`, or other `*name` shadow properties — those virtual columns are NOT queryable on custom entities and putting them in `$select` returns HTTP 400 on every list read. Do NOT inline the raw annotation key (`record['_<lookup>_value@OData.Community.Display.V1.FormattedValue']`) either — it is brittle and easy to typo. Always:
 
   ```tsx
@@ -218,7 +219,7 @@ You will be invoked by `/create-mobile-app` Step 11 or `/edit-app` screen-rebuil
 
 - **Dataverse image rendering rule (detail/list screens).** If a screen displays a Dataverse Image column, include the real image/base64 field in `select` and render a `data:image/<mime>;base64,...` URI when base64 is present. Do not rely on guessed URL/display pseudo-fields alone.
 
-- **Native capabilities: use `src/native/` wrappers, NOT raw Expo modules.** `/add-native` creates typed wrappers under `src/native/` (e.g., `camera.ts`, `cameraUpload.ts`, `secureStore.ts`, `documentPicker.ts`, `pdfReport.ts`, `pdfViewer.ts`, `penInput.ts`, `geolocation.ts`). For non-Dataverse native workflows, always import from these wrappers — never import `expo-camera`, `expo-image-picker`, `expo-document-picker`, `expo-print`, `expo-secure-store`, `expo-file-system`, `expo-sharing`, `@microsoft/power-apps-native-pdf-viewer`, `@microsoft/power-apps-native-pen-input`, or `@microsoft/power-apps-native-bglocation` directly in screen files. The wrappers handle permissions, iOS/Android platform differences, URL validation, and return discriminated-union results (`{ ok: true, ... } | { ok: false, reason }`). If a wrapper doesn't exist yet, write the screen with the expected import path and a `// TODO(native-not-yet-added): run /add-native <capability> to create src/native/<wrapper>.ts` comment. For `camera.ts`, use `/add-native camera`; for `barcodeScanner.tsx`, use `/add-native barcode-scanner`; for `pdfReport.ts`, use `/add-native pdf-report`; for `pdfViewer.ts`, use `/add-native pdf-viewer` or `/add-native @microsoft/power-apps-native-pdf-viewer`; for `penInput.ts`, use `/add-native pen-input` or `/add-native @microsoft/power-apps-native-pen-input`; for `geolocation.ts`, use `/add-native geolocation` or `/add-native @microsoft/power-apps-native-bglocation`. **`expo-notifications` and `expo-haptics` are NOT available** — per AGENTS.md §2 and the HARD RULE below for haptics. If the plan tells you to use an unavailable capability, return `NEEDS_CONTEXT` — do not import it.
+- **Native capabilities use `src/native/` wrappers.** `/add-native` creates typed wrappers under `src/native/` (e.g., `camera.ts`, `cameraUpload.ts`, `secureStore.ts`, `documentPicker.ts`, `pdfReport.ts`, `pdfViewer.ts`, `penInput.ts`, `geolocation.ts`, `haptics.ts`). For non-Dataverse native workflows, screen files import these wrappers; the wrapper implementation owns imports from `expo-camera`, `expo-image-picker`, `expo-document-picker`, `expo-print`, `expo-secure-store`, `expo-file-system`, `expo-sharing`, `expo-haptics`, `@microsoft/power-apps-native-pdf-viewer`, `@microsoft/power-apps-native-pen-input`, or `@microsoft/power-apps-native-bglocation`. The wrappers handle permissions, iOS/Android platform differences, URL validation, and return discriminated-union results (`{ ok: true, ... } | { ok: false, reason }`). If a wrapper doesn't exist yet, write the screen with the expected import path and a `// TODO(native-not-yet-added): run /add-native <capability> to create src/native/<wrapper>.ts` comment. For `camera.ts`, use `/add-native camera`; for `barcodeScanner.tsx`, use `/add-native barcode-scanner`; for `pdfReport.ts`, use `/add-native pdf-report`; for `pdfViewer.ts`, use `/add-native pdf-viewer` or `/add-native @microsoft/power-apps-native-pdf-viewer`; for `penInput.ts`, use `/add-native pen-input` or `/add-native @microsoft/power-apps-native-pen-input`; for `geolocation.ts`, use `/add-native geolocation` or `/add-native @microsoft/power-apps-native-bglocation`; for `haptics.ts`, use `/add-native haptics`. `expo-notifications` remains unavailable. If the plan tells you to use an unavailable capability, return `NEEDS_CONTEXT`.
 
 - **Planned pure-JavaScript dependencies may be imported directly.** Follow `${PLUGIN_ROOT}/shared/references/javascript-dependency-planning.md`'s Builder Contract. Before importing any non-template package, verify it appears with an exact version in `## Screens → ### JavaScript Dependencies` and in the project's `package.json` `dependencies`, and that `require.resolve('<package>', { paths: [working_dir] })` succeeds. If the plan lists it but installation is missing, return `BLOCKED [<screen_name>]: approved JavaScript dependency <package>@<version> is not installed — orchestrator must install dependencies before builders run.` If it is not in the approved table, return `NEEDS_CONTEXT` instead of adding it yourself. Builders never select packages, edit `package.json`, or run installs. Import and use only the package APIs named by the approved per-screen spec.
 
@@ -262,7 +263,7 @@ You will be invoked by `/create-mobile-app` Step 11 or `/edit-app` screen-rebuil
 
 - **Camera evidence flows MUST expose a visible `Take picture` action.** If the spec, route name, or table purpose includes camera evidence, photo evidence, proof photos, scan evidence, inspection photos, or any custom camera capture/upload flow, the screen must show a first-class button labeled `Take picture` (or a domain-specific equivalent beginning with `Take`, such as `Take evidence photo`) that calls `takePhoto()` from `src/native/camera`. Do not hide camera capture behind gallery-only upload, a file picker, an overflow menu, or a detail-only affordance. Gallery/upload can be a secondary sibling action, but camera capture must be visible in the main content or bottom action bar. After capture, if the photo is written to Dataverse, follow the create-then-navigate/upload rule: pre-generate any needed parent/evidence ID with `newId()`, check every write/upload result, and keep the user on the screen with inline error UI if capture/upload fails.
 
-- **HARD RULE — NEVER use `expo-haptics` in any generated screen.** Even though the package may appear in `package.json`, it crashes at runtime in the current rewrap binary (the native module isn't bundled into the binary the customer's app loads — `Haptics.notificationAsync()` / `Haptics.impactAsync()` throw on first call). Visual-only feedback for all interactions: button press uses `pressStyle={{ scale: 0.98 }}`, success uses a green pill / banner / snackbar, error uses inline error text + retry button, toggle uses Switch's visible state change. NEVER write `import * as Haptics from 'expo-haptics'` — it WILL crash the running app, and the screen-builder hooks will block the write anyway.
+- **Haptics usage.** When the screen spec includes haptics, import `triggerImpact`, `triggerNotification`, or `triggerSelection` from `src/native/haptics`. Use impact feedback for deliberate presses, selection feedback when a selected value changes, and notification feedback only after a success, warning, or error outcome is known. Inspect the wrapper result and log a non-OK result without turning an otherwise successful operation into a failure. Haptics supplement visible state; buttons, banners, inline errors, and selected states must remain understandable when vibration is unavailable or disabled. Do not trigger haptics during render, loading loops, or repeated list events.
 - **React Query (`@tanstack/react-query`) is the default for server state.** The template ships it (`package.json`), and current `@microsoft/power-apps-native-host` wraps the app with `QueryClientProvider` inside `PowerAppsProvider`. **Never re-wire the provider from a screen file** and never construct a new `QueryClient` inside a component. Use `useQuery` for reads, `useMutation` for writes (create / update / delete), `useInfiniteQuery` for cursor-paginated lists, and `useQueryClient()` for invalidation. The raw `useEffect` + `useState` skeleton in Step 3 is only a fallback for screens where the spec explicitly excludes React Query (rare). Required usage rules:
   - **Query keys are arrays starting with the entity, then params.** Examples: `['inspections']`, `['inspections', { status: 'open' }]`, `['inspection', id]`. Consistent shape lets `queryClient.invalidateQueries({ queryKey: ['inspections'] })` from a sibling mutation invalidate every variant in one line.
   - **After every successful mutation, invalidate the affected query keys.** Pattern:
@@ -276,7 +277,7 @@ You will be invoked by `/create-mobile-app` Step 11 or `/edit-app` screen-rebuil
     });
     ```
     Without invalidation, the parent list shows stale data after the user pops back. This is the most common React Query bug in this plugin's generated screens.
-  - **Loading button rule (#38) consumes `isPending`.** A submit button on a `useMutation` flow MUST disable while `isPending`, label-swap, and trigger any visible success state inside `onSuccess` (green pill / banner / snackbar). Never haptic — see hard rule above.
+  - **Loading button rule (#38) consumes `isPending`.** A submit button on a `useMutation` flow MUST disable while `isPending`, label-swap, and trigger visible success state inside `onSuccess` (green pill / banner / snackbar). When the approved screen spec includes haptics, call `triggerNotification('success')` after setting that visible success state and handle its result as described above.
   - **Focus refetch is handled by React Query** — see the `useFocusEffect` rule below for the exception. Do NOT pair `useQuery` with `useFocusEffect`; pick one.
 - **Refresh on focus, never on mount.** Data loading on a screen MUST use `useFocusEffect` from `expo-router` wrapped in `React.useCallback` — NEVER `useEffect` with `[]`/`[loadX]` dependencies for the initial fetch on a list, detail, or any screen the user can navigate back to. `useEffect` only runs on mount; React Navigation keeps screens mounted when a child is pushed, so popping back to the list never re-fetches and the user sees stale data after a create/update/delete in a child screen. `useFocusEffect` re-runs every time the screen regains focus (mount AND re-focus), which is what users expect.
   - **Required import:** `import { useFocusEffect } from 'expo-router';` — not `@react-navigation/native`.
@@ -715,7 +716,12 @@ Dynamic token values are not always type-checked; unknown aliases can render lit
 Read: <working_dir>/tamagui.config.ts
 ```
 
-Require Tamagui 2, `@tamagui/config/v5`, both customization markers, and marker-based `customConfig`. Otherwise return `BLOCKED: stale Tamagui template; expected Tamagui 2 with Config v5`.
+Require Tamagui 2, both customization markers,
+`createPowerAppsTamaguiConfig`, and marker-based `customConfig`. The default
+`customConfig` may be empty because the native host supplies Config v5,
+animations, semantic aliases, contrast handling, and the `fonts.mono`
+fallback. Otherwise return `BLOCKED: stale Tamagui template; expected the
+native-host Tamagui config factory`.
 
 Read the effective customizations:
 
@@ -724,7 +730,12 @@ Read the effective customizations:
 - `customConfig.fonts` — added families such as `heading`, `body`, and `mono`.
 - `customConfig.themes` — light/dark semantic overrides.
 
-Config v5 supplies the standard theme values listed below. Use custom token aliases only when `customConfig` defines them; never infer aliases from naming conventions.
+The native-host factory always supplies this semantic contract:
+`$surface0`-`$surface3`, `$mediaSurface`, `$accentDeep`, `$accentBase`,
+`$accentSoft`, `$accentOnAccent`, `$text0`-`$text3`, all documented
+`$status*` foreground/background pairs, and `$mono`. Config v5 supplies the
+standard numbered values. Use other custom aliases only when `customConfig`
+defines them; never infer additional aliases from naming conventions.
 
 **Forbidden — do NOT use any of these in your TSX, ever:**
 
@@ -733,7 +744,7 @@ Config v5 supplies the standard theme values listed below. Use custom token alia
 | `color="$color"` (no number) | Renders as literal string → invisible text | `color="$color12"` (text), `color="$color9"` (muted) |
 | `bg="$bg"` (no number) | Same — silently broken | `bg="$background"` or `bg="$color2"` |
 | `color="$primary"` | Stock Tamagui has no `$primary`; only brand configs may | `color="$accentBase"` if defined, else `color="$blue10"` |
-| Any `$<name>` you didn't see in `tamagui.config.ts` | Will render as the literal `'$<name>'` string | Read the config and pick a real token |
+| Any `$<name>` outside the native-host contract and not defined in `tamagui.config.ts` | Will render as the literal `'$<name>'` string | Use a host semantic token, a Config v5 standard value, or a visible app-defined token |
 | Raw hex (`#1a1a1a`, `#fff`) | Bypasses the design system; breaks dark mode | Always a token |
 
 **Config v5 props:** `onlyAllowShorthands` is enabled. Use v5 shorthands (`bg`, `items`, `justify`, `rounded`, `text`, `self`, `grow`/`shrink`, min/max, spacing, and edge shorthands) whenever defined. Keep unaliased longhands such as `flex`, `width`, `height`, `color`, `position`, `fontSize`, and `fontWeight`. Never use v4 aliases (`ai`, `jc`, `br`, `f`, `w`, `h`, `col`, `pos`, `ta`, `als`, `tt`, `ls`) or a longhand that v5 aliases.
@@ -904,14 +915,15 @@ export default function <ScreenName>Screen() {
 
 - **Detail routes** like `/(app)/inspections/[id]` use `useLocalSearchParams<{ id: string }>()` from `expo-router`
 - **Form screens** use `react-hook-form` if installed; otherwise inline `useState` per field for v0
+- **Tamagui text controls** — use `onChangeText={(text) => ...}` for `<Input>` and `<TextArea>`. Do not read `target.value` or `nativeEvent.text` from their `onChange` event: Tamagui types that callback as a web `Event`, while `onChangeText` is consistently string-valued on web and native.
 - **Choice / picklist fields in forms** — use Tamagui `<Select>` with the generated const. The const lives in `src/generated/models/<Entity>Model.ts` and maps int values (as string keys) to label strings (e.g. `Cr123_Projectstatus = { '100000000': 'Active', ... }`). Use `Object.entries(Const)` to build `<Select.Item>` elements. Convert to/from string at the `Select` boundary (`String(field.value)` in, `Number(v)` out). Never hardcode option values. For read-only display (list rows, detail fields), use the `formattedValue(record, '<columnLogicalName>')` helper from `@/utils`, or fall back to the generated const lookup (`Cr123_Projectstatus[String(record.cr123_status)]`). NEVER invent/read a separate `*name` shadow property and NEVER inline the raw annotation key. See the "Choice / picklist select" recipe in `shared/references/tamagui-component-recipes.md`.
   - **Fallback — const missing or model file absent:** emit a plain `<Input>` storing the raw int as a string, with a TODO comment:
     ```tsx
     {/* TODO(choice-missing): No option const found for cr123_status in Cr123_ProjectModel.ts.
-      Re-run `npx power-apps add-data-source` from the app root with explicit connector/table flags to regenerate, then replace with <Select>. */}
+      Re-run `$PA app add data-source` from the app root with explicit connector/table flags to regenerate, then replace with <Select>. */}
     <Input
       value={String(field.value ?? '')}
-      onChange={event => field.onChange(Number(event.target?.value ?? event.nativeEvent?.text ?? ''))}
+      onChangeText={value => field.onChange(Number(value) || 0)}
       inputMode="numeric"
     />
     ```
@@ -1108,31 +1120,10 @@ Follow these whenever the spec touches navigation, list rows, or modals. Recipes
 
     The large title collapses on scroll (iOS Settings / Mail / App Store). On Android it degrades to a standard toolbar. Pass `contentInsetAdjustmentBehavior="automatic"` to your `ScrollView` or `FlatList` so content scrolls under the collapsing header. Detail and Form screens pushed onto the stack do NOT use large title — they use `headerShown: true` with standard height.
 
-41. **Connectivity banner — use `@react-native-community/netinfo` (already in template).** Every app MUST show a persistent "No connection" banner when the device loses connectivity. Do NOT build this per-screen — it lives in `app/(app)/_layout.tsx` (or `src/components/ConnectivityBanner.tsx` if the orchestrator created it). If the banner primitive exists, do nothing. If your screen is the protected layout (`_layout.tsx`), wire it:
-
-    ```tsx
-    import NetInfo from '@react-native-community/netinfo';
-    import { useTheme } from 'tamagui';
-
-    const [isConnected, setIsConnected] = React.useState(true);
-    const theme = useTheme();
-    React.useEffect(() => {
-      const unsub = NetInfo.addEventListener(state => {
-        setIsConnected(state.isConnected ?? true);
-      });
-      return () => unsub();
-    }, []);
-
-    // Render above the slot/navigator:
-    {!isConnected && (
-      <XStack bg="$red4" px="$4" py="$2" items="center" justify="center" gap="$2">
-        <Ionicons name="cloud-offline-outline" size={16} color={theme.red10.val} />
-        <Text fontSize="$2" fontWeight="600" color="$red10">No connection</Text>
-      </XStack>
-    )}
-    ```
-
-    This is different from the offline *sync* bar (which tracks pending local writes). The connectivity banner is binary: connected or not. Field apps lose signal constantly — users must know before they tap Save and get a silent failure.
+41. **Connectivity UI follows the approved specification.** Apply
+    [`shared/references/connectivity-intent-ownership.md`](../shared/references/connectivity-intent-ownership.md).
+    Implement connectivity diagnostics or app-owned sync UI only when the
+    approved per-screen specification names that product feature.
 
 42. **Layout animations on list add/remove.** Every `FlatList` that supports create or delete MUST animate insertions and removals. Wrap `renderItem` content in Reanimated `Animated.View` with `entering`, `exiting`, and `layout` props:
 
@@ -1163,7 +1154,7 @@ Follow these whenever the spec touches navigation, list rows, or modals. Recipes
 Before returning a status, run the mobile changed-file dispatcher against exactly `target_file`:
 
 ```bash
-node "${PLUGIN_ROOT}/scripts/validate-mobile-files.js" --project-root "<working_dir>" --file "<target_file>"
+node "${PLUGIN_ROOT}/scripts/validate-mobile-files.js" --project-root '<working_dir>' --file '<target_file>'
 ```
 
 If it exits `2`, repair every reported violation and rerun it. Do not return `DONE` until it exits `0`. This explicit mobile-owned gate replaces the former plugin-wide write hooks, which also ran during unrelated Canvas Apps workflows.

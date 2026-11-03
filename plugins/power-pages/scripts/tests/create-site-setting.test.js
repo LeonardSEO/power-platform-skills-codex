@@ -4,7 +4,11 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-const { createTempProject } = require('./test-utils');
+const {
+  createTempProject,
+  createTempNonSpaSite,
+  writeProjectFile,
+} = require('./test-utils');
 
 function runCreateSiteSetting(args) {
   const cliPath = path.join(__dirname, '..', 'create-site-setting.js');
@@ -17,7 +21,7 @@ test('create-site-setting creates a value-backed site setting', (t) => {
   const projectRoot = createTempProject(t);
   const result = runCreateSiteSetting([
     '--projectRoot', projectRoot,
-    '--name', 'Webapi/test/enabled',
+    '--name', ' Webapi/test/enabled ',
     '--value', 'true',
     '--description', 'Enable test setting',
     '--type', 'boolean',
@@ -54,6 +58,92 @@ test('create-site-setting creates an environment-variable-backed site setting', 
   assert.doesNotMatch(yaml, /^description:/m);
 });
 
+test('create-site-setting appends aggregate PAC settings and retains source convention', (t) => {
+  const siteRoot = createTempNonSpaSite(t);
+  const aggregatePath = writeProjectFile(
+    siteRoot,
+    'sitesetting.yml',
+    [
+      '- adx_name: Existing/Setting',
+      '  adx_sitesettingid: 11111111-1111-4111-8111-111111111111',
+      '  adx_source: 0',
+      '  adx_value: existing',
+      '',
+    ].join('\n')
+  );
+  const before = fs.readFileSync(aggregatePath, 'utf8');
+
+  const result = runCreateSiteSetting([
+    '--projectRoot', siteRoot,
+    '--name', 'Webapi/contact/enabled',
+    '--value', 'true',
+    '--description', 'Enable contact Web API',
+    '--type', 'boolean',
+  ]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.filePath, aggregatePath);
+  assert.equal(output.storage, 'aggregate');
+  const after = fs.readFileSync(aggregatePath, 'utf8');
+  assert.ok(after.startsWith(before));
+  assert.match(after, /- adx_description: Enable contact Web API/);
+  assert.match(after, /  adx_name: Webapi\/contact\/enabled/);
+  assert.match(after, /  adx_source: 0/);
+  assert.match(after, /  adx_value: true/);
+});
+
+test('create-site-setting does not invent adx_source when aggregate metadata omits it', (t) => {
+  const siteRoot = createTempNonSpaSite(t);
+  const aggregatePath = writeProjectFile(
+    siteRoot,
+    'sitesetting.yml',
+    [
+      '- adx_name: Existing/Setting',
+      '  adx_sitesettingid: 11111111-1111-4111-8111-111111111111',
+      '  adx_value: existing',
+      '',
+    ].join('\n')
+  );
+
+  const result = runCreateSiteSetting([
+    '--projectRoot', siteRoot,
+    '--name', 'Webapi/contact/fields',
+    '--value', 'fullname',
+    '--description', 'Contact fields',
+  ]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const after = fs.readFileSync(aggregatePath, 'utf8');
+  const createdRecord = after.slice(after.indexOf('- adx_description: Contact fields'));
+  assert.doesNotMatch(createdRecord, /adx_source:/);
+});
+
+test('create-site-setting rejects mixed aggregate and per-record storage', (t) => {
+  const siteRoot = createTempNonSpaSite(t);
+  writeProjectFile(
+    siteRoot,
+    'sitesetting.yml',
+    '- adx_name: Existing\n  adx_sitesettingid: 11111111-1111-4111-8111-111111111111\n'
+  );
+  writeProjectFile(
+    siteRoot,
+    'site-settings/existing.sitesetting.yml',
+    'id: 22222222-2222-4222-8222-222222222222\nname: Existing Per Record\nvalue: true\n'
+  );
+
+  const result = runCreateSiteSetting([
+    '--projectRoot', siteRoot,
+    '--name', 'Webapi/contact/enabled',
+    '--value', 'true',
+    '--description', 'Enable contact Web API',
+    '--type', 'boolean',
+  ]);
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Mixed site-setting serialization/);
+});
+
 test('create-site-setting rejects mixing environment-variable and value inputs', (t) => {
   const projectRoot = createTempProject(t);
   const result = runCreateSiteSetting([
@@ -65,6 +155,59 @@ test('create-site-setting rejects mixing environment-variable and value inputs',
 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /cannot be combined with --value or --description/);
+});
+
+test('create-site-setting rejects wildcard Web API fields', (t) => {
+  const projectRoot = createTempProject(t);
+  const result = runCreateSiteSetting([
+    '--projectRoot', projectRoot,
+    '--name', 'Webapi/test/fields',
+    '--value', 'test_name,*',
+    '--description', 'Allowed test fields',
+  ]);
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /requires an explicit comma-separated column list/);
+  assert.match(result.stderr, /_<LogicalName>_value for lookup reads/);
+  assert.match(result.stderr, /Navigation Property before @odata.bind for lookup writes/);
+});
+
+test('create-site-setting rejects wildcard Web API fields when the setting name has whitespace', (t) => {
+  const projectRoot = createTempProject(t);
+  const result = runCreateSiteSetting([
+    '--projectRoot', projectRoot,
+    '--name', ' Webapi/test/fields ',
+    '--value', '*',
+    '--description', 'Allowed test fields',
+  ]);
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /requires an explicit comma-separated column list/);
+});
+
+test('create-site-setting detects duplicate names after trimming whitespace', (t) => {
+  const projectRoot = createTempProject(t);
+  const first = runCreateSiteSetting([
+    '--projectRoot', projectRoot,
+    '--name', 'Webapi/test/fields',
+    '--value', 'test_name',
+    '--description', 'Allowed test fields',
+  ]);
+  assert.equal(first.status, 0, first.stderr);
+
+  const duplicate = runCreateSiteSetting([
+    '--projectRoot', projectRoot,
+    '--name', ' Webapi/test/fields ',
+    '--value', 'test_name',
+    '--description', 'Duplicate test fields',
+  ]);
+  assert.equal(duplicate.status, 1);
+  assert.match(duplicate.stderr, /already exists/);
+});
+
+test('create-site-setting allows wildcard values for unrelated settings', (t) => {
+  const yaml = getWrittenYaml(t, 'HTTP/Access-Control-Allow-Origin', '*');
+  assert.match(yaml, /^value: "\*"$/m);
 });
 
 // --- YAML quoting edge cases ---

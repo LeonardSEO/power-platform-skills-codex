@@ -25,6 +25,8 @@ jobs:
       POWER_PLATFORM_SKILLS_TELEMETRY_CODE_APPS_PREVIEW_OPTOUT: "1"
       POWER_PLATFORM_SKILLS_TELEMETRY_MOBILE_APP_OPTOUT: "1"
       POWER_PLATFORM_SKILLS_TELEMETRY_POWER_AUTOMATE_OPTOUT: "1"
+      POWER_PLATFORM_SKILLS_TELEMETRY_PCF_OPTOUT: "1"
+      POWER_PLATFORM_SKILLS_TELEMETRY_POWER_APPS_MOBILE_EXTENSION_OPTOUT: "1"
 
     steps:
       - name: Check out Codex marketplace
@@ -41,6 +43,14 @@ jobs:
           path: .upstream-source
           fetch-depth: 1
 
+      - name: Check out Microsoft Dataverse upstream
+        uses: actions/checkout@v7
+        with:
+          repository: microsoft/Dataverse-skills
+          ref: main
+          path: .dataverse-source
+          fetch-depth: 1
+
       - name: Use Node.js 22
         uses: actions/setup-node@v7
         with:
@@ -52,14 +62,18 @@ jobs:
         run: |
           upstream_commit="$(git -C .upstream-source rev-parse HEAD)"
           echo "upstream_commit=$upstream_commit" >> "$GITHUB_OUTPUT"
+          dataverse_commit="$(git -C .dataverse-source rev-parse HEAD)"
+          echo "dataverse_commit=$dataverse_commit" >> "$GITHUB_OUTPUT"
+          node scripts/sync-dataverse.mjs "$GITHUB_WORKSPACE/.dataverse-source" "$dataverse_commit"
           bash scripts/sync-upstream.sh \
             "$GITHUB_WORKSPACE/.upstream-source" \
             "$upstream_commit"
-          rm -rf .upstream-source
+          rm -rf .upstream-source .dataverse-source
 
       - name: Create, update, and merge synchronization pull request
         env:
           GH_TOKEN: ${{ github.token }}
+          DATAVERSE_COMMIT: ${{ steps.synchronize.outputs.dataverse_commit }}
           UPSTREAM_COMMIT: ${{ steps.synchronize.outputs.upstream_commit }}
         shell: bash
         run: |
@@ -86,6 +100,8 @@ jobs:
             echo
             echo "- Repository: \`microsoft/power-platform-skills\`"
             echo "- Commit: \`$UPSTREAM_COMMIT\`"
+            echo
+            echo "- Dataverse: \`microsoft/Dataverse-skills@$DATAVERSE_COMMIT\`"
             echo
             echo "Codex manifests, compatibility fixes, and the telemetry hard-off"
             echo "were reapplied automatically. \`npm test\` passed before this PR"

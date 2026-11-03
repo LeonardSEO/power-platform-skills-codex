@@ -5,7 +5,7 @@
 
 A Codex-optimized distribution of Microsoft's
 [`power-platform-skills`](https://github.com/microsoft/power-platform-skills).
-It packages the complete Power Platform marketplace for Codex while preserving
+It packages the local Power Platform plugins for Codex while preserving
 compatibility with the upstream Claude Code and GitHub Copilot CLI formats.
 
 This is an independent, unofficial adaptation. Microsoft remains the author and
@@ -15,15 +15,22 @@ copyright holder of the upstream content.
 
 | Plugin | Skills | Purpose |
 | --- | ---: | --- |
-| `power-pages` | 33 | Build and deploy Power Pages code sites |
+| `power-pages` | 39 | Build and deploy Power Pages code sites |
 | `model-apps` | 4 | Build generative pages for model-driven apps |
-| `mcp-apps` | 2 | Generate interactive MCP App widgets |
+| `mcp-apps` | 3 | Generate interactive MCP App widgets |
 | `canvas-apps` | 4 | Author Canvas Apps through the Canvas Authoring MCP server |
 | `code-apps-preview` | 15 | Build React and Vite Power Apps code apps |
-| `mobile-app` | 28 | Build Expo and React Native Power Apps |
-| `power-automate` | 11 | Build, edit, publish, run, and debug cloud flows |
+| `mobile-app` | 31 | Build Expo and React Native Power Apps |
+| `power-automate` | 12 | Build, edit, publish, run, and debug cloud flows |
+| `pcf` | 3 | Build, test, deploy, and verify PCF components (preview) |
+| `power-apps-mobile-extension` | 13 | Build native controls for wrapped Canvas apps |
+| `process-intelligence` | 10 | Analyze Power Automate Process Mining data |
+| `dataverse` | 9 | Query and manage Dataverse data, schema, security, and solutions |
 
-**Total: 7 plugins and 97 skill definitions.**
+**Total: 11 plugins and 143 skill definitions.**
+
+Dataverse is bundled from [microsoft/Dataverse-skills](https://github.com/microsoft/Dataverse-skills),
+with its own pinned upstream commit and synchronization command.
 
 ## Installation
 
@@ -35,7 +42,7 @@ Add this repository as a Codex marketplace:
 codex plugin marketplace add LeonardSEO/power-platform-skills-codex
 ```
 
-Install all seven plugins:
+Install all eleven bundled plugins:
 
 ```bash
 codex plugin add power-pages@power-platform-skills-codex
@@ -45,6 +52,10 @@ codex plugin add canvas-apps@power-platform-skills-codex
 codex plugin add code-apps-preview@power-platform-skills-codex
 codex plugin add mobile-app@power-platform-skills-codex
 codex plugin add power-automate@power-platform-skills-codex
+codex plugin add pcf@power-platform-skills-codex
+codex plugin add power-apps-mobile-extension@power-platform-skills-codex
+codex plugin add process-intelligence@power-platform-skills-codex
+codex plugin add dataverse@power-platform-skills-codex
 ```
 
 ### Universal installer
@@ -87,7 +98,8 @@ Install the desired plugins from `power-platform-skills-codex`, then run
 
 Some plugins have additional setup instructions in their own `README.md`,
 `AGENTS.md`, or setup skill.
-Power Automate FlowAgent 3.1 requires Node.js 20 or newer.
+Power Automate FlowAgent requires Node.js 20 or newer. Process Intelligence
+requires Node.js 22 or 24 LTS. See each plugin for its additional requirements.
 
 ## Usage
 
@@ -113,7 +125,7 @@ Use power-pages:create-site to create a Power Pages code site.
 
 This distribution adds and maintains the Codex-specific integration layer:
 
-- `.codex-plugin/plugin.json` manifests for all seven plugins
+- `.codex-plugin/plugin.json` manifests for all bundled plugins
 - A Codex marketplace at `.agents/plugins/marketplace.json`
 - A native Claude Code marketplace at `.claude-plugin/marketplace.json`
 - Direct `.codex.mcp.json` server maps for Codex
@@ -168,8 +180,8 @@ npm test
 
 The validation suite checks:
 
-- All seven Codex and Claude Code marketplace entries and manifests
-- All 97 skill definitions
+- All bundled Codex and Claude Code marketplace entries and manifests
+- All bundled skill definitions
 - Codex- and Claude-native MCP schemas and manifest references
 - The Codex and Claude FlowAgent startup, initialization, and tool-list handshake
 - The telemetry hard-off contract

@@ -7,6 +7,8 @@ This repository is an unofficial Codex adaptation of:
 - Upstream URL: https://github.com/microsoft/power-platform-skills
 - Upstream license: MIT
 - Upstream copyright: Microsoft Corporation
+- Dataverse source: https://github.com/microsoft/Dataverse-skills
+- Dataverse license: MIT (also retained at `plugins/dataverse/LICENSE`)
 
 The Power Platform skills, scripts, templates, references, and bundled MCP
 components originated in the Microsoft project.

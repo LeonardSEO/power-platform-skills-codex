@@ -1,7 +1,14 @@
 # Localization Reference
 
+> **Scope: generated PAGE code, not Dataverse metadata.** This file covers translating the React
+> pages `/genpage` writes — translation dictionaries, RTL, and user-settings-driven number/date
+> formatting. It does **not** cover Dataverse table, column or choice **labels**. Those are set per
+> field: a plain string uses the build-wide authoring language (`languageCode`), or write the field
+> as an LCID map to label it in several languages at once. There is no per-table language
+> (see `app-spec-schema.md` → `languageCode` and *Localized labels*).
+
 Read this only when the planner has detected multiple configured languages OR any
-non-English language via `pac model list-languages`. English-only environments
+non-English language via `scripts/list-languages.js`. English-only environments
 should skip this entire file — the page-builder will write the page without any
 localization scaffolding.
 
@@ -12,23 +19,43 @@ section, not unconditionally.
 
 ### When to Apply
 
-Only apply localization when `pac model list-languages` (run by the planner during requirements gathering) returns **multiple languages** or **any non-English language**. English-only environments skip this entire section.
+Only apply localization when `scripts/list-languages.js` (run by the planner during requirements gathering; it is the only source of the environment's languages) reports **multiple languages** or **any non-English language**. English-only environments skip this entire section.
 
 ### Language Detection
 
-Detect the user's UI language at component mount using the Xrm global context:
+Detect the user's UI language from the Xrm global context, in a **top-level** function: the page's
+error bar and render boundary (`references/rules.md`, "Missing Error Handling") are top-level
+components that translate their copy too, and a value kept in a component's closure is out of their
+reach.
 
 ```typescript
-const language = React.useMemo(() => {
-  const uiLanguageId = (typeof Xrm !== "undefined" &&
-    Xrm.Utility?.getGlobalContext()?.userSettings?.languageId) || 1033;
-  const langMap: Record<number, { code: string; name: string; isRtl: boolean }> = {
-    // Populate entries from pac model list-languages output, mapped to LCID info.
-    // Example: 1033: { code: "en-US", name: "English", isRtl: false },
-  };
-  return langMap[uiLanguageId] || { code: "en-US", name: "English", isRtl: false };
-}, []);
+type PageLanguage = { code: string; name: string; isRtl: boolean };
+// One entry per language in the plan's `## Environment` → `Languages` line, e.g.
+//   English (1033, en-US); Arabic (Saudi Arabia) (1025, ar-SA) — RTL
+// becomes the two entries below. `isRtl` is true exactly where the line carries `— RTL` (see RTL
+// Layout Support) — never from memory. A language the plan lists with no code has nothing to key a
+// translation by: it gets no entry, and the fallback below serves that user in English.
+const PAGE_LANGUAGES: Record<number, PageLanguage> = {
+  1033: { code: "en-US", name: "English", isRtl: false },
+  1025: { code: "ar-SA", name: "Arabic (Saudi Arabia)", isRtl: true },
+};
+const DEFAULT_LANGUAGE: PageLanguage = { code: "en-US", name: "English", isRtl: false };
+
+// Hook-free, so it is safe anywhere — even in the render boundary's fallback. A host without Xrm,
+// or one that throws, gets English instead of a second crash.
+function resolvePageLanguage(): PageLanguage {
+  try {
+    const uiLanguageId = (typeof Xrm !== "undefined" &&
+      Xrm.Utility?.getGlobalContext()?.userSettings?.languageId) || 1033;
+    return PAGE_LANGUAGES[uiLanguageId] || DEFAULT_LANGUAGE;
+  } catch {
+    return DEFAULT_LANGUAGE;
+  }
+}
 ```
+
+In the page component, read it once for the layout direction:
+`const language = React.useMemo(() => resolvePageLanguage(), []);`
 
 ### Translation Dictionary
 
@@ -42,25 +69,59 @@ const translations: Record<string, Record<string, string>> = {
     title: "Dashboard",
     save: "Save",
     cancel: "Cancel",
+    // The page error keys (references/rules.md, "Missing Error Handling") belong here too, in
+    // every language; a localized page has no separate English ERROR_COPY.
+    "error.read": "Unable to load data. Please try again.",
+    "error.write": "The change could not be saved. Refresh before trying again.",
+    "error.network": "The request did not go through. You can try again.",
+    "error.indeterminate": "We couldn't confirm this completed — refresh before retrying.",
+    "error.render": "This page hit a problem and could not render. Refresh the page.",
+    "error.tryAgain": "Try again",
     // ... all user-visible strings
   },
   "ar-SA": {
     title: "لوحة القيادة",
     save: "حفظ",
     cancel: "إلغاء",
+    // ... every key above, translated
   },
   // ... one entry per detected language
 };
 
-const translate = (key: string): string =>
-  translations[language.code]?.[key] || translations["en-US"]?.[key] || key;
+// Top level, so PageErrorBar and PageErrorBoundary use it as well as the page component.
+function translate(key: string): string {
+  const language = resolvePageLanguage();
+  return translations[language.code]?.[key] || translations["en-US"]?.[key] || key;
+}
 ```
 
 Usage: `<Text>{translate("title")}</Text>` — never `<Text>Dashboard</Text>`.
 
 ### RTL Layout Support
 
-Detect RTL from the language LCID. Arabic (1025, 2049, 3073, 4097, 5121) and Hebrew (1037) are RTL.
+Take each language's direction from the `rtl` field of `scripts/list-languages.js` (carried into the
+plan's `## Environment` → `Languages` line as a `— RTL` mark) — never from a hand-written list of LCIDs. The script reads
+it from a table of Windows culture data, and a list always misses some: Windows culture data marks more than 40
+right-to-left cultures — every Arabic region, Persian and Dari, Urdu, Pashto, Sindhi, Uyghur, Divehi, Syriac, Central
+Kurdish, Hebrew and Yiddish among them — and a language a list forgot renders left-to-right.
+
+If the plan marks no direction for a language (a plan written before the script reported one), compute the flag from
+the language's **Code** instead. Direction is a
+property of the script a language is written in, and `Intl.Locale#maximize()` fills in the likely script
+from CLDR (`fa` → `fa-Arab-IR`, `ur-PK` → `ur-Arab-PK`, `dv-MV` → `dv-Thaa-MV`):
+
+```typescript
+// ISO 15924 scripts written right-to-left.
+const RTL_SCRIPTS = new Set(["Arab", "Hebr", "Syrc", "Thaa", "Nkoo", "Adlm", "Rohg", "Mand", "Samr"]);
+const isRtlLocale = (code: string): boolean => {
+  try {
+    // `Intl.Locale` is typed only from the ES2020 lib, so the cast keeps an older `lib` setting compiling.
+    return RTL_SCRIPTS.has(new (Intl as any).Locale(code).maximize().script ?? "");
+  } catch {
+    return false; // not a valid BCP-47 tag
+  }
+};
+```
 
 - Wrap the root element with the `dir` attribute: `<div dir={language.isRtl ? "rtl" : "ltr"}>`.
 - Use **logical CSS properties** instead of physical ones:
@@ -77,6 +138,12 @@ Detect RTL from the language LCID. Arabic (1025, 2049, 3073, 4097, 5121) and Heb
 
 Retrieve these columns: `uilanguageid`, `localeid`, `decimalsymbol`, `numberseparator`, `currencysymbol`, `dateformatstring`, `dateseparator`.
 
+A failed read is reported through the page's `reportPageError` (rules.md → *Missing Error
+Handling*) as a `'read'` and shown in the page's `PageErrorBar` — never logged as the thrown value.
+The page still renders: the formatting helpers below fall back to the browser's locale. The block
+below is a complete `PageBody` on the page error block; the language resolver, the dictionary and
+`translate` above stay top level.
+
 ```typescript
 // Cache user settings on `window` + de-dupe the host double-mount so we retrieve
 // them once (see references/data-caching.md). Keyed globally — settings are
@@ -85,42 +152,57 @@ const winAny = window as unknown as Record<string, unknown>;
 const SETTINGS_KEY = "__ppUserSettings";
 const SETTINGS_INFLIGHT = "__ppUserSettingsInflight";
 
-const [userSettings, setUserSettings] = React.useState<any>(
-  () => (winAny[SETTINGS_KEY] as any) ?? null,
-);
-const dataReady = !!dataApi;   // never depend on `dataApi` itself — see Rule 15
+function PageBody(props: GeneratedComponentProps) {
+  const { dataApi, pageInput } = props;
+  void pageInput;
+  const language = React.useMemo(() => resolvePageLanguage(), []);
+  const [{ userSettings, settingsError }, setSettings] = React.useState<{ userSettings: any; settingsError: PageErrorView | null }>(
+    () => ({ userSettings: (winAny[SETTINGS_KEY] as any) ?? null, settingsError: null }),
+  );
+  const dataReady = !!dataApi;   // never depend on `dataApi` itself — see Rule 15
 
-React.useEffect(() => {
-  if (!dataReady) return;
-  if (winAny[SETTINGS_KEY] !== undefined) { setUserSettings(winAny[SETTINGS_KEY]); return; }
-  const currentUserId = (typeof Xrm !== "undefined" &&
-    Xrm.Utility?.getGlobalContext()?.userSettings?.userId)
-    ?.replace("{", "").replace("}", "");
-  if (!currentUserId) return;
-  let cancelled = false;
+  React.useEffect(() => {
+    if (!dataReady) return;
+    if (winAny[SETTINGS_KEY] !== undefined) {
+      if (userSettings !== winAny[SETTINGS_KEY]) setSettings({ userSettings: winAny[SETTINGS_KEY], settingsError: null });
+      return;
+    }
+    const currentUserId = (typeof Xrm !== "undefined" &&
+      Xrm.Utility?.getGlobalContext()?.userSettings?.userId)
+      ?.replace("{", "").replace("}", "");
+    if (!currentUserId) return;
+    let cancelled = false;
 
-  // Share one in-flight fetch across the two host mounts.
-  let pending = winAny[SETTINGS_INFLIGHT] as Promise<any> | undefined;
-  if (!pending) {
-    pending = dataApi.retrieveRow("usersettings" as any, {
-      id: currentUserId,
-      select: ["uilanguageid", "localeid", "decimalsymbol", "numberseparator",
-               "currencysymbol", "dateformatstring", "dateseparator"] as any,
-    })
-      .then((settings: any) => { winAny[SETTINGS_KEY] = settings; return settings; })
-      .finally(() => { if (winAny[SETTINGS_INFLIGHT] === pending) delete winAny[SETTINGS_INFLIGHT]; });
-    winAny[SETTINGS_INFLIGHT] = pending;
-  }
-  pending
-    .then((settings: any) => { if (!cancelled) setUserSettings(settings); })
-    .catch((error: any) => { if (!cancelled) console.error("Failed to fetch user settings", error); });
+    // Share one in-flight fetch across the two host mounts.
+    let pending = winAny[SETTINGS_INFLIGHT] as Promise<any> | undefined;
+    if (!pending) {
+      pending = dataApi.retrieveRow("usersettings" as any, {
+        id: currentUserId,
+        select: ["uilanguageid", "localeid", "decimalsymbol", "numberseparator",
+                 "currencysymbol", "dateformatstring", "dateseparator"] as any,
+      })
+        .then((settings: any) => { winAny[SETTINGS_KEY] = settings; return settings; })
+        .finally(() => { if (winAny[SETTINGS_INFLIGHT] === pending) delete winAny[SETTINGS_INFLIGHT]; });
+      winAny[SETTINGS_INFLIGHT] = pending;
+    }
+    pending
+      .then((settings: any) => { if (!cancelled) setSettings({ userSettings: settings, settingsError: null }); })
+      // Reported once, never the thrown value; a failure is never cached as settings.
+      .catch((error: unknown) => { if (!cancelled) setSettings({ userSettings: null, settingsError: reportPageError(PAGE_NAME, "loadUserSettings", undefined, error, "read") }); });
 
-  return () => { cancelled = true; };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [dataReady]);
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataReady]);
+
+  return (
+    <div dir={language.isRtl ? "rtl" : "ltr"}>
+      <PageErrorBar error={settingsError} />
+      <Text>{translate("title")}</Text>
+    </div>
+  );
+}
 ```
-
-Provide formatting helpers that use these settings. **NEVER hardcode date formats or currency symbols.**
+Provide formatting helpers that use these settings, inside `PageBody` beside the settings state. **NEVER hardcode date formats or currency symbols.**
 
 **CRITICAL rules for formatting:**
 - Do NOT use `Intl.NumberFormat` with a hardcoded currency code as the primary formatter — always use the helpers below that read from `usersettings`.
