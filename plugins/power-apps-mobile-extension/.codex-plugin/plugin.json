@@ -23,7 +23,7 @@
   ],
   "skills": "./skills/",
   "interface": {
-    "displayName": "Power Apps Mobile Extension for Codex",
+    "displayName": "Mobile Extensions for Codex",
     "shortDescription": "Build native mobile controls",
     "longDescription": "Build third-party Power Apps Mobile (PAM) controls into a prebuilt .ppmplugin binary (Android DEX + flat iOS .framework + manifest.json) for the wrap runtime. Public tooling only; recommended build entry point /generate-ppmplugin.",
     "developerName": "LeonardSEO",
@@ -33,6 +33,8 @@
       "Write"
     ],
     "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
-    "defaultPrompt": "Build a native control for a wrapped Canvas app."
+    "defaultPrompt": "Build a native control for a wrapped Canvas app.",
+    "logo": "./assets/codex-power-platform.svg",
+    "composerIcon": "./assets/codex-power-platform.svg"
   }
 }

@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+import { pluginSchema, mcpSchema, portableServers } from "./plugin-package.mjs";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -232,6 +234,48 @@ for (const [pluginName, expectedCount] of expectedSkills) {
         `Codex MCP configuration for ${pluginName} must be a direct server map`,
       );
     }
+  }
+
+  const portable = readJson(join(pluginRoot, "plugin.json"));
+  if (portable.$schema !== pluginSchema) fail(`Unsupported portable schema for ${pluginName}`);
+  for (const key of ["name", "version", "description", "author", "homepage", "repository", "license", "keywords"]) {
+    if (!isDeepStrictEqual(portable[key], manifest[key])) {
+      fail(`Portable and Codex ${key} disagree for ${pluginName}`);
+    }
+  }
+  if (!isDeepStrictEqual(portable.extensions?.["com.openai"]?.interface, manifest.interface)) {
+    fail(`Portable and Codex presentation disagree for ${pluginName}`);
+  }
+  for (const field of ["skills", "mcpServers", "interface"]) {
+    if (field in portable) fail(`Legacy ${field} is not portable in ${pluginName}`);
+  }
+  for (const field of ["displayName", "shortDescription"]) {
+    if (typeof manifest.interface[field] !== "string" || !manifest.interface[field].trim() || manifest.interface[field].length > 30) {
+      fail(`Invalid ${field} for ${pluginName}`);
+    }
+  }
+  for (const field of ["logo", "composerIcon"]) {
+    const icon = manifest.interface[field];
+    if (typeof icon !== "string" || !icon.startsWith("./assets/") || icon.includes("..") || !existsSync(join(pluginRoot, icon))) {
+      fail(`Missing or invalid ${field} for ${pluginName}`);
+    }
+    const iconPath = join(pluginRoot, icon);
+    if (icon.endsWith(".svg")) {
+      const svg = readFileSync(iconPath, "utf8");
+      const viewBox = svg.match(/viewBox="0 0 (\d+) (\d+)"/);
+      if (!viewBox || Number(viewBox[1]) < 48 || viewBox[1] !== viewBox[2]) {
+        fail(`Icon must have a square viewBox of at least 48 for ${pluginName}`);
+      }
+    }
+  }
+  if (manifest.mcpServers) {
+    const portableMcp = readJson(join(pluginRoot, "mcp.json"));
+    const nativeMcp = readJson(join(pluginRoot, manifest.mcpServers));
+    if (portableMcp.$schema !== mcpSchema || !isDeepStrictEqual(portableMcp.mcpServers, portableServers(nativeMcp))) {
+      fail(`Portable and Codex MCP configuration disagree for ${pluginName}`);
+    }
+  } else if (existsSync(join(pluginRoot, "mcp.json"))) {
+    fail(`Unmapped portable MCP configuration for ${pluginName}`);
   }
 
   const skillsRoot = join(pluginRoot, "skills");

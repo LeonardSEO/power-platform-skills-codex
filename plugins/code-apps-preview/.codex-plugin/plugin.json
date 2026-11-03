@@ -20,7 +20,7 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Code Apps Preview for Codex",
-    "shortDescription": "Build Power Apps code apps with React.",
+    "shortDescription": "Build Power Apps code apps",
     "longDescription": "Codex adaptation of Microsoft's skills for creating and deploying React and Vite Power Apps code apps connected to Power Platform services.",
     "developerName": "LeonardSEO",
     "category": "Productivity",
@@ -29,6 +29,8 @@
       "Write"
     ],
     "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
-    "defaultPrompt": "Build a Power Apps code app."
+    "defaultPrompt": "Build a Power Apps code app.",
+    "logo": "./assets/codex-power-platform.svg",
+    "composerIcon": "./assets/codex-power-platform.svg"
   }
 }

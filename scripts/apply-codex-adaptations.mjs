@@ -1,3 +1,4 @@
+import { writePluginPackage } from "./plugin-package.mjs";
 import {
   existsSync,
   mkdirSync,
@@ -226,6 +227,7 @@ if (scope === "power-automate") {
   writeJson(join(pluginRoot, ".codex.mcp.json"), createCodexMcpConfig(scope, mcp));
 
   applyPowerAutomateFlowDesign();
+  writePluginPackage(repositoryRoot, scope);
   const inventoryPath = join(repositoryRoot, "config", "plugin-inventory.json");
   const inventory = readJson(inventoryPath);
   const previousSkills = inventory.plugins?.[scope]?.skills;
@@ -468,6 +470,8 @@ for (const telemetryFile of telemetryFiles) {
     regions: {},
   });
 }
+
+for (const name of bundledNames) writePluginPackage(repositoryRoot, name);
 
 const marketplacePath = join(repositoryRoot, ".agents", "plugins", "marketplace.json");
 const marketplace = readJson(marketplacePath);

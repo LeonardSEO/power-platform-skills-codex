@@ -1,0 +1,39 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "power-pages",
+  "version": "3.0.0+codex.96d16d0718e4",
+  "description": "Create and deploy Power Pages code sites and manage Power Platform ALM.",
+  "author": {
+    "name": "LeonardSEO",
+    "url": "https://github.com/LeonardSEO"
+  },
+  "homepage": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "repository": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "license": "MIT",
+  "keywords": [
+    "power-pages",
+    "power-platform",
+    "code-sites",
+    "dataverse",
+    "alm"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Power Pages for Codex",
+        "shortDescription": "Build and deploy Power Pages",
+        "longDescription": "Codex adaptation of Microsoft's skills for Power Pages code sites, Dataverse configuration, deployment, and application lifecycle management.",
+        "developerName": "LeonardSEO",
+        "category": "Productivity",
+        "capabilities": [
+          "Interactive",
+          "Write"
+        ],
+        "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
+        "defaultPrompt": "Build and deploy a Power Pages code site.",
+        "logo": "./assets/codex-power-platform.svg",
+        "composerIcon": "./assets/codex-power-platform.svg"
+      }
+    }
+  }
+}

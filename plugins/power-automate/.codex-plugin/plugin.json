@@ -20,7 +20,7 @@
   "mcpServers": "./.codex.mcp.json",
   "interface": {
     "displayName": "Power Automate for Codex",
-    "shortDescription": "Build and manage complete cloud flows.",
+    "shortDescription": "Build and debug cloud flows",
     "longDescription": "Codex adaptation of Microsoft's skills and bundled FlowAgent MCP server for creating, editing, running, publishing, and debugging Power Automate cloud flows.",
     "developerName": "LeonardSEO",
     "category": "Productivity",
@@ -29,6 +29,8 @@
       "Write"
     ],
     "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
-    "defaultPrompt": "Build and publish a complete Power Automate cloud flow."
+    "defaultPrompt": "Build and publish a complete Power Automate cloud flow.",
+    "logo": "./assets/codex-power-platform.svg",
+    "composerIcon": "./assets/codex-power-platform.svg"
   }
 }

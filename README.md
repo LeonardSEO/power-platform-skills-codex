@@ -1,17 +1,53 @@
+<p align="center">
+  <img src="config/plugin-icon.svg" width="80" height="80" alt="Power Platform Skills for Codex" />
+</p>
+
 # Power Platform Skills for Codex
 
+**Build Power Apps, cloud flows, and Dataverse solutions with Microsoft's Power Platform skills in Codex.**
+
 [![Validate](https://github.com/LeonardSEO/power-platform-skills-codex/actions/workflows/validate.yml/badge.svg)](https://github.com/LeonardSEO/power-platform-skills-codex/actions/workflows/validate.yml)
-[![Sync Microsoft upstream](https://github.com/LeonardSEO/power-platform-skills-codex/actions/workflows/sync-upstream.yml/badge.svg)](https://github.com/LeonardSEO/power-platform-skills-codex/actions/workflows/sync-upstream.yml)
+[![Sync upstream](https://github.com/LeonardSEO/power-platform-skills-codex/actions/workflows/sync-upstream.yml/badge.svg)](https://github.com/LeonardSEO/power-platform-skills-codex/actions/workflows/sync-upstream.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A Codex-optimized distribution of Microsoft's
-[`power-platform-skills`](https://github.com/microsoft/power-platform-skills).
-It packages the local Power Platform plugins for Codex while preserving
-compatibility with the upstream Claude Code and GitHub Copilot CLI formats.
+An independent distribution of [Microsoft Power Platform Skills](https://github.com/microsoft/power-platform-skills)
+and [Dataverse Skills](https://github.com/microsoft/Dataverse-skills), packaged for Codex with local MCP runtimes,
+portable manifests, and Microsoft telemetry hard-disabled.
 
-This is an independent, unofficial adaptation. Microsoft remains the author and
-copyright holder of the upstream content.
+Use one marketplace to install the capabilities you need. Existing `code-apps-preview`
+and `mobile-app` installation names remain stable. Microsoft remains the author
+and copyright holder of the upstream content; this project is not affiliated
+with or endorsed by Microsoft.
 
-## Included plugins
+## Start with Power Automate
+
+You need Codex with plugin support and **Node.js 22 LTS**. Azure CLI and a Microsoft
+account with access to your target environment are needed when you connect to Power Platform.
+
+Register the marketplace and install the Power Automate plugin:
+
+```bash
+codex plugin marketplace add LeonardSEO/power-platform-skills-codex && codex plugin add power-automate@power-platform-skills-codex
+```
+
+Restart your desktop app or start a new CLI session. Try this read-only request:
+
+```text
+Use power-automate:browse-flows to show my available environments.
+Ask me which environment to use, then list its flows without changing anything.
+```
+
+Follow the plugin's setup instructions if Azure CLI authentication is required.
+Access depends on your account and environment permissions. Installation does not
+sign you in or grant access to an environment.
+
+Confirm the installation:
+
+```bash
+codex plugin list --marketplace power-platform-skills-codex --json
+```
+
+## Choose your plugins
 
 | Plugin | Skills | Purpose |
 | --- | ---: | --- |
@@ -29,186 +65,156 @@ copyright holder of the upstream content.
 
 **Total: 11 plugins and 143 skill definitions.**
 
-Dataverse is bundled from [microsoft/Dataverse-skills](https://github.com/microsoft/Dataverse-skills),
-with its own pinned upstream commit and synchronization command.
+The skill count includes five internal mobile implementation helpers. Those helpers
+are invoked through `mobile-app:add-native`, rather than exposed as separate portable skills.
 
-## Installation
-
-### Codex CLI
-
-Add this repository as a Codex marketplace:
+Install any additional plugin using its name from the table:
 
 ```bash
-codex plugin marketplace add LeonardSEO/power-platform-skills-codex
-```
-
-Install all eleven bundled plugins:
-
-```bash
-codex plugin add power-pages@power-platform-skills-codex
-codex plugin add model-apps@power-platform-skills-codex
-codex plugin add mcp-apps@power-platform-skills-codex
-codex plugin add canvas-apps@power-platform-skills-codex
-codex plugin add code-apps-preview@power-platform-skills-codex
-codex plugin add mobile-app@power-platform-skills-codex
-codex plugin add power-automate@power-platform-skills-codex
-codex plugin add pcf@power-platform-skills-codex
-codex plugin add power-apps-mobile-extension@power-platform-skills-codex
-codex plugin add process-intelligence@power-platform-skills-codex
 codex plugin add dataverse@power-platform-skills-codex
+codex plugin add canvas-apps@power-platform-skills-codex
+codex plugin add pcf@power-platform-skills-codex
 ```
 
-### Universal installer
-
-Install the complete suite into Codex with one command:
+<details>
+<summary>Install every plugin</summary>
 
 ```bash
-DO_NOT_TRACK=1 npx plugins@latest add LeonardSEO/power-platform-skills-codex --target codex --scope user --yes
+for plugin in power-pages model-apps mcp-apps canvas-apps code-apps-preview mobile-app power-automate pcf power-apps-mobile-extension process-intelligence dataverse; do
+  codex plugin add "$plugin@power-platform-skills-codex" || break
+done
 ```
 
-`DO_NOT_TRACK=1` disables the universal installer's anonymous installation
-telemetry. It is separate from this distribution's telemetry safeguards.
+</details>
 
-Start a new Codex chat or CLI session after installation. Confirm the
-installation with:
+### Update an existing installation
 
 ```bash
-codex plugin list
+codex plugin marketplace upgrade power-platform-skills-codex
+codex plugin list --marketplace power-platform-skills-codex --json
 ```
 
-### Claude Code
+Restart your desktop app or start a new CLI session after updating. Check the
+reported versions; install newly added plugins explicitly with `codex plugin add`.
 
-Run these commands inside Claude Code:
+### Desktop and Claude Code
+
+In a desktop client that exposes local marketplaces in its Plugins directory,
+select **Power Platform Skills for Codex** and install the plugins you need.
+Restart the client after registering the marketplace if it is not visible yet.
+
+For Claude Code, add the same repository from inside Claude Code, then select
+plugins from the marketplace and reload them:
 
 ```text
 /plugin marketplace add LeonardSEO/power-platform-skills-codex
 /plugin
+/reload-plugins
 ```
 
-Install the desired plugins from `power-platform-skills-codex`, then run
-`/reload-plugins`.
+Codex's native marketplace commands are the documented installation path.
+No third-party installer or remote shell script is required.
 
-## Requirements
+## What you can build
 
-- Codex CLI with plugin support or Claude Code
-- Node.js 18 or newer
-- Azure CLI (`az`) for Microsoft authentication
-- Power Platform CLI (`pac`) for Power Platform operations
-- .NET `dnx` for the Canvas Authoring MCP server
+| Goal | Start here |
+| --- | --- |
+| Design a cloud flow that a customer can understand | `power-automate:build-flow` |
+| Build a React and Vite Power Apps code app | `code-apps-preview:create-code-app` |
+| Create or edit a Canvas App | `canvas-apps:canvas-app` |
+| Query or manage a Dataverse environment | `dataverse:dv-connect` |
+| Build a Power Pages site | `power-pages:create-site` |
+| Build and verify a PCF component | `pcf:pcf` |
+| Analyze Process Mining data | `process-intelligence:analytics` |
 
-Some plugins have additional setup instructions in their own `README.md`,
-`AGENTS.md`, or setup skill.
-Power Automate FlowAgent requires Node.js 20 or newer. Process Intelligence
-requires Node.js 22 or 24 LTS. See each plugin for its additional requirements.
+These are entry points, not preconfigured customer environments. Review the
+selected skill's plan and required permissions before authorizing writes or deployment.
 
-## Usage
+## Requirements and scope
 
-Build and publish a Power Automate cloud flow:
+- **Runtime:** Node.js 22 LTS covers the bundled Node-based plugins. Process Intelligence
+  supports Node.js 22 or 24 LTS; Power Automate requires Node.js 20 or newer.
+- **Authentication:** Azure CLI (`az`) where required by the selected plugin.
+- **Power Platform tooling:** PAC CLI, .NET SDK, and other platform tools vary by plugin.
+  Canvas Authoring requires .NET 10 SDK. PCF deployment also requires PAC and .NET.
+- **Host:** local Codex/desktop execution for bundled processes. Installing this repository
+  does not make a local process available in a browser-only or cloud host.
 
-```text
-Use power-automate:build-flow to build and publish a complete cloud flow.
-```
+Read the selected plugin's README, `AGENTS.md`, and setup skill for its exact prerequisites.
+Some capabilities are previews or have cloud/OS limitations. PCF is preview;
+Process Intelligence does not support GCC, GCC High, DoD, or Mooncake.
 
-Create a React and Vite Power Apps code app:
+## What this distribution maintains
 
-```text
-Use code-apps-preview:create-code-app to create a Power Apps code app.
-```
+Every plugin has a portable `plugin.json` with OpenAI presentation metadata,
+plus a matching `.codex-plugin/plugin.json` compatibility manifest. Plugins with
+bundled MCP servers also ship portable `mcp.json`, a Codex-native server map, and
+the original upstream host configuration. The sync reapplies these files after
+upstream updates; versions and icon paths are validated together.
 
-Build and deploy a Power Pages site:
+Power Automate keeps the Node.js 22/24 FlowAgent compatibility bootstrap. Its
+`build-flow` and `create-flow` skills also preserve:
 
-```text
-Use power-pages:create-site to create a Power Pages code site.
-```
+- [Dutch flow design rules](config/power-automate-flow-design.md): name visible steps
+  in Dutch and represent meaningful business decisions as explainable actions.
+- [Custom connector discovery](config/power-automate-overrides/references/custom-connectors.md)
+  before choosing actions or raw HTTP integrations.
+- A user's stated Microsoft Foundry/Azure OpenAI pay-as-you-go preference.
+- A `build-custom-connector` skill and [example sketches](config/power-automate-overrides/examples/custom-connectors/README.md).
+  The sketches contain no customer endpoint or deployable connector credentials.
 
-## Codex compatibility
+## Telemetry and credentials
 
-This distribution adds and maintains the Codex-specific integration layer:
+Microsoft Power Platform telemetry is hard-disabled in the bundled distribution:
+production instrumentation keys and collector routes are removed, Power Pages
+telemetry hooks are removed, and FlowAgent telemetry is forced off. Validation
+rejects enabled telemetry configurations or restored routing values.
 
-- `.codex-plugin/plugin.json` manifests for all bundled plugins
-- A Codex marketplace at `.agents/plugins/marketplace.json`
-- A native Claude Code marketplace at `.claude-plugin/marketplace.json`
-- Direct `.codex.mcp.json` server maps for Codex
-- Original `.mcp.json` files for Claude Code and GitHub Copilot CLI
-- A Node.js 22 and 24 compatibility bootstrap for Power Automate FlowAgent
-- Automatic validation of plugin manifests, skills, MCP configuration, and
-  telemetry safeguards
+This applies to the bundled plugins. Codex, Azure CLI, Microsoft services, and
+other external tools have their own data handling and telemetry settings.
+The repository contains no environment-specific authentication configuration;
+set up credentials through the selected tool's supported sign-in flow.
 
-### Power Automate FlowAgent
+## Upstream updates
 
-The bundled FlowAgent MCP server is wired through a dedicated Codex-native MCP
-configuration. Repository validation starts the server, completes the MCP
-`initialize` handshake, requests `tools/list`, and confirms essential tools such
-as `list_flows`, `create_flow`, and `publish_flow`.
+The [weekly sync](.github/workflows/sync-upstream.yml) follows both Microsoft
+repositories, records their commits independently, reapplies the Codex adaptations,
+and runs `npm test`. The existing automation then opens or updates a synchronization
+PR and squash-merges it after its local validation succeeds. An unsuccessful sync
+stops before that step.
 
-For flows handed over to Dutch-speaking customers, `build-flow` and
-`create-flow` follow the [flow design guide](config/power-automate-flow-design.md):
-name visible steps in Dutch and show each meaningful business decision as an
-explainable action. Action count and generation speed do not take priority over
-readability. Complex expressions remain possible inside an action with one
-clear purpose.
+The repository-wide state identifies the last full Power Platform sync. Dataverse
+has a separate state file; Power Automate can also be updated independently.
+See [UPSTREAM.md](UPSTREAM.md) for exact mappings, commands, and preservation rules.
 
-For API and AI flows, the skills also [search for custom connectors](config/power-automate-overrides/references/custom-connectors.md)
-in the target environment and Microsoft's example folders. A separate
-`build-custom-connector` skill prepares a reusable connector from OpenAPI when
-needed. A stated Microsoft Foundry pay-as-you-go preference is preserved;
-connector creation in an environment remains a separate authorized step.
-The [example sketches](config/power-automate-overrides/examples/custom-connectors/README.md)
-show an Azure AI action block and a grouped Symbis Utilities connector without
-bundling a customer endpoint or a deployable connector.
+## Development and contributions
 
-## Telemetry
-
-Microsoft Power Platform telemetry is hard-disabled in this distribution:
-
-- Power Pages 1DS telemetry hooks are removed
-- Microsoft production instrumentation keys and collector URLs are removed
-- Power Automate FlowAgent is forced into telemetry mode `off`
-- `config/telemetry-disabled.json` provides a repository-wide kill switch
-- CI fails if telemetry is re-enabled or a production telemetry route returns
-
-These safeguards apply to the installed Power Platform plugins. External tools
-such as the optional `npx plugins` installer have their own telemetry settings.
-
-## Validation
-
-No package installation is required:
+Clone the repository and run the existing checks; no root package installation is required:
 
 ```bash
+git clone https://github.com/LeonardSEO/power-platform-skills-codex.git
+cd power-platform-skills-codex
 npm test
 ```
 
-The validation suite checks:
+The checks cover portable and compatibility manifest consistency, MCP transports,
+icons, skill metadata, sync regression fixtures, telemetry safeguards, and the
+Codex and Claude FlowAgent initialization/tool-list handshake. They do not connect
+to a customer environment or prove live deployment behavior.
 
-- All bundled Codex and Claude Code marketplace entries and manifests
-- All bundled skill definitions
-- Codex- and Claude-native MCP schemas and manifest references
-- The Codex and Claude FlowAgent startup, initialization, and tool-list handshake
-- The telemetry hard-off contract
-- Consistency with the recorded Microsoft upstream commit
+For a change, create a branch, follow [AGENTS.md](AGENTS.md), add a focused regression
+check for changed behavior, and open a PR against `main`. Change synchronization
+rules or overlays when a fix must survive future imports. Upstream-owned feature
+changes belong in the corresponding Microsoft repository.
 
-The Power Automate plugin can also be synchronized separately. Its upstream
-commit is recorded in `config/plugin-inventory.json`; the repository-wide
-commit in `.upstream/power-platform-skills.json` remains the last full sync.
+Use [GitHub Issues](https://github.com/LeonardSEO/power-platform-skills-codex/issues)
+for reproducible problems or focused requests. Include your Codex version, plugin
+name/version, OS, command or prompt, expected behavior, and sanitized error output.
+Never post access tokens, credentials, customer data, or private environment URLs.
+For sensitive vulnerabilities, follow [SECURITY.md](SECURITY.md).
 
-## Microsoft upstream synchronization
+## License and attribution
 
-The scheduled [Sync Microsoft upstream](.github/workflows/sync-upstream.yml)
-workflow checks `microsoft/power-platform-skills@main` every Monday. When the
-upstream repository changes, the workflow:
-
-1. Synchronizes upstream additions, edits, and deletions.
-2. Reapplies the Codex manifests, MCP adapters, and compatibility fixes.
-3. Keeps telemetry hard-disabled.
-4. Refreshes plugin versions and skill counts.
-5. Runs the complete validation suite.
-6. Opens or updates a pull request and squash-merges it after validation.
-
-See [`UPSTREAM.md`](UPSTREAM.md) for the plugin mappings and local synchronization
-procedure.
-
-## License
-
-The upstream source is licensed under the MIT License. The original Microsoft
-copyright and license notice are preserved in [`LICENSE`](LICENSE). See
-[`NOTICE.md`](NOTICE.md) for attribution and adaptation details.
+[MIT](LICENSE). Microsoft copyright and upstream notices are retained. The
+Dataverse license is also included in [plugins/dataverse/LICENSE](plugins/dataverse/LICENSE).
+See [NOTICE.md](NOTICE.md) for the upstream sources and Codex-specific adaptations.

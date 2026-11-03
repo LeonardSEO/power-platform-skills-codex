@@ -1,11 +1,39 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "process-intelligence",
-  "version": "0.7.0",
+  "version": "0.7.0+codex.96d16d0718e4",
   "description": "Analyze Power Automate Process Mining processes, bottlenecks, variants, cohorts and object-centric executions through MCP.",
-  "author": { "name": "Microsoft", "url": "https://www.microsoft.com" },
-  "homepage": "https://github.com/microsoft/power-platform-skills/",
-  "repository": "https://github.com/microsoft/power-platform-skills/",
+  "author": {
+    "name": "LeonardSEO",
+    "url": "https://github.com/LeonardSEO"
+  },
+  "homepage": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "repository": "https://github.com/LeonardSEO/power-platform-skills-codex",
   "license": "MIT",
-  "keywords": ["process-intelligence", "power-automate", "power-platform", "mcp", "analytics"]
+  "keywords": [
+    "process-intelligence",
+    "power-automate",
+    "power-platform",
+    "mcp",
+    "analytics"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Process Intelligence for Codex",
+        "shortDescription": "Analyze process mining data",
+        "longDescription": "Analyze Power Automate Process Mining processes, bottlenecks, variants, cohorts and object-centric executions through MCP.",
+        "developerName": "LeonardSEO",
+        "category": "Productivity",
+        "capabilities": [
+          "Interactive",
+          "Write"
+        ],
+        "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
+        "defaultPrompt": "Analyze a Power Automate Process Mining process.",
+        "logo": "./assets/codex-power-platform.svg",
+        "composerIcon": "./assets/codex-power-platform.svg"
+      }
+    }
+  }
 }

@@ -1,3 +1,4 @@
+import { writePluginPackage } from "./plugin-package.mjs";
 import { spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -25,6 +26,7 @@ cpSync(join(upstream, "LICENSE"), join(destination, "LICENSE"));
 const upstreamVersion = manifest.version;
 manifest.version = `${upstreamVersion}+codex.${commit.slice(0, 12)}`;
 writeJson(join(destination, ".codex-plugin/plugin.json"), manifest);
+writePluginPackage(root, "dataverse");
 function countSkills(directory) {
   return readdirSync(directory, { withFileTypes: true }).reduce((total, entry) =>
     total + (entry.isDirectory() ? countSkills(join(directory, entry.name)) : Number(entry.name === "SKILL.md")), 0);

@@ -9,6 +9,9 @@ Skills marketplace.
 - Keep each Codex manifest at
   `plugins/<plugin-name>/.codex-plugin/plugin.json`.
 - The plugin folder name and manifest `name` must match.
+- Keep root Agent Plugins 1.0 manifests consistent with their Codex compatibility
+  manifests, including versions, presentation, MCP transports, and packaged icons.
+  Regenerate them through `scripts/plugin-package.mjs` during synchronization.
 - Keep `.agents/plugins/marketplace.json` as the repository marketplace.
 - Preserve upstream files unless a Codex compatibility change requires an edit.
 - Keep Power Pages telemetry hard-disabled.

@@ -20,7 +20,7 @@
   "mcpServers": "./.codex.mcp.json",
   "interface": {
     "displayName": "Mobile Apps for Codex",
-    "shortDescription": "Build Power Apps mobile apps with Expo.",
+    "shortDescription": "Build Power Apps mobile apps",
     "longDescription": "Codex adaptation of Microsoft's skills for creating and deploying Power Apps mobile code apps with Expo, React Native, and native device capabilities.",
     "developerName": "LeonardSEO",
     "category": "Productivity",
@@ -29,6 +29,8 @@
       "Write"
     ],
     "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
-    "defaultPrompt": "Build a mobile Power App with Expo."
+    "defaultPrompt": "Build a mobile Power App with Expo.",
+    "logo": "./assets/codex-power-platform.svg",
+    "composerIcon": "./assets/codex-power-platform.svg"
   }
 }

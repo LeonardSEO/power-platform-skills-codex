@@ -1,0 +1,39 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "canvas-apps",
+  "version": "3.1.1+codex.96d16d0718e4",
+  "description": "Build Power Apps Canvas Apps with PA YAML and the Canvas Authoring MCP server.",
+  "author": {
+    "name": "LeonardSEO",
+    "url": "https://github.com/LeonardSEO"
+  },
+  "homepage": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "repository": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "license": "MIT",
+  "keywords": [
+    "canvas-apps",
+    "power-apps",
+    "pa-yaml",
+    "msapp",
+    "power-platform"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Canvas Apps for Codex",
+        "shortDescription": "Author Canvas Apps",
+        "longDescription": "Codex adaptation of Microsoft's skills for authoring, editing, and validating Power Apps Canvas Apps through the Canvas Authoring MCP server.",
+        "developerName": "LeonardSEO",
+        "category": "Productivity",
+        "capabilities": [
+          "Interactive",
+          "Write"
+        ],
+        "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
+        "defaultPrompt": "Build a Power Apps Canvas App.",
+        "logo": "./assets/codex-power-platform.svg",
+        "composerIcon": "./assets/codex-power-platform.svg"
+      }
+    }
+  }
+}

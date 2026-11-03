@@ -28,7 +28,9 @@
       "Write"
     ],
     "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
-    "defaultPrompt": "Analyze a Power Automate Process Mining process."
+    "defaultPrompt": "Analyze a Power Automate Process Mining process.",
+    "logo": "./assets/codex-power-platform.svg",
+    "composerIcon": "./assets/codex-power-platform.svg"
   },
   "mcpServers": "./.codex.mcp.json"
 }

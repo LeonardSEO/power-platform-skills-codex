@@ -1,0 +1,39 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "model-apps",
+  "version": "2.20.6+codex.96d16d0718e4",
+  "description": "Build and deploy generative pages for Power Apps model-driven apps.",
+  "author": {
+    "name": "LeonardSEO",
+    "url": "https://github.com/LeonardSEO"
+  },
+  "homepage": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "repository": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "license": "MIT",
+  "keywords": [
+    "model-apps",
+    "power-apps",
+    "generative-pages",
+    "dataverse",
+    "pac-cli"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Model Apps for Codex",
+        "shortDescription": "Build model-driven Power Apps",
+        "longDescription": "Codex adaptation of Microsoft's skills for planning, building, and deploying generative pages in Power Apps model-driven applications.",
+        "developerName": "LeonardSEO",
+        "category": "Productivity",
+        "capabilities": [
+          "Interactive",
+          "Write"
+        ],
+        "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
+        "defaultPrompt": "Build a generative page for a model-driven app.",
+        "logo": "./assets/codex-power-platform.svg",
+        "composerIcon": "./assets/codex-power-platform.svg"
+      }
+    }
+  }
+}

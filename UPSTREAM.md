@@ -117,3 +117,20 @@ workflow updates both repositories before validation. The generated PR records
 both source commits. Dataverse connection/auth setup remains environment-specific
 and is performed by `dv-connect`; the distribution ships no environment URL or
 credentials.
+
+## Portable packages and icons
+
+`scripts/plugin-package.mjs` writes root Agent Plugins 1.0 manifests from each
+Codex compatibility manifest. It runs after the host-specific adaptations, both
+for full/Power Automate syncs and standalone Dataverse syncs. Versions, metadata
+and OpenAI presentation are identical across the two formats. Portable MCP
+configuration comes from the adapted Codex server map with explicit `stdio` or
+`streamable-http` transport types; FlowAgent retains its bootstrap and telemetry
+environment.
+
+The Dataverse root manifest is intentionally replaced: its upstream root uses an
+Antigravity schema, which conflicts with Codex portable discovery. Process
+Intelligence's portable manifest is regenerated so it shares the Codex version.
+Existing Dataverse artwork is preserved. Other plugins include the original
+project icon from `config/plugin-icon.svg` under their own assets directory.
+The icon and presentation settings are restored on every sync.

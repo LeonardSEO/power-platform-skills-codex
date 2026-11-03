@@ -1,0 +1,39 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "mobile-app",
+  "version": "0.6.0+codex.96d16d0718e4",
+  "description": "Build Power Apps mobile code apps with Expo, React Native, and Power Platform connectors.",
+  "author": {
+    "name": "LeonardSEO",
+    "url": "https://github.com/LeonardSEO"
+  },
+  "homepage": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "repository": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "license": "MIT",
+  "keywords": [
+    "power-apps",
+    "mobile",
+    "expo",
+    "react-native",
+    "connectors"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Mobile Apps for Codex",
+        "shortDescription": "Build Power Apps mobile apps",
+        "longDescription": "Codex adaptation of Microsoft's skills for creating and deploying Power Apps mobile code apps with Expo, React Native, and native device capabilities.",
+        "developerName": "LeonardSEO",
+        "category": "Productivity",
+        "capabilities": [
+          "Interactive",
+          "Write"
+        ],
+        "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
+        "defaultPrompt": "Build a mobile Power App with Expo.",
+        "logo": "./assets/codex-power-platform.svg",
+        "composerIcon": "./assets/codex-power-platform.svg"
+      }
+    }
+  }
+}

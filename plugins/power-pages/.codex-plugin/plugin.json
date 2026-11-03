@@ -20,7 +20,7 @@
   "mcpServers": "./.codex.mcp.json",
   "interface": {
     "displayName": "Power Pages for Codex",
-    "shortDescription": "Build and deploy modern Power Pages sites.",
+    "shortDescription": "Build and deploy Power Pages",
     "longDescription": "Codex adaptation of Microsoft's skills for Power Pages code sites, Dataverse configuration, deployment, and application lifecycle management.",
     "developerName": "LeonardSEO",
     "category": "Productivity",
@@ -29,6 +29,8 @@
       "Write"
     ],
     "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
-    "defaultPrompt": "Build and deploy a Power Pages code site."
+    "defaultPrompt": "Build and deploy a Power Pages code site.",
+    "logo": "./assets/codex-power-platform.svg",
+    "composerIcon": "./assets/codex-power-platform.svg"
   }
 }

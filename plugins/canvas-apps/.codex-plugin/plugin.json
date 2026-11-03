@@ -20,7 +20,7 @@
   "mcpServers": "./.codex.mcp.json",
   "interface": {
     "displayName": "Canvas Apps for Codex",
-    "shortDescription": "Build Canvas Apps with PA YAML.",
+    "shortDescription": "Author Canvas Apps",
     "longDescription": "Codex adaptation of Microsoft's skills for authoring, editing, and validating Power Apps Canvas Apps through the Canvas Authoring MCP server.",
     "developerName": "LeonardSEO",
     "category": "Productivity",
@@ -29,6 +29,8 @@
       "Write"
     ],
     "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
-    "defaultPrompt": "Build a Power Apps Canvas App."
+    "defaultPrompt": "Build a Power Apps Canvas App.",
+    "logo": "./assets/codex-power-platform.svg",
+    "composerIcon": "./assets/codex-power-platform.svg"
   }
 }

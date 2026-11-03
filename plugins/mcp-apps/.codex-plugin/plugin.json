@@ -19,7 +19,7 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "MCP Apps for Codex",
-    "shortDescription": "Generate interactive widgets for MCP tools.",
+    "shortDescription": "Build MCP tools and widgets",
     "longDescription": "Codex adaptation of Microsoft's skills for creating self-contained HTML widgets that visualize and interact with MCP tool results.",
     "developerName": "LeonardSEO",
     "category": "Productivity",
@@ -28,6 +28,8 @@
       "Write"
     ],
     "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
-    "defaultPrompt": "Generate an interactive widget for my MCP tool."
+    "defaultPrompt": "Generate an interactive widget for my MCP tool.",
+    "logo": "./assets/codex-power-platform.svg",
+    "composerIcon": "./assets/codex-power-platform.svg"
   }
 }

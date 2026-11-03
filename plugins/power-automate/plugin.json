@@ -1,0 +1,39 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "power-automate",
+  "version": "3.2.10+codex.96d16d0718e4",
+  "description": "Build, edit, run, publish, and debug Power Automate cloud flows through FlowAgent.",
+  "author": {
+    "name": "LeonardSEO",
+    "url": "https://github.com/LeonardSEO"
+  },
+  "homepage": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "repository": "https://github.com/LeonardSEO/power-platform-skills-codex",
+  "license": "MIT",
+  "keywords": [
+    "power-automate",
+    "cloud-flows",
+    "flowagent",
+    "mcp",
+    "power-platform"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Power Automate for Codex",
+        "shortDescription": "Build and debug cloud flows",
+        "longDescription": "Codex adaptation of Microsoft's skills and bundled FlowAgent MCP server for creating, editing, running, publishing, and debugging Power Automate cloud flows.",
+        "developerName": "LeonardSEO",
+        "category": "Productivity",
+        "capabilities": [
+          "Interactive",
+          "Write"
+        ],
+        "websiteURL": "https://github.com/LeonardSEO/power-platform-skills-codex",
+        "defaultPrompt": "Build and publish a complete Power Automate cloud flow.",
+        "logo": "./assets/codex-power-platform.svg",
+        "composerIcon": "./assets/codex-power-platform.svg"
+      }
+    }
+  }
+}

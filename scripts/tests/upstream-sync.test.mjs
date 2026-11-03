@@ -28,7 +28,7 @@ test("sync includes new local plugins, pins Dataverse, preserves overlays and re
     return spawnSync(process.execPath, [join(root, "scripts", script), source, sha], { encoding: "utf8" });
   }
   try {
-    for (const path of ["scripts/apply-codex-adaptations.mjs", "scripts/sync-dataverse.mjs", "config", "README.md", ".agents", ".claude-plugin", ".upstream"]) copy(path);
+    for (const path of ["scripts/validate-repository.mjs", "scripts/plugin-package.mjs", "scripts/apply-codex-adaptations.mjs", "scripts/sync-dataverse.mjs", "config", "README.md", ".agents", ".claude-plugin", ".upstream"]) copy(path);
     const inventory = readJson(join(repository, "config/plugin-inventory.json"));
     const entries = [];
     for (const [name, details] of Object.entries(inventory.plugins)) {
@@ -40,6 +40,8 @@ test("sync includes new local plugins, pins Dataverse, preserves overlays and re
       if (name === "dataverse") {
         write(join(sourceRoot, "skills/example/SKILL.md"), "---\nname: example\ndescription: Example\n---\n");
         write(join(sourceRoot, ".claude-plugin/plugin.json"), manifest);
+        cpSync(join(repository, "plugins/dataverse/assets"), join(sourceRoot, "assets"), { recursive: true });
+        write(join(sourceRoot, "plugin.json"), { $schema: "https://antigravity.google/schemas/v1/plugin.json" });
         continue;
       }
       entries.push({ name, source: `./${details.upstreamPath}` });
@@ -69,12 +71,43 @@ test("sync includes new local plugins, pins Dataverse, preserves overlays and re
       assert.ok(readJson(join(root, ".agents/plugins/marketplace.json")).plugins.some((entry) => entry.name === name));
       assert.ok(existsSync(join(root, "plugins", name, ".claude-plugin/plugin.json")));
     }
+    for (const name of Object.keys(updated.plugins)) {
+      const portable = readJson(join(root, "plugins", name, "plugin.json"));
+      const compatibility = readJson(join(root, "plugins", name, ".codex-plugin/plugin.json"));
+      assert.equal(portable.$schema, "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json");
+      assert.equal(portable.version, compatibility.version);
+      assert.deepEqual(portable.extensions["com.openai"].interface, compatibility.interface);
+      assert.ok(existsSync(join(root, "plugins", name, compatibility.interface.logo)));
+    }
+    const portableFlowAgent = readJson(join(root, "plugins/power-automate/mcp.json")).mcpServers.flowagent;
+    assert.equal(portableFlowAgent.type, "stdio");
+    assert.ok(portableFlowAgent.args[1].includes("globalThis.require=require"));
+    assert.equal(readJson(join(root, "plugins/power-automate/mcp.json")).mcpServers["microsoft-learn"].type, "streamable-http");
     assert.ok(readFileSync(join(root, "plugins/power-automate/skills/build-custom-connector/SKILL.md"), "utf8").includes("name:"));
     assert.ok(readJson(join(root, "plugins/power-automate/.codex.mcp.json")).flowagent.args[1].includes("globalThis.require=require"));
     const snapshot = readFileSync(join(root, "config/plugin-inventory.json"), "utf8");
     result = run("apply-codex-adaptations.mjs", upstream, commit);
     assert.equal(result.status, 0, result.stderr);
     assert.equal(readFileSync(join(root, "config/plugin-inventory.json"), "utf8"), snapshot);
+    const portablePath = join(root, "plugins/dataverse/plugin.json");
+    const portable = readJson(portablePath);
+    write(portablePath, { ...portable, $schema: "https://antigravity.google/schemas/v1/plugin.json" });
+    result = run("validate-repository.mjs", upstream, commit);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Unsupported portable schema for dataverse/);
+    write(portablePath, portable);
+    const processManifestPath = join(root, "plugins/process-intelligence/plugin.json");
+    const processManifest = readJson(processManifestPath);
+    write(processManifestPath, { ...processManifest, version: "0.0.0" });
+    result = run("validate-repository.mjs", upstream, commit);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Portable and Codex version disagree for process-intelligence/);
+    write(processManifestPath, processManifest);
+    const pcfManifest = readJson(join(root, "plugins/pcf/.codex-plugin/plugin.json"));
+    rmSync(join(root, "plugins/pcf", pcfManifest.interface.logo));
+    result = run("validate-repository.mjs", upstream, commit);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Missing or invalid logo for pcf/);
     entries.at(-1).source.repo = "unexpected/repository";
     write(join(upstream, "marketplace.json"), { plugins: entries });
     result = run("apply-codex-adaptations.mjs", upstream, commit);
