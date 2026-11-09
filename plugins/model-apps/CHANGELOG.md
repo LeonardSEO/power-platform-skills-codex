@@ -5,6 +5,52 @@ All notable changes to the **model-apps** plugin.
 Entries are deliberately short: what changed and why it matters to you. The reasoning,
 evidence and trade-offs behind a change live in its PR, in `docs/`, or in the linked issue.
 
+## [2.23.0]
+
+- **Configuration identities (opt-in):** with `configurationIdentity: "stable-v1"`, environment variables, connection references, Custom APIs and duplicate-detection rules, with their children, are created at reserved ids and bound; a create whose answer was lost is never sent again (#807).
+- **Before its first write, whatever `--stage` or `--changed-only` selects,** a build checks every protected item; a lost create is bound only after each printed `--authorize adopt:` token (a root's approval never covers its children).
+- **Protected rows** are verified by id. A namesake at another id halts `create-identity-conflict`; deletes and value clears halt `configuration-protected-removal-unsupported`; removing the opt-in while rows are bound halts `create-identity-opt-in-required`.
+- **Custom APIs (opt-in):** a root-field edit with new request parameters or response properties is sent as one checked change set; other multi-part edits halt `configuration-edit-unsupported`.
+- **Duplicate-detection rules (opt-in)** are published once, then only verified; later edits halt `configuration-edit-unsupported`. A first publication that may have been sent is never resent; if a read cannot show it published, publish the rule by hand (#808).
+- **`--changed-only`** now applies a spec whose only change is a configuration item instead of reporting nothing to apply. Builds without the opt-in are otherwise unchanged, apart from the view check below.
+- **Views:** a view or view filter with an unknown key (for example `filter` instead of `filters`) is refused, naming the key to write, instead of being built without it; the inert `type` key stays allowed. Teardown accepts such a spec; verify warns (#827).
+
+### Limits
+
+- Rows created before opting in are not migrated (#807 stays open). Make later duplicate-rule edits outside the plugin. Keyed command bars (show or hide buttons on rebuild) are not in this release (#812).
+
+## [2.22.0]
+
+- **Teardown:** a table's only Main form, refused with `0x8004F661`, settles with its table: one run removes the solution (#806).
+- **First builds:** reads about a just-created table retry the metadata-cache lag in place within the budget; a failed form lookup never creates a duplicate; exhausted retries quote the service (#796).
+- **Localized tables:** preflights skip the broad label-bearing read, stopping before writes if existence stays unknown (#796); unprovisioned label languages halt before the publisher or solution exist (#809).
+- **Tables found after "already exists"** reuse existing columns, applying declared column security and authorized Date and Time repairs at once (#796).
+- **Validation:** unknown `views[]` and filter keys warn with the likely key and fail `--strict` lint; an ignored view `type` stays silent (#799).
+- **Managed downloads:** a form's handler library returns as an external resource (never updated; teardown keeps it); a flow's personas return when proved from roles that later builds own (#800).
+- **Managed-download output** is replaced only after restoration, validation and fragments succeed; items blocked only by a missing library or persona go to a new `.maker-workspace/managed-fragments-*.json` (#800).
+- **Declared dashboards:** a durably acknowledged, still-present create is recovered after a stop without a second create or adoption when the retained draft is unchanged; creates send a fixed seed-cell id (#798).
+- **Adopted forms:** publication stops can name differing caption cells and language codes (#797).
+- **Authoring:** `/app-builder` offers optional capabilities, never by default; evals grade view filters and opt-in (#802, #804).
+
+### Limits
+
+- Adopted-form caption differences still need `publication-risk` approval (#797). Stops before a dashboard acknowledgement is recorded stay manual; older versions refuse these bindings: never reset or edit the store (#798).
+- Page-tree replacement is non-atomic (#814). Retry-stable configuration rows, owed rule publication and keyed command bars come later (#807, #808, #812).
+## [2.21.0]
+
+- **`reconcile: "declared"`**: views/charts/web resources/forms/Global Standard dashboards; rules/flows create/adopt-only; adoption: `adopt:<family>:<key>`. Forms/dashboards/rules/flows `--verify`/download (`--include-managed --managed-manifest <store>`); removed, Maker-deleted roots can retire; re-declarations get fresh ids. New-app `createIdentity: "stable-v1"`: retry-stable view/chart ids. `quickFind.findColumns`, `app.mainFormsOnUpdate: "exact"`, `app.pinDeclaredArtifacts` (lost pin-add recovery).
+- Choice values, `dateTimeBehavior`/`isSecured`/`fieldSecurityProfiles`, table flags (`--authorize <key>` for destructive changes). Environment variables, connection references, Custom APIs, duplicate rules, `solution.version` (`--deployment-settings`). `app.theme` (Preview); `--include-capabilities` downloads theme/behaviours/flags. **Pages:** upload `--draft`/`--turn-id`, navigation drafts/leases, `prepare-compiler-refresh`. **Read-only:** `--dry-run --preview-push`/`--inspect-components`/`solutions.js inspect`/`plan-app-promotion.js`. `data-fix.js` writes.
+- Security/name/DateTime/page-form reads; teardown retains embedded pages/configuration/profiles. Unusable declared connections/APIs or unsettled publication halt page edits. **Default views:** never edit/send tableless copies; refresh otherwise-identical copies. Bounded retries: invocation-created tables only. Preserve/halt other unsent edits (`workspace-copy-unsent-edits`); follow keep/discard guidance.
+- **New declared dashboard tiles:** repeat captions across provisioned languages; only missing sent non-base captions are tolerated. Unreadable languages halt writes/request retries. Create-content mismatches: inspect id; delete only as advised.
+- Declared form tables/dashboards publish without `--publish`; lagging reads retry ~45s/scope plus request time. Process-flow deletes retry; unknown-outcome steps never replay; refused access-unlinks fail.
+
+### Limits
+
+- Saved form/dashboard layers miss mid-write edits. Publish checks skip captions whose language is absent from published reads and some saved labels. Publish duplicate rules; unprovisioned languages fail after solution creation. Lost-create retries can duplicate configuration; recovered-table Date/Time repairs may need rerunning.
+- `--authorize publication-risk:<scope>/<dispatch>`: start-only; accepted/uncertain recording stops without service writes. Rerun to publish; re-declare removed dashboards. Adopted-form saved/published base-language caption differences may need repeated approvals after checking published forms in Maker.
+- Managed downloads omit `securityRoles` flows and forms lacking required downloaded handler libraries (`managedForms.stale`); copy flow/personas or form/libraries from source spec. No view/chart/profile/configuration downloads; charts verify presence only.
+- Local-copy recovery: printed `overwrite:` keys; otherwise manual ([schema](references/app-spec-schema-advanced.md)). `--allow-destructive`: existing-app exact Main forms, empty web resources/Quick Find, removed view columns. Keyed commands/`forms[].genPages` refused; caption-only inspection fails.
+
 ## [2.20.6]
 
 The bundled SDK is updated (commit 59ae2d72e2a8).

@@ -61,9 +61,9 @@ codex plugin list --marketplace power-platform-skills-codex --json
 | `pcf` | 3 | Build, test, deploy, and verify PCF components (preview) |
 | `power-apps-mobile-extension` | 13 | Build native controls for wrapped Canvas apps |
 | `process-intelligence` | 10 | Analyze Power Automate Process Mining data |
-| `dataverse` | 9 | Query and manage Dataverse data, schema, security, and solutions |
+| `dataverse` | 10 | Query and manage Dataverse data, schema, security, and solutions |
 
-**Total: 11 plugins and 143 skill definitions.**
+**Total: 11 plugins and 144 skill definitions.**
 
 The skill count includes five internal mobile implementation helpers. Those helpers
 are invoked through `mobile-app:add-native`, rather than exposed as separate portable skills.

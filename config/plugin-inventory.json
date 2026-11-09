@@ -1,77 +1,77 @@
 {
   "generatedFrom": {
     "repository": "microsoft/power-platform-skills",
-    "commit": "96d16d0718e4439adcb0ba06542ecca85b664818"
+    "commit": "9d26fde082b47f04e9bb97cb30a46dd1eaaa776e"
   },
   "plugins": {
     "dataverse": {
       "upstreamRepository": "microsoft/Dataverse-skills",
       "upstreamPath": ".github/plugins/dataverse",
-      "upstreamCommit": "9d995d8e5860bb0c2e4f671e1350a908f3cc1174",
-      "upstreamVersion": "1.16.1",
-      "codexVersion": "1.16.1+codex.9d995d8e5860",
-      "skills": 9
+      "upstreamCommit": "27e6f6a3fef23075ede87d8e5f028cde29e0130e",
+      "upstreamVersion": "1.18.0",
+      "codexVersion": "1.18.0+codex.27e6f6a3fef2",
+      "skills": 10
     },
     "power-pages": {
       "upstreamPath": "plugins/power-pages",
       "upstreamVersion": "3.0.0",
-      "codexVersion": "3.0.0+codex.96d16d0718e4",
+      "codexVersion": "3.0.0+codex.9d26fde082b4",
       "skills": 39
     },
     "model-apps": {
       "upstreamPath": "plugins/model-apps",
-      "upstreamVersion": "2.20.6",
-      "codexVersion": "2.20.6+codex.96d16d0718e4",
+      "upstreamVersion": "2.23.0",
+      "codexVersion": "2.23.0+codex.9d26fde082b4",
       "skills": 4
     },
     "mcp-apps": {
       "upstreamPath": "plugins/mcp-apps",
       "upstreamVersion": "1.2.0",
-      "codexVersion": "1.2.0+codex.96d16d0718e4",
+      "codexVersion": "1.2.0+codex.9d26fde082b4",
       "skills": 3
     },
     "canvas-apps": {
       "upstreamPath": "plugins/canvas-apps",
       "upstreamVersion": "3.1.1",
-      "codexVersion": "3.1.1+codex.96d16d0718e4",
+      "codexVersion": "3.1.1+codex.9d26fde082b4",
       "skills": 4
     },
     "code-apps-preview": {
       "upstreamPath": "plugins/code-apps",
-      "upstreamVersion": "1.1.0",
-      "codexVersion": "1.1.0+codex.96d16d0718e4",
+      "upstreamVersion": "1.3.0",
+      "codexVersion": "1.3.0+codex.9d26fde082b4",
       "skills": 15
     },
     "mobile-app": {
       "upstreamPath": "plugins/mobile-apps",
       "upstreamVersion": "0.6.0",
-      "codexVersion": "0.6.0+codex.96d16d0718e4",
+      "codexVersion": "0.6.0+codex.9d26fde082b4",
       "skills": 31
     },
     "power-automate": {
       "upstreamPath": "plugins/power-automate",
       "upstreamVersion": "3.2.10",
-      "codexVersion": "3.2.10+codex.96d16d0718e4",
+      "codexVersion": "3.2.10+codex.9d26fde082b4",
       "skills": 12
     },
     "pcf": {
       "upstreamPath": "plugins/pcf",
       "upstreamVersion": "1.0.1",
-      "codexVersion": "1.0.1+codex.96d16d0718e4",
+      "codexVersion": "1.0.1+codex.9d26fde082b4",
       "skills": 3
     },
     "power-apps-mobile-extension": {
       "upstreamPath": "plugins/power-apps-mobile-extension",
       "upstreamVersion": "0.2.0",
-      "codexVersion": "0.2.0+codex.96d16d0718e4",
+      "codexVersion": "0.2.0+codex.9d26fde082b4",
       "skills": 13
     },
     "process-intelligence": {
       "upstreamPath": "plugins/process-intelligence",
       "upstreamVersion": "0.7.0",
-      "codexVersion": "0.7.0+codex.96d16d0718e4",
+      "codexVersion": "0.7.0+codex.9d26fde082b4",
       "skills": 10
     }
   },
-  "totalSkills": 143
+  "totalSkills": 144
 }

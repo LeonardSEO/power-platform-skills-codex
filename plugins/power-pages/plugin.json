@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "power-pages",
-  "version": "3.0.0+codex.96d16d0718e4",
+  "version": "3.0.0+codex.9d26fde082b4",
   "description": "Create and deploy Power Pages code sites and manage Power Platform ALM.",
   "author": {
     "name": "LeonardSEO",

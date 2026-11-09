@@ -1,6 +1,6 @@
 {
   "name": "process-intelligence",
-  "version": "0.7.0+codex.96d16d0718e4",
+  "version": "0.7.0+codex.9d26fde082b4",
   "description": "Analyze Power Automate Process Mining processes, bottlenecks, variants, cohorts and object-centric executions through MCP.",
   "author": {
     "name": "LeonardSEO",
