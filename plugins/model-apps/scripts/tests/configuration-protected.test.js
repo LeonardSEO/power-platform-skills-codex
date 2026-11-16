@@ -4,6 +4,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { makeTempDir } = require('./helpers/temp-dirs.js');
 const { createConfigOrg } = require('./helpers/fake-config-org.js');
 const { validateAppSpec, CONFIGURATION_IDENTITY_MIN_VERSION } = require('../lib/app-spec.js');
@@ -13,10 +15,10 @@ const { createMakerSdk, createNodeWorkspaceStorage } = require('../lib/maker-sdk
 const { configurationSendOnce } = require('../lib/configuration-transport.js');
 const { createDeferredManagedCreateGate } = require('../lib/managed-create-transport.js');
 const { createManagedCreateContext } = require('../lib/managed-create-context.js');
-const { openManagedBindings, managedManifestView } = require('../lib/managed-bindings.js');
+const { openManagedBindings, managedManifestView, storeFileName } = require('../lib/managed-bindings.js');
 const { readerFor } = require('../verify-model-app.js');
 const { createConfigurationRuntime } = require('../lib/configuration-build.js');
-const { readDeploymentBindings } = require('../lib/configuration-artifacts.js');
+const { readDeploymentBindings, configurationAuthorizationKeys } = require('../lib/configuration-artifacts.js');
 const { runSdkBuild } = require('../lib/sdk-build.js');
 const { STAGES } = require('../lib/stages.js');
 const { RETRY } = require('../lib/retry-policy.js');
@@ -77,13 +79,16 @@ function configSpec(over = {}) {
 const api = (over) => ({ customApis: [{ ...API, ...over }] });
 const rule = (over) => ({ duplicateDetectionRules: [{ ...RULE, ...over }] });
 
-async function harness({ hookup = true, intercept } = {}) {
+// `storeSeed`: a binding store file as an earlier plugin version wrote it, put where this one opens it.
+async function harness({ hookup = true, intercept, storeSeed } = {}) {
   const org = createConfigOrg({ tables: [{ logicalName: 'contact', attributes: ['emailaddress1', 'lastname'] }], solution: { uniqueName: SOL, version: '1.0.0.0', prefix: 'contoso' }, ...(intercept ? { intercept } : {}) });
   const gate = createDeferredManagedCreateGate();
   const httpClient = createAzHttpClient(org.origin, { getToken: () => 'test-token-0123456789abcdef', request: org.request, sleep: async () => {}, sendOnce: configurationSendOnce, workflowEffectGate: gate });
   const sdk = createMakerSdk({ workspaceStorage: createNodeWorkspaceStorage(makeTempDir('cfg-protected-sdk-')), instanceUrl: org.origin, httpClient, solutionUniqueName: SOL });
   await sdk.initWorkspace();
-  const store = openManagedBindings({ workspaceDir: makeTempDir('cfg-protected-store-'), environment: org.origin, appUniqueName: 'contoso_configured', solutionUniqueName: SOL });
+  const storeDir = makeTempDir('cfg-protected-store-');
+  if (storeSeed) fs.writeFileSync(path.join(storeDir, storeFileName(storeSeed.environmentFingerprint, 'contoso_configured', SOL)), JSON.stringify(storeSeed, null, 2));
+  const store = openManagedBindings({ workspaceDir: storeDir, environment: org.origin, appUniqueName: 'contoso_configured', solutionUniqueName: SOL });
   gate.bind(store);
   const ctx = createManagedCreateContext({ store, notFoundCode: B.NOT_FOUND_CODE });
   const protectedConfiguration = hookup ? P.createProtectedConfiguration({ store, gate, ctx, apiBase: `${org.origin}/api/data/v9.0` }) : undefined;
@@ -91,8 +96,16 @@ async function harness({ hookup = true, intercept } = {}) {
 }
 // A later process over the same binding store: a fresh managed create context (none of the earlier answers), with the
 // maker's exact approvals.
-function reopen(h, approvals = []) {
-  const ctx = createManagedCreateContext({ store: h.store, approvals, notFoundCode: B.NOT_FOUND_CODE });
+// An `@<row id>` approval reaches the context as the build's parser types it (build-model-app.js, through
+// configurationAuthorizationKeys, against `typedAs`); a token it refuses is passed as given, so a test can still offer one,
+// and `typedAs: null` passes every token as given.
+function reopen(h, approvals = [], typedAs = configSpec()) {
+  const typed = approvals.flatMap((t) => {
+    if (!typedAs || !/@[0-9a-f]{8}-/i.test(t)) return [t];
+    const read = configurationAuthorizationKeys([t], typedAs);
+    return read.problems.length ? [t] : [...read.rowApprovals];
+  });
+  const ctx = createManagedCreateContext({ store: h.store, approvals: typed, notFoundCode: B.NOT_FOUND_CODE });
   return { ...h, ctx, protectedConfiguration: P.createProtectedConfiguration({ store: h.store, gate: h.gate, ctx, apiBase: `${h.org.origin}/api/data/v9.0` }) };
 }
 // One configuration pass as the build runs it: the preflight, then the data-model step. Answers what it sent.
@@ -314,12 +327,12 @@ test('a rule whose initial publication failed keeps it owed: the rerun never sen
 test('a rule whose create answer was lost is never re-created or published by a rerun, and is bound only under its exact approvals', async () => {
   let org = null;
   let lose = true;
-  // The service applies the create, and its answer is lost on the way back.
+  // The service applies the create, and its answer is lost on the way back (a gateway's 503: no verdict on the request).
   const h = await harness({ intercept: async (req) => {
     if (!lose || req.method !== 'POST' || req.path.split('?')[0] !== '/duplicaterules') return undefined;
     lose = false;
     await org.request({ url: `${org.origin}/api/data/v9.0${req.path}`, method: 'POST', headers: req.headers, body: JSON.stringify(req.body) });
-    return { statusCode: 400, body: { error: { code: '0x80040216', message: 'the answer was lost' } } };
+    return { statusCode: 503, body: { error: { code: '0x80040216', message: 'the answer was lost' } } };
   } });
   org = h.org;
   const first = await pass(h, configSpec());
@@ -918,6 +931,27 @@ test('a bound protected item whose workspace copy differs from the server\'s is 
   assert.deepEqual((await pass(reopen(h), spec)).sent, []);
 });
 
+test('a workspace copy an earlier version left, which the SDK refuses, stops the preflight with its own code and remedy, never an overwrite approval that cannot clear it', async () => {
+  const h = await harness();
+  const spec = apiSpec();
+  await created(h, spec);
+  const bundle = require('../vendor/cds-maker-sdk.cjs');
+  const { LEGACY_COPY_CODE } = require('../lib/workspace-configuration-memory.js');
+  // The refusal the workspace overlay raises at the SDK's first touch of a legacy copy it cannot prove clean
+  // (lib/workspace-configuration-memory.js): an overwrite fetch is refused the same way, so an overwrite approval
+  // could never clear it; only the maker's removal of the two files does.
+  const diff = h.sdk.diffArtifact.bind(h.sdk);
+  h.sdk.diffArtifact = async (kind, ...rest) => {
+    if (kind === 'customApi') throw new bundle.SdkError(LEGACY_COPY_CODE, 'customApis/<id>.json and its metadata were left by an earlier version; delete those two files');
+    return diff(kind, ...rest);
+  };
+  const out = await pass(reopen(h), spec);
+  assert.equal(out.halt && out.halt.code, LEGACY_COPY_CODE, out.halt && `${out.halt.code}: ${out.halt.message}`);
+  assert.ok(out.halt.message.includes('delete those two files'), out.halt.message);
+  assert.ok(!out.halt.message.includes('--authorize overwrite:'), out.halt.message);
+  assert.deepEqual(out.sent, [], 'nothing is written');
+});
+
 // A protected edit the org refuses, with a local edit written into the shared workspace copy at some point of the
 // build's own send. `inject(h, id, sdk)` installs the edit; answers the harness, the root id and the edited App Spec.
 async function refusedSendWith(inject) {
@@ -1024,7 +1058,9 @@ test('a local edit made after a failed protected send, while a build compares th
 test('a failed protected send never removes its copy, and an approved replacement that cannot read the server\'s row keeps it and stops', async () => {
   let denyRead = false;
   const h = await harness({ intercept: ({ method, path }) => {
-    if (method === 'POST' && path.startsWith('/customapis')) return { statusCode: 400, body: { error: { code: '0x80040216', message: 'refused create' } } };
+    // A 503 says nothing about whether the create was taken, so the attempt stays pending (a 400 with a Dataverse code is
+    // a refusal that releases it: see the create-refused tests).
+    if (method === 'POST' && path.startsWith('/customapis')) return { statusCode: 503, body: { error: { code: '0x80040216', message: 'the answer was lost' } } };
     if (denyRead && method === 'GET' && path.startsWith('/customapis(')) return { statusCode: 403, body: { error: { code: '0x80040220', message: 'read denied' } } };
     return undefined;
   } });
@@ -1227,4 +1263,1207 @@ test('verify under the opt-in never falls back to a name: no binding store, no b
   pending.groups = pending.groups.filter((g) => g.family !== 'customApi');
   pending.pending.push({ family: 'customApi', key: 'contoso_calc', code: 'managed-settlement-pending' });
   assert.equal(definitions(await read.configuration(configSpec(), undefined, pending))['customApi contoso_Calc'], 'managed-settlement-pending');
+});
+
+// ---------------------------------------------------------------------------------------------
+// Verify pairs a protected rule's conditions at the ids its binding holds, as the build's plan does: criteria swapped between two
+// bound condition rows is a change the build refuses (configuration-edit-unsupported), so verify must fail it too.
+
+const TWO_CONDITIONS = [{ key: 'e', column: 'emailaddress1', match: 'exact' }, { key: 'l', column: 'lastname', match: 'exact' }];
+const twoRules = () => configSpec(rule({ conditions: TWO_CONDITIONS }));
+const conditionRow = (h, column) => h.org.rows('duplicateruleconditions').find((r) => r.baseattributename === column);
+const patchRow = async (h, set, id, body) => {
+  const res = await h.org.request({ url: `${h.org.origin}/api/data/v9.2/${set}(${id})`, method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  assert.ok(res.statusCode < 300, `${set}: ${res.statusCode}`);
+};
+const verifyRule = (h, spec = twoRules(), view = viewOf(h)) => readerFor(h.sdk, 'contoso_configured').configuration(spec, undefined, view);
+const ruleCheck = (checks) => checks.find((c) => c.kind === 'duplicateRule' && c.name === 'definition');
+const setCriteria = (h, row, column) => patchRow(h, 'duplicateruleconditions', row.duplicateruleconditionid, { baseattributename: column, matchingattributename: column });
+const assertBuildStops = async (h) => {
+  const out = await pass(h, twoRules());
+  assert.equal(out.halt && out.halt.code, 'configuration-edit-unsupported', out.halt && out.halt.message);
+  assert.equal(out.halt.phase, 'preflight');
+  assert.deepEqual(out.sent, [], 'nothing is sent');
+};
+
+test('verify fails a protected rule whose bound condition rows swapped their criteria, naming the conditions; the build refuses it too', async () => {
+  const h = await harness();
+  await created(h, twoRules());
+  const e = conditionRow(h, 'emailaddress1');
+  const l = conditionRow(h, 'lastname');
+  await setCriteria(h, e, 'lastname');
+  await setCriteria(h, l, 'emailaddress1');
+  const mark = h.org.requests.length;
+  const check = ruleCheck(await verifyRule(h));
+  assert.equal(check.ok, false, 'the same rule the build refuses must not verify');
+  assert.equal(check.code, 'DRIFT');
+  assert.deepEqual(check.fields, ['/conditions', '/conditions/e', '/conditions/l']);
+  assert.deepEqual(writesSince(h, mark), [], 'verify sends nothing');
+  await assertBuildStops(h);
+});
+
+// The complete verify output for the swapped state without the opt-in, as the unchanged code produces it for this org: every kind's checks.
+const PLAIN_SWAPPED_OUTPUT = [
+  { kind: 'environmentVariable', key: 'contoso_ApiBase', name: 'definition', ok: true },
+  { kind: 'customApi', key: 'contoso_Calc', name: 'definition', ok: true },
+  { kind: 'customApi', key: 'contoso_Calc', name: 'implementation', ok: false, code: 'CUSTOM_API_IMPLEMENTATION_UNPROVEN' },
+  { kind: 'duplicateRule', key: 'email', name: 'definition', ok: true },
+  { kind: 'duplicateRule', key: 'email', name: 'publication', ok: true },
+];
+test('verify still passes an unchanged protected rule, and name lookup (no opt-in) passes a real swap exactly as before', async () => {
+  const h = await harness();
+  await created(h, twoRules());
+  assert.deepEqual(ruleCheck(await verifyRule(h)), { kind: 'duplicateRule', key: 'email', name: 'definition', ok: true });
+  // Both rows are taken before either is changed: the second lookup would otherwise find the first row again.
+  const e = conditionRow(h, 'emailaddress1');
+  const l = conditionRow(h, 'lastname');
+  await setCriteria(h, e, 'lastname');
+  await setCriteria(h, l, 'emailaddress1');
+  assert.deepEqual([e, l].map((r) => r.baseattributename), ['lastname', 'emailaddress1'], 'the rows really are swapped');
+  const { configurationIdentity, ...plain } = twoRules();
+  assert.equal(configurationIdentity, 'stable-v1');
+  assert.deepEqual(await verifyRule(h, plain), PLAIN_SWAPPED_OUTPUT, 'name lookup judges by content: the complete output is what it was before');
+});
+
+test('a protected rule whose bound condition was deleted and made again still fails verify as not found, and a real criteria change is still drift', async () => {
+  const h = await harness();
+  await created(h, twoRules());
+  const e = conditionRow(h, 'emailaddress1');
+  const ruleId = e._regardingobjectid_value;
+  const gone = await h.org.request({ url: `${h.org.origin}/api/data/v9.2/duplicateruleconditions(${e.duplicateruleconditionid})`, method: 'DELETE', headers: {} });
+  assert.ok(gone.statusCode < 300);
+  await insertRow(h.org, 'duplicateruleconditions', { baseattributename: 'emailaddress1', matchingattributename: 'emailaddress1', operatorcode: e.operatorcode, 'regardingobjectid@odata.bind': `/duplicaterules(${ruleId})` });
+  const remade = ruleCheck(await verifyRule(h));
+  assert.equal(remade.code, B.NOT_FOUND_CODE, 'a bound row is never replaced by a namesake');
+  assert.equal(remade.fields, undefined);
+  const h2 = await harness();
+  await created(h2, twoRules());
+  await setCriteria(h2, conditionRow(h2, 'lastname'), 'firstname');
+  const changed = ruleCheck(await verifyRule(h2));
+  assert.equal(changed.ok, false);
+  assert.equal(changed.code, 'DRIFT');
+  assert.ok(changed.fields.includes('/conditions') && changed.fields.includes('/conditions/l') && !changed.fields.includes('/conditions/e'), changed.fields.join(','));
+  await assertBuildStops(h2);
+});
+
+// Verify and the build's preflight judge a bound protected rule by one function (judgeBoundShape + editVerdict), so for every state
+// of the rule they must agree: verify passes exactly when the preflight halts nothing for it. Each state runs verify, then the
+// preflight, on the same fake org and binding store.
+const addRow = (h, column, over = {}) => {
+  const sample = conditionRow(h, 'emailaddress1');
+  return insertRow(h.org, 'duplicateruleconditions', {
+    baseattributename: column, matchingattributename: column, operatorcode: sample.operatorcode, ignoreblankvalues: false,
+    'regardingobjectid@odata.bind': `/duplicaterules(${sample._regardingobjectid_value})`, ...over,
+  });
+};
+const SWAP = async (h) => { const e = conditionRow(h, 'emailaddress1'); const l = conditionRow(h, 'lastname'); await setCriteria(h, e, 'lastname'); await setCriteria(h, l, 'emailaddress1'); };
+const withConditions = (conditions) => configSpec(rule({ conditions }));
+const E = TWO_CONDITIONS[0];
+const L = TWO_CONDITIONS[1];
+const STATES = [
+  { name: 'unchanged', pass: true },
+  { name: 'reordered in the declaration', spec: () => withConditions([L, E]), pass: true },
+  { name: 'a single condition', base: configSpec(), spec: () => configSpec(), pass: true },
+  { name: 'swapped criteria', change: SWAP, pass: false, fields: ['/conditions', '/conditions/e', '/conditions/l'] },
+  { name: 'a changed criterion', change: (h) => setCriteria(h, conditionRow(h, 'lastname'), 'firstname'), pass: false, fields: ['/conditions', '/conditions/l'] },
+  { name: 'a renamed key', spec: () => withConditions([{ ...E, key: 'e2' }, L]), pass: false, fields: ['/conditions', '/conditions/e2'] },
+  { name: 'a declared condition added', spec: () => withConditions([...TWO_CONDITIONS, { key: 'f', column: 'firstname', match: 'exact' }]), pass: false, fields: ['/conditions', '/conditions/f'] },
+  { name: 'a declared condition removed', spec: () => withConditions([E]), pass: false, fields: ['/conditions'] },
+  { name: 'an extra server row', change: (h) => addRow(h, 'firstname'), pass: false, fields: ['/conditions'] },
+  { name: 'a hand-added duplicate of a bound condition declared under a new key', change: (h) => addRow(h, 'emailaddress1'), spec: () => withConditions([...TWO_CONDITIONS, { key: 'x', column: 'emailaddress1', match: 'exact' }]), pass: false, fields: ['/conditions', '/conditions/x'] },
+  { name: 'conditions omitted over bound ones', spec: () => configSpec(rule({ conditions: undefined })), pass: false, fields: ['/conditions'] },
+  { name: 'a rule field changed by hand', change: (h) => patchRow(h, 'duplicaterules', h.org.rows('duplicaterules')[0].duplicateruleid, { name: 'Renamed by hand' }), pass: false, fields: ['/name'] },
+  { name: 'a changed name and swapped criteria', change: SWAP, spec: () => configSpec(rule({ name: 'Other name', conditions: TWO_CONDITIONS })), pass: false, fields: ['/name', '/conditions', '/conditions/e', '/conditions/l'] },
+  { name: 'a changed name and a declared condition added', spec: () => configSpec(rule({ name: 'Other name', conditions: [...TWO_CONDITIONS, { key: 'f', column: 'firstname', match: 'exact' }] })), pass: false, fields: ['/name', '/conditions', '/conditions/f'] },
+  { name: 'a changed name and a declared condition removed', spec: () => configSpec(rule({ name: 'Other name', conditions: [E] })), pass: false, fields: ['/name', '/conditions'] },
+  { name: 'a hand-added row declared under two new keys (the comparison cannot pair them)', base: configSpec(), change: (h) => addRow(h, 'lastname'), spec: () => withConditions([E, { key: 'l', column: 'lastname', match: 'exact' }, { key: 'l2', column: 'lastname', match: 'exact' }]), pass: false, fields: ['/conditions', '/conditions/l', '/conditions/l2'] },
+  { name: 'another matching table', spec: () => configSpec(rule({ matchingEntity: 'account', conditions: TWO_CONDITIONS })), pass: false, fields: ['/matchingEntity'] },
+  { name: 'swapped criteria and a status change', change: SWAP, spec: () => configSpec(rule({ status: 'unpublished', conditions: TWO_CONDITIONS })), pass: false, fields: ['/conditions', '/conditions/e', '/conditions/l', '/status'] },
+  { name: 'a bound row deleted', change: async (h) => { const row = conditionRow(h, 'lastname'); const res = await h.org.request({ url: `${h.org.origin}/api/data/v9.2/duplicateruleconditions(${row.duplicateruleconditionid})`, method: 'DELETE', headers: {} }); assert.ok(res.statusCode < 300); }, pass: false, code: B.NOT_FOUND_CODE },
+  { name: 'an unpublished bound rule without conditions', base: configSpec(rule({ status: 'unpublished', conditions: [] })), spec: () => configSpec(rule({ status: 'unpublished', conditions: [] })), pass: true },
+];
+
+async function agreeOn(state) {
+  const h = await harness();
+  await created(h, state.base || twoRules());
+  if (state.change) await state.change(h);
+  const spec = state.spec ? state.spec() : state.base || twoRules();
+  const mark = h.org.requests.length;
+  const check = ruleCheck(await verifyRule(h, spec));
+  assert.deepEqual(writesSince(h, mark), [], `${state.name}: verify sends nothing`);
+  const out = await pass(h, spec);
+  const halted = out.halt !== null;
+  assert.equal(check.ok === true, !halted, `${state.name}: verify ${check.ok ? 'passes' : `fails ${check.code}`}, the preflight ${halted ? `halts ${out.halt.code}` : 'does not halt'}`);
+  assert.equal(check.ok === true, state.pass, state.name);
+  if (state.fields) { assert.equal(check.code, 'DRIFT', `${state.name}: ${check.code}`); assert.deepEqual(check.fields, state.fields, state.name); }
+  if (state.code) { assert.equal(check.code, state.code, state.name); assert.equal(out.halt.code, state.code, state.name); }
+  if (halted) assert.deepEqual(out.sent, [], `${state.name}: a halted build sent nothing`);
+}
+
+test('verify and the build preflight agree on every state of a bound protected rule, and verify never writes', async () => {
+  // Every state runs, so one failure does not hide the next.
+  const failures = [];
+  for (const state of STATES) {
+    try { await agreeOn(state); } catch (error) { failures.push(String(error.message).split('\n').filter(Boolean).slice(0, 3).join(' | ').slice(0, 300)); }
+  }
+  assert.deepEqual(failures, [], 'every state agrees');
+});
+
+// ---------------------------------------------------------------------------------------------
+// A row a maker made BEFORE the opt-in (here by a build without it, so at an id the service picked) is a namesake to the
+// first protected create. It is adopted at its own id only under the exact `@<row id>` approvals the stop prints, and
+// read-only: nothing is sent to adopt it, and it is never bound while anything about it differs from what the stop said.
+
+const PK = { environmentvariabledefinitions: 'environmentvariabledefinitionid', customapis: 'customapiid', duplicaterules: 'duplicateruleid', customapirequestparameters: 'customapirequestparameterid' };
+const apiOnly = (over) => configSpec({ environmentVariables: [], duplicateDetectionRules: [], ...(over ? api(over) : {}) });
+const ADOPT_KINDS = [
+  { kind: 'environmentVariable', key: 'contoso_apibase', set: 'environmentvariabledefinitions', spec: () => variableOnly(), children: 0 },
+  { kind: 'customApi', key: 'contoso_calc', set: 'customapis', spec: () => apiOnly(), children: 2 },
+];
+const withoutOptIn = (spec) => { const { configurationIdentity, ...plain } = spec; return plain; };
+// The maker's rows, made by a build without the opt-in: the plain path creates them by name.
+async function madeBeforeOptIn(h, spec, opts = {}) {
+  const out = await pass(h, withoutOptIn(spec), opts);
+  assert.equal(out.halt, null, out.halt && `${out.halt.code}: ${out.halt.message}`);
+  return out;
+}
+const idIn = (h, set) => h.org.rows(set)[0][PK[set]];
+// The approvals a stop printed, of every item it names: configuration-build.js quotes each one.
+function printedApprovals(halt) {
+  const all = [...(halt ? halt.message : '').matchAll(/given after checking those rows are yours: ((?:"(?:[^"\\]|\\.)*"(?:, )?)+)\./g)];
+  return all.flatMap((m) => JSON.parse(`[${m[1]}]`));
+}
+// The stop a namesake gets today, before anything this change adds to it.
+const namesakeStop = (kind, key, ids) => `${kind} ${key}: the ${kind} "${key}" has a namesake at another id (${ids}); a protected create never binds a namesake, and no service changes were sent by this build`;
+function assertNothingHeld(h, kind, key, label) {
+  const group = h.store.readGroup(kind, key);
+  assert.equal(group.committed, null, `${label}: nothing is bound`);
+  assert.equal(group.pending, null, `${label}: no attempt is left`);
+}
+const settingsOf = (spec, Value) => readDeploymentBindings({ EnvironmentVariables: [{ SchemaName: 'contoso_ApiBase', Value }] }, spec);
+async function removeMembership(h, objectId) {
+  const member = h.org.rows('solutioncomponents').find((c) => c.objectid === objectId);
+  const res = await h.org.request({ url: `${h.org.origin}/api/data/v9.2/solutioncomponents(${member.solutioncomponentid})`, method: 'DELETE', headers: {} });
+  assert.ok(res.statusCode < 300, `DELETE solutioncomponents: ${res.statusCode}`);
+}
+async function joinSolution(h, id, componentType) {
+  const res = await h.org.request({ url: `${h.org.origin}/api/data/v9.2/AddSolutionComponent`, method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ SolutionUniqueName: SOL, ComponentId: id, ComponentType: componentType, AddRequiredComponents: false }) });
+  assert.ok(res.statusCode < 300, `AddSolutionComponent: ${res.statusCode}`);
+}
+
+test('a protected row made before the opt-in is adopted at its own id only under the exact approvals its stop prints, and nothing is sent', async () => {
+  for (const { kind, key, set, spec, children } of ADOPT_KINDS) {
+    const h = await harness();
+    await madeBeforeOptIn(h, spec());
+    const id = idIn(h, set);
+    const stop = await pass(reopen(h), spec());
+    assert.equal(stop.halt && stop.halt.code, 'create-identity-conflict', stop.halt && stop.halt.message);
+    assert.equal(stop.halt.phase, 'preflight');
+    assert.ok(stop.halt.message.startsWith(`${namesakeStop(kind, key, id)}. It can instead be adopted at its id ${id}, after checking that row is yours; the build would then change nothing in it.`), stop.halt.message);
+    assert.deepEqual(stop.sent, [], kind);
+    const tokens = printedApprovals(stop.halt);
+    assert.equal(tokens[0], `adopt:${kind}:${key}@${id}`, kind);
+    assert.equal(tokens.length, 1 + children, tokens.join(' '));
+    for (const t of tokens.slice(1)) assert.match(t, /^adopt:[A-Za-z]+:[^@/]+\/[^@/]+@[0-9a-f-]{36}$/);
+    // Nothing short of every exact approval adopts: not the root's alone, not the children's, not the plain token
+    // (which still means the row at the derived id only).
+    for (const partial of [tokens.slice(0, 1), tokens.slice(1), [`adopt:${kind}:${key}`]]) {
+      if (!partial.length || (partial.length === tokens.length)) continue;
+      const out = await pass(reopen(h, partial), spec());
+      assert.equal(out.halt && out.halt.code, 'create-identity-conflict', `${kind} ${partial}`);
+      assert.deepEqual(out.sent, [], `${kind} ${partial}`);
+      assertNothingHeld(h, kind, key, `${kind} ${partial}`);
+    }
+    const done = await pass(reopen(h, tokens), spec());
+    assert.equal(done.halt, null, done.halt && `${done.halt.code}: ${done.halt.message}`);
+    assert.deepEqual(done.sent, [], `${kind}: adopting sends nothing`);
+    const group = committed(h, kind, key);
+    assert.equal(group.records.length, 1 + children, kind);
+    assert.ok(group.records.every((r) => r.origin === 'adopted'), kind);
+    assert.equal(group.records.find((r) => r.kind === kind).id, id, kind);
+    assert.equal(h.store.readGroup(kind, key).pending, null);
+    assert.equal(h.org.rows(set).length, 1, `${kind}: nothing is made beside it`);
+    const rerun = await pass(reopen(h), spec());
+    assert.equal(rerun.halt, null, rerun.halt && `${rerun.halt.code}: ${rerun.halt.message}`);
+    assert.deepEqual(rerun.sent, [], `${kind}: the next build sends nothing`);
+  }
+});
+
+test('a namesake the build would then change prints the fields it would send, and its root approval lapses when they change', async () => {
+  const h = await harness();
+  await madeBeforeOptIn(h, apiOnly());
+  const id = idIn(h, 'customapis');
+  // Another protected item, created at its derived id: the adoption leaves its binding byte for byte.
+  await created(h, variableOnly());
+  const other = JSON.stringify(h.store.readGroup('environmentVariable', 'contoso_apibase'));
+  const spec = configSpec({ duplicateDetectionRules: [], ...api({ description: 'Adds two numbers' }) });
+  const stop = await pass(reopen(h), spec);
+  assert.equal(stop.halt && stop.halt.code, 'create-identity-conflict', stop.halt && stop.halt.message);
+  assert.ok(stop.halt.message.includes(`It can instead be adopted at its id ${id}, after checking that row is yours; the build would then change only these fields, /description.`), stop.halt.message);
+  assert.deepEqual(stop.sent, []);
+  const tokens = printedApprovals(stop.halt);
+  const [root] = tokens;
+  assert.match(root, new RegExp(`^adopt:customApi:contoso_calc@${id}\\+[0-9a-f]{16}$`));
+  // The root approval without the digest of that list, or with another one, adopts nothing.
+  for (const wrong of [root.replace(/\+.*$/, ''), root.replace(/\+.*$/, '+0123456789abcdef')]) {
+    const out = await pass(reopen(h, [wrong, ...tokens.slice(1)]), spec);
+    assert.equal(out.halt && out.halt.code, 'create-identity-conflict', wrong);
+    assert.deepEqual(out.sent, [], wrong);
+    assertNothingHeld(h, 'customApi', 'contoso_calc', wrong);
+  }
+  // The App Spec changed again after the stop: the build would now send another list, so the approvals given lapse.
+  const more = configSpec({ duplicateDetectionRules: [], ...api({ description: 'Adds two numbers', displayName: 'Calculator' }) });
+  const lapsed = await pass(reopen(h, tokens), more);
+  assert.equal(lapsed.halt && lapsed.halt.code, 'create-identity-conflict', lapsed.halt && lapsed.halt.message);
+  assert.ok(lapsed.halt.message.includes('only these fields, /description, /displayName.'), lapsed.halt.message);
+  assert.notEqual(printedApprovals(lapsed.halt)[0], root);
+  assert.deepEqual(lapsed.sent, []);
+  assertNothingHeld(h, 'customApi', 'contoso_calc', 'lapsed');
+  // Under the exact approvals: adopted read-only, then the printed edit is sent once through the bound path.
+  const done = await pass(reopen(h, tokens), spec);
+  assert.equal(done.halt, null, done.halt && `${done.halt.code}: ${done.halt.message}`);
+  assert.deepEqual(done.sent.map((r) => `${r.method} ${r.path.split('?')[0]}`), [`PATCH /customapis(${id})`]);
+  assert.equal(h.org.rows('customapis')[0].description, 'Adds two numbers');
+  assert.equal(JSON.stringify(h.store.readGroup('environmentVariable', 'contoso_apibase')), other, 'another item\'s binding is unchanged');
+  const rerun = await pass(reopen(h), spec);
+  assert.equal(rerun.halt, null);
+  assert.deepEqual(rerun.sent, []);
+});
+
+test('a namesake that cannot be adopted says why after today\'s stop, and is never bound, approvals given or not', async () => {
+  const CASES = [
+    { name: 'outside the solution', kind: 'environmentVariable', key: 'contoso_apibase', set: 'environmentvariabledefinitions', spec: variableOnly(),
+      make: async (h) => { await madeBeforeOptIn(h, variableOnly()); await removeMembership(h, idIn(h, 'environmentvariabledefinitions')); },
+      reason: /is not in the solution ContosoSol; add it there first\.$/ },
+    { name: 'a child the App Spec does not declare', kind: 'customApi', key: 'contoso_calc', set: 'customapis', spec: apiOnly(),
+      make: (h) => madeBeforeOptIn(h, apiOnly({ requestParameters: [...API.requestParameters, { uniqueName: 'B', type: 'integer' }] })), reason: /removals are not supported\.$/ },
+    { name: 'a name in another case', kind: 'environmentVariable', key: 'contoso_apibase', set: 'environmentvariabledefinitions',
+      spec: configSpec({ customApis: [], duplicateDetectionRules: [], environmentVariables: [{ schemaName: 'contoso_APIBase', type: 'string', defaultValue: 'https://api.contoso.com' }] }),
+      make: (h) => madeBeforeOptIn(h, variableOnly()), reason: /its schemaName differs from the App Spec's/ },
+    { name: 'a value that differs', kind: 'environmentVariable', key: 'contoso_apibase', set: 'environmentvariabledefinitions', spec: variableOnly(),
+      opts: { configurationBindings: settingsOf(variableOnly(), 'https://two.contoso.com') },
+      make: (h) => madeBeforeOptIn(h, variableOnly(), { configurationBindings: settingsOf(variableOnly(), 'https://one.contoso.com') }), reason: /never writes a value after adopting\.$/ },
+    { name: 'a first value', kind: 'environmentVariable', key: 'contoso_apibase', set: 'environmentvariabledefinitions', spec: variableOnly(),
+      opts: { configurationBindings: settingsOf(variableOnly(), 'https://one.contoso.com') },
+      make: (h) => madeBeforeOptIn(h, variableOnly()), reason: /would then write a first value to it/ },
+  ];
+  for (const c of CASES) {
+    const h = await harness();
+    await c.make(h);
+    const id = idIn(h, c.set);
+    const before = JSON.stringify(h.org.rows(c.set));
+    for (const approvals of [[], [`adopt:${c.kind}:${c.key}@${id}`]]) {
+      const out = await pass(reopen(h, approvals), c.spec, c.opts);
+      assert.equal(out.halt && out.halt.code, 'create-identity-conflict', `${c.name}: ${out.halt && out.halt.message}`);
+      assert.equal(out.halt.phase, 'preflight', c.name);
+      const [head, tail] = out.halt.message.split(`. It cannot be adopted at its id ${id}: `);
+      assert.equal(head, namesakeStop(c.kind, c.key, id), c.name);
+      assert.match(tail || '', c.reason, `${c.name}: ${out.halt.message}`);
+      assert.ok(!/exact approvals/.test(out.halt.message), `${c.name}: no approval is printed`);
+      assert.deepEqual(out.sent, [], c.name);
+      assertNothingHeld(h, c.kind, c.key, c.name);
+    }
+    assert.equal(JSON.stringify(h.org.rows(c.set)), before, `${c.name}: the row is untouched`);
+  }
+});
+
+test('several namesakes keep today\'s stop byte for byte, and no namesake keeps today\'s requests', async () => {
+  const h = await harness();
+  const ids = [];
+  for (let i = 0; i < 2; i += 1) {
+    const id = await insertRow(h.org, 'environmentvariabledefinitions', VARIABLE_ROW);
+    await joinSolution(h, id, 380);
+    ids.push(id);
+  }
+  const out = await pass(reopen(h, ids.map((id) => `adopt:environmentVariable:contoso_apibase@${id}`)), variableOnly());
+  assert.equal(out.halt && out.halt.code, 'create-identity-conflict');
+  const listed = /namesake at another id \(([^)]*)\)/.exec(out.halt.message)[1];
+  assert.deepEqual(listed.split(', ').sort(), ids.slice().sort());
+  assert.equal(out.halt.message, namesakeStop('environmentVariable', 'contoso_apibase', listed));
+  assert.deepEqual(out.sent, []);
+  assertNothingHeld(h, 'environmentVariable', 'contoso_apibase', 'several');
+  // No namesake: the first create is exactly today's, an approval of the derived id included.
+  const plain = await harness();
+  const first = await pass(reopen(plain, ['adopt:environmentVariable:contoso_apibase']), variableOnly());
+  assert.equal(first.halt, null, first.halt && first.halt.message);
+  assert.deepEqual(first.sent.map((r) => `${r.method} ${r.path.split('(')[0].split('?')[0]}`), ['POST /environmentvariabledefinitions']);
+  assert.equal(committed(plain, 'environmentVariable', 'contoso_apibase').records[0].origin, 'created');
+});
+
+test('a namesake that changes after its adoption began is not adopted: nothing is sent or bound, and the attempt is retired', async () => {
+  const CASES = [
+    // A declared field edited by hand: the build would now change it, a list the approvals were not given for.
+    { name: 'a maker edit', kind: 'customApi', key: 'contoso_calc', set: 'customapis', spec: apiOnly({ description: 'Adds two numbers' }), change: (h, id) => patchRow(h, 'customapis', id, { description: 'Changed by hand' }) },
+    { name: 'a membership removed', kind: 'customApi', key: 'contoso_calc', set: 'customapis', spec: apiOnly(), change: (h, id) => removeMembership(h, id) },
+    { name: 'a variable edited', kind: 'environmentVariable', key: 'contoso_apibase', set: 'environmentvariabledefinitions', spec: variableOnly(), change: (h, id) => patchRow(h, 'environmentvariabledefinitions', id, { defaultvalue: 'https://other.contoso.com' }) },
+  ];
+  for (const c of CASES) {
+    // The change lands in the riskiest window: after the attempt began and the store was captured, before the
+    // acceptance — on the first service read the build makes once begin has run.
+    let armed = false;
+    let id = null;
+    const own = new Set();
+    const h = await harness({ intercept: async () => {
+      if (!armed) return undefined;
+      armed = false;
+      const from = h.org.requests.length;
+      await c.change(h, id);
+      for (const r of h.org.requests.slice(from)) own.add(r);
+      return undefined;
+    } });
+    await madeBeforeOptIn(h, c.spec);
+    id = idIn(h, c.set);
+    const tokens = printedApprovals((await pass(reopen(h), c.spec)).halt);
+    const approved = reopen(h, tokens);
+    const runtime = createConfigurationRuntime({ spec: c.spec, sdk: approved.sdk, opts: { protectedConfiguration: approved.protectedConfiguration }, appUniqueName: 'contoso_configured' });
+    assert.deepEqual(await runtime.preflight(), { halts: [] }, `${c.name}: the preflight forecasts the adoption`);
+    const begin = approved.ctx.begin;
+    let began = 0;
+    approved.ctx.begin = (plans) => { const out = begin(plans); began += 1; armed = true; return out; };
+    const mark = h.org.requests.length;
+    const step = await runtime.apply('data-model');
+    assert.equal(began, 1, `${c.name}: the adoption began`);
+    assert.equal(armed, false, `${c.name}: the change landed`);
+    assert.deepEqual(step.halt && step.halt.items.map((i) => i.code), ['create-identity-conflict'], `${c.name}: ${JSON.stringify(step.halt && step.halt.items)}`);
+    assert.deepEqual(h.org.requests.slice(mark).filter((r) => r.method !== 'GET' && !own.has(r)), [], `${c.name}: nothing is sent`);
+    assertNothingHeld(h, c.kind, c.key, c.name);
+    assert.deepEqual(h.store.snapshot().envelope.attempts, [], `${c.name}: the attempt is retired`);
+    // The next build stops on what is there now: the approvals given for the earlier rows adopt nothing.
+    const next = await pass(reopen(h, tokens), c.spec);
+    assert.equal(next.halt && next.halt.code, 'create-identity-conflict', c.name);
+    assert.deepEqual(next.sent, [], c.name);
+    assertNothingHeld(h, c.kind, c.key, c.name);
+  }
+});
+
+test('an approval given for a row that was then replaced, or whose child was, adopts nothing: the stop names the new rows; one for a row since deleted lets the item be created', async () => {
+  // The root replaced: deleted and made again by name, at another id.
+  const h = await harness();
+  await madeBeforeOptIn(h, apiOnly());
+  const tokens = printedApprovals((await pass(reopen(h), apiOnly())).halt);
+  const old = idIn(h, 'customapis');
+  const del = await h.org.request({ url: `${h.org.origin}/api/data/v9.2/customapis(${old})`, method: 'DELETE', headers: {} });
+  assert.ok(del.statusCode < 300);
+  await madeBeforeOptIn(h, apiOnly());
+  const fresh = idIn(h, 'customapis');
+  assert.notEqual(fresh, old);
+  const out = await pass(reopen(h, tokens), apiOnly());
+  assert.equal(out.halt && out.halt.code, 'create-identity-conflict', out.halt && out.halt.message);
+  assert.equal(printedApprovals(out.halt)[0], `adopt:customApi:contoso_calc@${fresh}`);
+  assert.deepEqual(out.sent, []);
+  assertNothingHeld(h, 'customApi', 'contoso_calc', 'root replaced');
+
+  // A child replaced: the same parameter made again under the same API, at another id, and put in the solution.
+  const c = await harness();
+  await madeBeforeOptIn(c, apiOnly());
+  const childTokens = printedApprovals((await pass(reopen(c), apiOnly())).halt);
+  const [param] = c.org.rows('customapirequestparameters');
+  const member = c.org.rows('solutioncomponents').find((m) => m.objectid === param.customapirequestparameterid);
+  const gone = await c.org.request({ url: `${c.org.origin}/api/data/v9.2/customapirequestparameters(${param.customapirequestparameterid})`, method: 'DELETE', headers: {} });
+  assert.ok(gone.statusCode < 300);
+  const copy = Object.fromEntries(Object.entries(param).filter(([k]) => !['customapirequestparameterid', '_customapiid_value', 'versionnumber'].includes(k) && !k.startsWith('@')));
+  const made = await insertRow(c.org, 'customapirequestparameters', { ...copy, 'CustomAPIId@odata.bind': `/customapis(${param._customapiid_value})` });
+  await joinSolution(c, made, member.componenttype);
+  const again = await pass(reopen(c, childTokens), apiOnly());
+  assert.equal(again.halt && again.halt.code, 'create-identity-conflict', again.halt && again.halt.message);
+  assert.ok(printedApprovals(again.halt).some((t) => t.endsWith(`@${made}`)), again.halt.message);
+  assert.deepEqual(again.sent, []);
+  assertNothingHeld(c, 'customApi', 'contoso_calc', 'child replaced');
+
+  // The namesake deleted after the stop: its approvals adopt nothing, and the item is created at its derived id, as the
+  // preflight forecasts and as a build with no namesake does.
+  const d = await harness();
+  await madeBeforeOptIn(d, variableOnly());
+  const varTokens = printedApprovals((await pass(reopen(d), variableOnly())).halt);
+  const was = idIn(d, 'environmentvariabledefinitions');
+  const dropped = await d.org.request({ url: `${d.org.origin}/api/data/v9.2/environmentvariabledefinitions(${was})`, method: 'DELETE', headers: {} });
+  assert.ok(dropped.statusCode < 300);
+  const created = await pass(reopen(d, varTokens), variableOnly());
+  assert.equal(created.halt, null, created.halt && created.halt.message);
+  assert.deepEqual(created.sent.map((r) => `${r.method} ${r.path.split('(')[0].split('?')[0]}`), ['POST /environmentvariabledefinitions']);
+  const record = committed(d, 'environmentVariable', 'contoso_apibase').records[0];
+  assert.equal(record.origin, 'created');
+  assert.notEqual(record.id, was);
+});
+
+test('an adoption cut off after it began is retired and made again under its approvals, and is never sent as a create', async () => {
+  for (const at of ['prepared', 'sending']) {
+    const h = await harness();
+    await madeBeforeOptIn(h, apiOnly());
+    const id = idIn(h, 'customapis');
+    const tokens = printedApprovals((await pass(reopen(h), apiOnly())).halt);
+    // The process stops right after the attempt is written: before it is marked sending, or right after.
+    const cut = reopen(h, tokens);
+    if (at === 'prepared') {
+      const mark = h.store.markAttemptSetSending;
+      h.store.markAttemptSetSending = () => { h.store.markAttemptSetSending = mark; throw new Error('the process stopped'); };
+    } else {
+      const begin = cut.ctx.begin;
+      cut.ctx.begin = (plans) => { begin(plans); throw new Error('the process stopped'); };
+    }
+    const crashed = await pass(cut, apiOnly());
+    assert.ok(crashed.halt, at);
+    assert.deepEqual(crashed.sent, [], at);
+    const pending = h.store.readGroup('customApi', 'contoso_calc').pending;
+    assert.equal(pending && pending.phase, at, at);
+    assert.equal(committed(h, 'customApi', 'contoso_calc'), null, at);
+
+    // A later build without the approvals stops as before, and the create path refuses the attempt outright.
+    const asked = await pass(reopen(h), apiOnly());
+    assert.equal(asked.halt && asked.halt.code, 'create-identity-conflict', `${at}: ${asked.halt && asked.halt.message}`);
+    assert.deepEqual(asked.sent, [], at);
+    const port = reopen(h).protectedConfiguration.port({ spec: apiOnly(), dataverse: h.sdk.dataverse, solution: SOL, bindings: undefined, sdk: h.sdk });
+    const mark = h.org.requests.length;
+    let refused = null;
+    try { await port.run({ kind: 'customApi', key: 'contoso_Calc' }, async () => { throw new Error('never sent'); }); } catch (error) { refused = error; }
+    assert.equal(refused && refused.code, 'create-identity-unverified', refused && refused.message);
+    assert.match(refused.message, /pending adoption, which is never sent as a create/);
+    assert.deepEqual(h.org.requests.slice(mark).filter((r) => r.method !== 'GET'), [], `${at}: run sends nothing`);
+
+    // Under the approvals: the attempt is retired and the adoption made again, read-only.
+    const done = await pass(reopen(h, tokens), apiOnly());
+    assert.equal(done.halt, null, done.halt && `${at}: ${done.halt.code}: ${done.halt.message}`);
+    assert.deepEqual(done.sent, [], at);
+    const group = h.store.readGroup('customApi', 'contoso_calc');
+    assert.equal(group.pending, null, at);
+    assert.equal(group.committed.records.find((r) => r.kind === 'customApi').id, id, at);
+    assert.equal(h.org.rows('customapis').length, 1, `${at}: nothing is created`);
+  }
+});
+// ---------------------------------------------------------------------------------------------
+// Adoption edges: what an approved adoption may and may not do, every item a stop prints approvals for, and the reads it costs.
+
+const sentLines = (sent) => sent.map((r) => `${r.method} ${r.path}`);
+
+test('an adopted variable keeps its private value, given or not, and nothing is sent', async () => {
+  for (const withSettings of [true, false]) {
+    const h = await harness();
+    const spec = variableOnly();
+    const opts = { configurationBindings: settingsOf(spec, 'https://one.contoso.com') };
+    await madeBeforeOptIn(h, spec, opts);
+    const given = withSettings ? opts : {};
+    const stopped = await pass(reopen(h), spec, given);
+    const tokens = printedApprovals(stopped.halt);
+    assert.equal(tokens.length, 2, stopped.halt && stopped.halt.message);
+    const out = await pass(reopen(h, tokens, spec), spec, given);
+    assert.equal(out.halt, null, out.halt && out.halt.message);
+    assert.deepEqual(sentLines(out.sent), [], `settings given: ${withSettings}`);
+    assert.equal(committed(h, 'environmentVariable', 'contoso_apibase').records.length, 2);
+  }
+});
+
+const DATA_SOURCE = '/providers/Microsoft.PowerApps/apis/shared_sharepointonline';
+const dataSources = () => configSpec({
+  customApis: [], duplicateDetectionRules: [],
+  environmentVariables: [
+    { schemaName: 'contoso_Parent', type: 'dataSource', connectorId: DATA_SOURCE, parameterKey: 'dataset' },
+    { schemaName: 'contoso_Child', type: 'dataSource', connectorId: DATA_SOURCE, parameterKey: 'table', parentSchemaName: 'contoso_Parent' },
+  ],
+});
+
+test('a data-source variable and its parent, both made before the opt-in, are adopted together, or the parent first and then the child', async () => {
+  // Together: one stop prints both, and one build adopts both, the child against its parent's adopted row.
+  {
+    const h = await harness();
+    const spec = dataSources();
+    await madeBeforeOptIn(h, spec);
+    const stopped = await pass(reopen(h), spec);
+    const tokens = printedApprovals(stopped.halt);
+    assert.equal(tokens.length, 2, stopped.halt && stopped.halt.message);
+    const out = await pass(reopen(h, tokens, spec), spec);
+    assert.equal(out.halt, null, out.halt && out.halt.message);
+    assert.deepEqual(sentLines(out.sent), []);
+    assert.ok(committed(h, 'environmentVariable', 'contoso_parent') && committed(h, 'environmentVariable', 'contoso_child'));
+  }
+  // The parent first: a later stop offers the child alone, against the parent's binding (not its derived id).
+  {
+    const h = await harness();
+    const spec = dataSources();
+    await madeBeforeOptIn(h, spec);
+    const parentOnly = { ...spec, environmentVariables: spec.environmentVariables.slice(0, 1) };
+    const parentStop = await pass(reopen(h), parentOnly);
+    const parentAdopted = await pass(reopen(h, printedApprovals(parentStop.halt), spec), parentOnly);
+    assert.equal(parentAdopted.halt, null, parentAdopted.halt && parentAdopted.halt.message);
+    const childStop = await pass(reopen(h), spec);
+    const tokens = printedApprovals(childStop.halt);
+    assert.equal(tokens.length, 1, childStop.halt && childStop.halt.message);
+    assert.match(tokens[0], /^adopt:environmentVariable:contoso_child@/);
+    const out = await pass(reopen(h, tokens, spec), spec);
+    assert.equal(out.halt, null, out.halt && out.halt.message);
+    assert.deepEqual(sentLines(out.sent), []);
+    assert.ok(committed(h, 'environmentVariable', 'contoso_child'));
+  }
+});
+
+test('a request parameter added in the adoption build is created under its approvals', async () => {
+  const h = await harness();
+  await madeBeforeOptIn(h, apiOnly());
+  const spec = apiOnly({ requestParameters: [...API.requestParameters, { uniqueName: 'B', type: 'string' }] });
+  const stopped = await pass(reopen(h), spec);
+  const tokens = printedApprovals(stopped.halt);
+  assert.equal(tokens.length, 3, stopped.halt && stopped.halt.message);
+  const out = await pass(reopen(h, tokens, spec), spec);
+  assert.equal(out.halt, null, out.halt && out.halt.message);
+  assert.ok(out.sent.some((r) => r.method === 'POST'), sentLines(out.sent).join(' '));
+});
+
+test('a maker edit made after the adoption is accepted stops the same build: nothing but the printed fields is ever sent', async () => {
+  let armed = false;
+  const own = new Set();
+  let id;
+  const h = await harness({ intercept: async () => {
+    if (!armed) return undefined;
+    armed = false;
+    const mark = h.org.requests.length;
+    await patchRow(h, 'customapis', id, { displayname: 'Unseen maker edit' });
+    for (const r of h.org.requests.slice(mark)) own.add(r);
+    return undefined;
+  } });
+  await madeBeforeOptIn(h, apiOnly({ displayName: 'Calculator' }));
+  id = idIn(h, 'customapis');
+  const spec = apiOnly({ displayName: 'Calculator', description: 'Adds numbers' });
+  const stopped = await pass(reopen(h), spec);
+  assert.match(stopped.halt.message, /only these fields, \/description\./);
+  const approved = reopen(h, printedApprovals(stopped.halt), spec);
+  const accept = approved.ctx.acceptReadOnly;
+  approved.ctx.acceptReadOnly = (items) => { const out = accept(items); armed = true; return out; };
+  const out = await pass(approved, spec);
+  assert.equal(armed, false, 'the maker edit was made');
+  assert.equal(out.halt && out.halt.code, 'configuration-incomplete', out.halt && out.halt.message);
+  assert.match(out.halt.message, /customApi contoso_Calc \(create-identity-conflict\)/);
+  // Refused, not unknown: the item's stop says nothing was sent for it.
+  assert.deepEqual(out.step.outcome.refused.map((r) => `${r.kind}:${r.code}`), ['customApi:create-identity-conflict']);
+  assert.deepEqual(out.step.outcome.unknown, []);
+  assert.deepEqual(sentLines(out.sent.filter((r) => !own.has(r))), [], 'nothing is sent');
+  assert.equal(h.org.rows('customapis')[0].displayname, 'Unseen maker edit');
+  assert.notEqual(h.org.rows('customapis')[0].description, 'Adds numbers', 'the approved edit is not sent either');
+  // A later build plans the item from the row as it is now, as an ordinary bound one: the App Spec's values are sent.
+  const later = await pass(reopen(h), spec);
+  assert.equal(later.halt, null, later.halt && later.halt.message);
+  assert.deepEqual(later.sent.map((r) => `${r.method} ${r.path.split('?')[0]}`), [`PATCH /customapis(${id})`]);
+  assert.equal(h.org.rows('customapis')[0].description, 'Adds numbers');
+});
+
+// A duplicate rule and its conditions are never adopted: a rule's namesake keeps the stop it had before adoption existed,
+// byte for byte, after the same reads, and no approval, typed or raw, binds it or lets anything be sent. An adopted rule
+// would be reconciled by the ordinary rule path, which neither holds an edit to the fields its stop printed nor keeps
+// from publishing a rule a maker changed after the acceptance.
+const anyId = (text) => text.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, '<id>');
+const RULE_STOP_READS = [
+  "GET /EntityDefinitions(LogicalName='connectionreference')?$select=ObjectTypeCode",
+  "GET /EntityDefinitions(LogicalName='customapi')?$select=ObjectTypeCode",
+  "GET /EntityDefinitions(LogicalName='duplicaterule')?$select=ObjectTypeCode",
+  "GET /EntityDefinitions(LogicalName='customapirequestparameter')?$select=ObjectTypeCode",
+  "GET /EntityDefinitions(LogicalName='customapiresponseproperty')?$select=ObjectTypeCode",
+  "GET /EntityDefinitions(LogicalName='duplicaterulecondition')?$select=ObjectTypeCode",
+  'GET /duplicaterules(<id>)?$select=duplicateruleid,name,description,baseentityname,matchingentityname,iscasesensitive,excludeinactiverecords,statecode,statuscode',
+  "GET /duplicaterules?$select=duplicateruleid,name&$filter=name eq 'Same email'",
+  'GET /duplicateruleconditions?$filter=_regardingobjectid_value eq <id>&$select=duplicateruleconditionid,baseattributename,matchingattributename,operatorcode,operatorparam,ignoreblankvalues,_regardingobjectid_value',
+];
+const onlyRule = (over = {}) => configSpec({ environmentVariables: [], customApis: [], ...rule(over) });
+
+test('a duplicate rule made before the opt-in keeps its stop byte for byte: no adoption is offered or taken, and nothing is sent', async () => {
+  const CASES = [
+    { name: 'published', spec: onlyRule() },
+    { name: 'unpublished', spec: onlyRule({ status: 'unpublished' }) },
+    { name: 'its description differs', before: onlyRule({ description: 'Original' }), spec: onlyRule({ description: 'Changed' }) },
+  ];
+  for (const c of CASES) {
+    const h = await harness();
+    await madeBeforeOptIn(h, c.before || c.spec);
+    const id = idIn(h, 'duplicaterules');
+    const condition = h.org.rows('duplicateruleconditions')[0].duplicateruleconditionid;
+    const rows = () => JSON.stringify([h.org.rows('duplicaterules'), h.org.rows('duplicateruleconditions')]);
+    const before = rows();
+    const mark = h.org.requests.length;
+    const stop = await pass(reopen(h), c.spec);
+    assert.equal(stop.halt && stop.halt.code, 'create-identity-conflict', c.name);
+    assert.equal(stop.halt.phase, 'preflight', c.name);
+    assert.equal(stop.halt.message, namesakeStop('duplicateRule', 'email', id), c.name);
+    assert.deepEqual(h.org.requests.slice(mark).map((r) => anyId(`${r.method} ${r.path}`)), RULE_STOP_READS, `${c.name}: the reads of 2.24.0`);
+    // The approvals a plugin that adopted rules would print: the parser reads them whole, as 2.24.0 does, so they name no
+    // declared item; given anyway, raw or in the typed spelling, they adopt nothing.
+    const wouldBe = [`adopt:duplicateRule:email@${id}`, `adopt:duplicateRuleCondition:email/e@${condition}`];
+    assert.deepEqual(configurationAuthorizationKeys(wouldBe, c.spec).problems.map((p) => p.code), ['CONFIGURATION_AUTHORIZATION_UNKNOWN_ITEM', 'CONFIGURATION_AUTHORIZATION_UNKNOWN_ITEM'], c.name);
+    for (const approvals of [wouldBe, wouldBe.map((a) => a.replace(/^adopt:/, 'adopt-row:')), ['adopt:duplicateRule:email', 'adopt:duplicateRuleCondition:email/e']]) {
+      const out = await pass(reopen(h, approvals, null), c.spec);
+      assert.equal(out.halt && out.halt.message, namesakeStop('duplicateRule', 'email', id), `${c.name}: ${approvals}`);
+      assert.deepEqual(out.sent, [], `${c.name}: ${approvals}`);
+      assertNothingHeld(h, 'duplicateRule', 'email', `${c.name}: ${approvals}`);
+    }
+    assert.equal(rows(), before, `${c.name}: the rule is untouched`);
+  }
+});
+
+test('a rule a maker edits during a build given the approvals a rule adoption would need is neither rewritten nor published', async () => {
+  // Two windows: right after an acceptance, which a rule never reaches, and the build's first request.
+  for (const status of ['published', 'unpublished']) for (const window of ['after acceptance', 'first request']) {
+    const label = `${status}, ${window}`;
+    let armed = false;
+    let id;
+    const own = new Set();
+    const h = await harness({ intercept: async () => {
+      if (!armed) return undefined;
+      armed = false;
+      const mark = h.org.requests.length;
+      await patchRow(h, 'duplicaterules', id, { description: 'Unseen maker edit' });
+      for (const r of h.org.requests.slice(mark)) own.add(r);
+      return undefined;
+    } });
+    const spec = onlyRule({ description: 'Original', status });
+    await madeBeforeOptIn(h, spec);
+    id = idIn(h, 'duplicaterules');
+    const condition = h.org.rows('duplicateruleconditions')[0].duplicateruleconditionid;
+    const stopped = await pass(reopen(h), spec);
+    const approvals = printedApprovals(stopped.halt);
+    // The typed spellings an adoption would be matched in, given even though the stop printed none.
+    const given = reopen(h, [...approvals, `adopt-row:duplicateRule:email@${id}`, `adopt-row:duplicateRuleCondition:email/e@${condition}`], approvals.length ? spec : null);
+    const accept = given.ctx.acceptReadOnly;
+    let accepted = 0;
+    given.ctx.acceptReadOnly = (items) => { const out = accept(items); accepted += 1; if (window === 'after acceptance') armed = true; return out; };
+    if (window === 'first request') armed = true;
+    const out = await pass(given, spec);
+    assert.deepEqual(sentLines(out.sent.filter((r) => !own.has(r))), [], `${label}: no PATCH and no PublishDuplicateRule`);
+    assert.equal(accepted, 0, `${label}: a rule is never accepted as adopted`);
+    assert.deepEqual(approvals, [], `${label}: the stop prints no approval`);
+    assert.equal(out.halt && out.halt.code, 'create-identity-conflict', label);
+    assert.equal(h.org.rows('duplicaterules')[0].description, window === 'first request' ? 'Unseen maker edit' : 'Original', label);
+    assertNothingHeld(h, 'duplicateRule', 'email', label);
+  }
+});
+
+test('a stop naming several adoptable namesakes shows each one\'s id and fields beside its approvals', async () => {
+  const h = await harness();
+  const before = apiOnly({ uniqueName: 'contoso_First', isFunction: false, requestParameters: [], responseProperties: [] });
+  before.customApis.push({ uniqueName: 'contoso_Second', description: 'Maker text', isFunction: false, requestParameters: [], responseProperties: [] });
+  await madeBeforeOptIn(h, before);
+  const idOf = (name) => h.org.rows('customapis').find((r) => r.uniquename === name).customapiid;
+  const spec = structuredClone(before);
+  spec.customApis[1].description = 'Replacement';
+  const stopped = await pass(reopen(h), spec);
+  const message = stopped.halt.message;
+  for (const [key, name, change] of [['contoso_first', 'contoso_First', 'nothing in it'], ['contoso_second', 'contoso_Second', 'only these fields, /description']]) {
+    const id = idOf(name);
+    assert.ok(message.includes(`Adopt customApi ${key} at its id ${id} (the build would then change ${change}) only under these exact approvals, given after checking those rows are yours: "adopt:customApi:${key}@${id}`), message);
+  }
+  assert.equal(printedApprovals(stopped.halt).length, 2);
+  const out = await pass(reopen(h, printedApprovals(stopped.halt), spec), spec);
+  assert.equal(out.halt, null, out.halt && out.halt.message);
+});
+
+test('the build\'s own error names every adoptable namesake with its id and fields, before anything is sent', async () => {
+  const h = await harness();
+  const before = apiOnly({ uniqueName: 'contoso_First', isFunction: false, requestParameters: [], responseProperties: [] });
+  before.customApis.push({ uniqueName: 'contoso_Second', description: 'Maker text', isFunction: false, requestParameters: [], responseProperties: [] });
+  await madeBeforeOptIn(h, before);
+  const idOf = (name) => h.org.rows('customapis').find((r) => r.uniquename === name).customapiid;
+  const spec = structuredClone(before);
+  spec.customApis[1].description = 'Replacement';
+  assert.deepEqual(validateAppSpec(spec).errors, []);
+  const mark = h.org.requests.length;
+  let caught;
+  try {
+    await runSdkBuild(spec, { sdk: h.sdk, apply: true, phases: STAGES.data, workspaceDir: makeTempDir('cfg-protected-ws-'), protectedConfiguration: reopen(h).protectedConfiguration, emit: () => {} });
+  } catch (error) {
+    caught = error;
+  }
+  assert.equal(caught && caught.code, 'create-identity-conflict', caught && caught.message);
+  for (const [key, name, change] of [['contoso_first', 'contoso_First', 'nothing in it'], ['contoso_second', 'contoso_Second', 'only these fields, /description']]) {
+    const id = idOf(name);
+    assert.ok(caught.message.includes(`Adopt customApi ${key} at its id ${id} (the build would then change ${change}) only under these exact approvals, given after checking those rows are yours: "adopt:customApi:${key}@${id}`), caught.message);
+  }
+  assert.deepEqual(h.org.requests.slice(mark).filter((r) => r.method !== 'GET'), [], 'zero service mutations');
+});
+
+test('a rule key that ends in what reads like a row id keeps its ordinary meaning, and a rule namesake is never offered', async () => {
+  const h = await harness();
+  const initial = onlyRule({ status: 'unpublished', conditions: [] });
+  await madeBeforeOptIn(h, initial);
+  const id = idIn(h, 'duplicaterules');
+  const spec = structuredClone(initial);
+  const secondKey = `email@${id}`;
+  spec.duplicateDetectionRules.push({ key: secondKey, name: 'Another rule', entity: 'contact', status: 'unpublished', conditions: [] });
+  const typed = `adopt:duplicateRule:${secondKey}`;
+  const parsed = configurationAuthorizationKeys([typed], spec);
+  assert.deepEqual(parsed.problems, []);
+  assert.deepEqual([...parsed.rowApprovals], [typed], 'the plain approval of the rule keyed email@<id>, as in 2.24.0');
+  const out = await pass(reopen(h, [...parsed.rowApprovals], null), spec);
+  assert.equal(out.halt && out.halt.code, 'create-identity-conflict');
+  assert.equal(out.halt.message, namesakeStop('duplicateRule', 'email', id));
+  assert.deepEqual(out.sent, []);
+  assert.equal(committed(h, 'duplicateRule', 'email'), null);
+});
+test('a failed continuation page of the membership or the children is never read as a complete adoption read', async () => {
+  for (const set of ['solutioncomponents', 'customapirequestparameters']) {
+    let active = false;
+    let root;
+    const h = await harness({ intercept: ({ method, path }) => {
+      if (!active || method !== 'GET' || !path.startsWith(`/${set}?`)) return undefined;
+      if (set !== 'solutioncomponents' && !path.includes(root) && !path.includes('$skiptoken=more')) return undefined;
+      if (/\$skiptoken=/.test(path)) return { statusCode: 503, body: { error: { code: '0x80040216', message: 'busy' } } };
+      return { statusCode: 200, body: { value: [], '@odata.nextLink': `${h.org.origin}/api/data/v9.0/${set}?$skiptoken=more` } };
+    } });
+    await madeBeforeOptIn(h, apiOnly());
+    root = idIn(h, 'customapis');
+    const tokens = printedApprovals((await pass(reopen(h), apiOnly())).halt);
+    active = true;
+    const out = await pass(reopen(h, tokens), apiOnly());
+    assert.ok(out.halt, set);
+    assert.deepEqual(sentLines(out.sent), [], set);
+    assert.ok(h.org.requests.some((r) => r.path.includes('$skiptoken=more')), set);
+    assertNothingHeld(h, 'customApi', 'contoso_calc', set);
+  }
+});
+
+test('complete continuation pages supply the children and the membership of an adoption', async () => {
+  let active = false;
+  let root;
+  let continued = 0;
+  const h = await harness({ intercept: ({ method, path }) => {
+    if (!active || method !== 'GET') return undefined;
+    const set = path.startsWith('/solutioncomponents?') ? 'solutioncomponents'
+      : path.startsWith('/customapirequestparameters?') && (path.includes(root) || path.includes('$skiptoken=more')) ? 'customapirequestparameters' : null;
+    if (!set) return undefined;
+    if (path.includes('$skiptoken=more')) { continued += 1; return { statusCode: 200, body: { value: h.org.rows(set) } }; }
+    return { statusCode: 200, body: { value: [], '@odata.nextLink': `${h.org.origin}/api/data/v9.0/${set}?$skiptoken=more` } };
+  } });
+  await madeBeforeOptIn(h, apiOnly());
+  root = idIn(h, 'customapis');
+  const tokens = printedApprovals((await pass(reopen(h), apiOnly())).halt);
+  active = true;
+  const out = await pass(reopen(h, tokens), apiOnly());
+  assert.equal(out.halt, null, out.halt && out.halt.message);
+  assert.ok(continued > 2, `continued ${continued}`);
+  assert.deepEqual(sentLines(out.sent), []);
+});
+
+test('a connection reference is adopted only with its matching private connection', async () => {
+  const spec = configSpec({ environmentVariables: [], customApis: [], duplicateDetectionRules: [],
+    connectionReferences: [{ logicalName: 'contoso_sp', connectorId: DATA_SOURCE }] });
+  const good = readDeploymentBindings({ ConnectionReferences: [{ LogicalName: 'contoso_sp', ConnectionId: 'conn-one' }] }, spec);
+  const bad = readDeploymentBindings({ ConnectionReferences: [{ LogicalName: 'contoso_sp', ConnectionId: 'conn-two' }] }, spec);
+  const h = await harness();
+  const opts = { configurationBindings: good, connections: async () => [{ connectionId: 'conn-one', connectorId: DATA_SOURCE }] };
+  await madeBeforeOptIn(h, spec, opts);
+  const stop = await pass(reopen(h), spec, opts);
+  const tokens = printedApprovals(stop.halt);
+  assert.equal(tokens.length, 1, stop.halt && stop.halt.message);
+  const refused = await pass(reopen(h, tokens, spec), spec, { ...opts, configurationBindings: bad });
+  assert.ok(refused.halt);
+  assert.deepEqual(sentLines(refused.sent), []);
+  assertNothingHeld(h, 'connectionReference', 'contoso_sp', 'private connection mismatch');
+  const accepted = await pass(reopen(h, tokens, spec), spec, opts);
+  assert.equal(accepted.halt, null, accepted.halt && accepted.halt.message);
+  assert.deepEqual(sentLines(accepted.sent), []);
+});
+
+test('a request parameter added while the adoption is captured is refused, and nothing is bound', async () => {
+  let armed = false;
+  let root;
+  const h = await harness({ intercept: async () => {
+    if (!armed) return undefined;
+    armed = false;
+    await insertRow(h.org, 'customapirequestparameters', { uniquename: 'MakerChild', name: 'MakerChild', type: 10, 'CustomAPIId@odata.bind': `/customapis(${root})` });
+    return undefined;
+  } });
+  await madeBeforeOptIn(h, apiOnly());
+  root = idIn(h, 'customapis');
+  const approved = reopen(h, printedApprovals((await pass(reopen(h), apiOnly())).halt));
+  const capture = approved.ctx.captureReadOnly;
+  approved.ctx.captureReadOnly = (items) => { const out = capture(items); armed = true; return out; };
+  const out = await pass(approved, apiOnly());
+  assert.ok(out.halt);
+  assertNothingHeld(h, 'customApi', 'contoso_calc', 'new child during adoption');
+});
+
+test('a read-only acceptance needs an attempt begun with its expected proof, never one only prepared', async () => {
+  const h = await harness();
+  const spec = apiOnly({ isFunction: false, requestParameters: [], responseProperties: [] });
+  await madeBeforeOptIn(h, spec);
+  const id = idIn(h, 'customapis');
+  const approved = reopen(h, [`adopt:customApi:contoso_calc@${id}`]);
+  const tokenOf = () => `adopt-row:customApi:contoso_calc@${id}`;
+  const base = await B.readConfigurationRow(h.sdk.dataverse, 'customApi', id);
+  const types = await B.readComponentTypes(h.sdk.dataverse);
+  const planned = B.planOf(spec, { kind: 'customApi', key: 'contoso_Calc', solution: SOL, componentTypes: types.types, bases: new Map([[id, base]]), boundIdOf: () => id, asIs: true });
+  const built = require('../lib/managed-create-context.js').buildRowPlan(planned.plan);
+  const [unbegun] = h.store.prepareAttemptSet([built.prepare]);
+  const [capture0] = approved.ctx.captureReadOnly([unbegun]);
+  const observation0 = await B.observe(h.sdk.dataverse, planned);
+  assert.throws(() => approved.ctx.acceptReadOnly([{ token: unbegun, capture: capture0, observation: observation0, declarationSha256: planned.plan.declarationSha256, approvalTokenOf: tokenOf }]),
+    /not a plan of existing rows with a base observation/);
+  h.store.retireUnsentAttempt({ token: unbegun, baseGeneration: null });
+  const [begun] = approved.ctx.begin([planned.plan]);
+  const [capture1] = approved.ctx.captureReadOnly([begun.token]);
+  const observation1 = await B.observe(h.sdk.dataverse, planned);
+  const [accepted] = approved.ctx.acceptReadOnly([{ token: begun.token, capture: capture1, observation: observation1, declarationSha256: planned.plan.declarationSha256, approvalTokenOf: tokenOf }]);
+  assert.equal(accepted.verdict.action, 'commit');
+  assert.equal(accepted.group.records[0].origin, 'adopted');
+});
+
+test('adoption analysis costs reads only for a single namesake under the opt-in', async () => {
+  const gets = {};
+  for (const roots of [0, 1, 2]) {
+    const h = await harness();
+    const spec = variableOnly();
+    if (roots > 0) await madeBeforeOptIn(h, spec);
+    if (roots === 2) await joinSolution(h, await insertRow(h.org, 'environmentvariabledefinitions', VARIABLE_ROW), 380);
+    for (const optIn of [false, true]) {
+      const runtime = createConfigurationRuntime({ spec: optIn ? spec : withoutOptIn(spec), sdk: h.sdk, opts: { protectedConfiguration: reopen(h).protectedConfiguration }, appUniqueName: 'contoso_configured' });
+      const mark = h.org.requests.length;
+      try { await runtime.preflight(); } catch { /* the namesake stops are judged elsewhere */ }
+      const since = h.org.requests.slice(mark);
+      assert.deepEqual(sentLines(since.filter((r) => r.method !== 'GET')), []);
+      gets[`${roots}:${optIn ? 'opt-in' : 'plain'}`] = since.length;
+    }
+  }
+  assert.deepEqual(gets, { '0:plain': 0, '0:opt-in': 8, '1:plain': 0, '1:opt-in': 18, '2:plain': 0, '2:opt-in': 8 });
+});
+
+// ---------------------------------------------------------------------------------------------
+// After an adoption is accepted, the same build sends at most the fields its stop printed, for every kind that adopts: a
+// maker edit made right after the acceptance, to a field outside that list, stops the item with nothing sent and the
+// maker's value kept. A later build plans the item from the row as it is now, as an ordinary bound one.
+
+async function editedAfterAcceptance({ before, spec, beforeOpts = {}, opts = {}, edit, expectList }) {
+  let armed = false;
+  const own = new Set();
+  const h = await harness({ intercept: async () => {
+    if (!armed) return undefined;
+    armed = false;
+    const mark = h.org.requests.length;
+    await edit(h);
+    for (const r of h.org.requests.slice(mark)) own.add(r);
+    return undefined;
+  } });
+  await madeBeforeOptIn(h, before, beforeOpts);
+  const stopped = await pass(reopen(h), spec, opts);
+  assert.equal(stopped.halt && stopped.halt.code, 'create-identity-conflict', stopped.halt && stopped.halt.message);
+  assert.ok(stopped.halt.message.includes(`the build would then change ${expectList}`), stopped.halt.message);
+  const approved = reopen(h, printedApprovals(stopped.halt), spec);
+  const accept = approved.ctx.acceptReadOnly;
+  let accepted = 0;
+  approved.ctx.acceptReadOnly = (items) => { const out = accept(items); accepted += 1; armed = true; return out; };
+  const out = await pass(approved, spec, opts);
+  assert.equal(accepted, 1, 'the adoption was accepted');
+  assert.equal(armed, false, 'the maker edit was made');
+  return { h, out, sent: out.sent.filter((r) => !own.has(r)) };
+}
+function assertItemStopped(out, sent, kind, code = 'create-identity-conflict') {
+  assert.equal(out.halt && out.halt.code, 'configuration-incomplete', out.halt && out.halt.message);
+  assert.deepEqual(out.step.outcome.refused.map((r) => `${r.kind}:${r.code}`), [`${kind}:${code}`]);
+  assert.deepEqual(out.step.outcome.unknown, []);
+  assert.deepEqual(sentLines(sent), [], 'nothing is sent');
+}
+
+test('an adopted environment variable edited by a maker right after the acceptance is not edited by the same build', async () => {
+  const VAR = { schemaName: 'contoso_ApiBase', type: 'string', name: 'API base', description: 'Original', defaultValue: 'https://api.contoso.com' };
+  const before = configSpec({ customApis: [], duplicateDetectionRules: [], environmentVariables: [VAR] });
+  const spec = configSpec({ customApis: [], duplicateDetectionRules: [], environmentVariables: [{ ...VAR, defaultValue: 'https://new.contoso.com' }] });
+  for (const [column, value] of [['description', 'Maker description'], ['displayname', 'Maker name']]) {
+    const edit = (h) => patchRow(h, 'environmentvariabledefinitions', idIn(h, 'environmentvariabledefinitions'), { [column]: value });
+    const { h, out, sent } = await editedAfterAcceptance({ before, spec, edit, expectList: 'only these fields, /defaultValue' });
+    assertItemStopped(out, sent, 'environmentVariable');
+    const [row] = h.org.rows('environmentvariabledefinitions');
+    assert.equal(row[column], value, `${column}: the maker value is kept`);
+    assert.equal(row.defaultvalue, 'https://api.contoso.com', `${column}: the approved edit is not sent either`);
+    const later = await pass(reopen(h), spec);
+    assert.equal(later.halt, null, later.halt && later.halt.message);
+    assert.equal(h.org.rows('environmentvariabledefinitions')[0].defaultvalue, 'https://new.contoso.com');
+  }
+});
+
+test('an adopted environment variable value changed by a maker right after the acceptance is not written back by the same build', async () => {
+  const spec = variableOnly();
+  const settings = { configurationBindings: settingsOf(spec, 'https://one.contoso.com') };
+  const edit = (h) => patchRow(h, 'environmentvariablevalues', h.org.rows('environmentvariablevalues')[0].environmentvariablevalueid, { value: 'https://maker.contoso.com' });
+  // Without the approval to replace a value, the build's own gate refuses writing the deployment settings' value back;
+  // with it, the adoption's hold does: nothing beyond the printed list (here nothing) is sent in the adopting build.
+  for (const [opts, code] of [[settings, 'DESTRUCTIVE_CHANGE_UNAUTHORIZED'], [{ ...settings, authorizedDestructive: new Set(['environmentVariableValue:contoso_apibase:value']) }, 'create-identity-conflict']]) {
+    const { h, out, sent } = await editedAfterAcceptance({ before: spec, spec, beforeOpts: settings, opts, edit, expectList: 'nothing in it' });
+    assertItemStopped(out, sent, 'environmentVariable', code);
+    assert.equal(h.org.rows('environmentvariablevalues')[0].value, 'https://maker.contoso.com', `${code}: the maker value is kept`);
+  }
+});
+
+test('an adopted connection reference edited by a maker right after the acceptance is not edited by the same build', async () => {
+  const REF = { logicalName: 'contoso_sp', connectorId: DATA_SOURCE, name: 'SharePoint', description: 'Original' };
+  const before = configSpec({ environmentVariables: [], customApis: [], duplicateDetectionRules: [], connectionReferences: [REF] });
+  const spec = configSpec({ environmentVariables: [], customApis: [], duplicateDetectionRules: [], connectionReferences: [{ ...REF, description: 'Approved' }] });
+  const settings = (s, more = {}) => ({ configurationBindings: readDeploymentBindings({ ConnectionReferences: [{ LogicalName: 'contoso_sp', ConnectionId: 'conn-one' }] }, s),
+    connections: async () => [{ connectionId: 'conn-one', connectorId: DATA_SOURCE }, { connectionId: 'conn-two', connectorId: DATA_SOURCE }], ...more });
+  // A connection the maker changed is one the build would replace: refused by the build's own gate without the approval
+  // to replace it, and by the adoption's hold with it.
+  let replace = null;
+  for (const [column, value, code] of [['connectionreferencedisplayname', 'Maker name', 'create-identity-conflict'], ['connectionid', 'conn-two', 'DESTRUCTIVE_CHANGE_UNAUTHORIZED'], ['connectionid', 'conn-two', 'create-identity-conflict']]) {
+    const approved = column === 'connectionid' && code === 'create-identity-conflict';
+    const edit = (h) => patchRow(h, 'connectionreferences', h.org.rows('connectionreferences')[0].connectionreferenceid, { [column]: value });
+    const { h, out, sent } = await editedAfterAcceptance({ before, spec, beforeOpts: settings(before), opts: settings(spec, approved ? { authorizedDestructive: new Set(replace) } : {}), edit, expectList: 'only these fields, /description' });
+    assertItemStopped(out, sent, 'connectionReference', code);
+    if (code === 'DESTRUCTIVE_CHANGE_UNAUTHORIZED') replace = out.step.outcome.refused[0].authorize;
+    const [row] = h.org.rows('connectionreferences');
+    assert.equal(row[column], value, `${column} ${code}: the maker value is kept`);
+    assert.equal(row.description, 'Original', `${column} ${code}: the approved edit is not sent either`);
+  }
+  assert.ok(replace && replace.length, 'the replacement approval was named');
+});
+
+// ---------------------------------------------------------------------------------------------
+// #847: a protected create the service refused before carrying it out (a 400 with a Dataverse error code: one operation,
+// rolled back whole) leaves nothing behind, so it is released in the same run; one whose answer was lost (a 503) stays
+// pending as before, and an App Spec that drops it settles it only under the exact `retire:` approval the build prints.
+const KV = '/subscriptions/00000000-0000-4000-8000-000000000001/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/vault-sample/secrets/key-sample';
+const secretSpec = () => configSpec({ customApis: [], duplicateDetectionRules: [], environmentVariables: [{ schemaName: 'contoso_Key', type: 'secret' }] });
+const noConfig = () => configSpec({ customApis: [], duplicateDetectionRules: [], environmentVariables: [] });
+const secretValue = () => ({ configurationBindings: readDeploymentBindings({ EnvironmentVariables: [{ SchemaName: 'contoso_Key', Value: KV }] }, secretSpec()) });
+const variableRows = (h) => [h.org.rows('environmentvariabledefinitions').length, h.org.rows('environmentvariablevalues').length];
+const isVariableCreate = (r) => r.method === 'POST' && /^\/environmentvariable/.test(r.path);
+// A later process with the maker's `--authorize retire:…` flags, read by the build's own parser against `spec`.
+function retiring(h, flags, spec) {
+  const read = configurationAuthorizationKeys(flags, spec);
+  assert.deepEqual(read.problems, []);
+  const ctx = createManagedCreateContext({ store: h.store, notFoundCode: B.NOT_FOUND_CODE });
+  return { ...h, ctx, protectedConfiguration: P.createProtectedConfiguration({ store: h.store, gate: h.gate, ctx, apiBase: `${h.org.origin}/api/data/v9.0`, retirements: read.retire }) };
+}
+const retireFlagOf = (halt) => {
+  const m = /--authorize '(retire:[^']+)'/.exec(halt.message);
+  assert.ok(m, halt.message);
+  return m[1];
+};
+async function refusedSecret() {
+  let refuse = true;
+  const h = await harness({ intercept: ({ method, path }) => (refuse && method === 'POST' && /^\/environmentvariable/.test(path)
+    ? { statusCode: 400, body: { error: { code: '0x80072040', message: 'the Key Vault reference was refused' } } } : undefined) });
+  const first = await pass(h, secretSpec(), secretValue());
+  return { h, first, allow: () => { refuse = false; } };
+}
+
+test('a secret variable whose create the service refused stops with create-refused and leaves nothing pending: the rebuild with a value completes it', async () => {
+  const { h, first, allow } = await refusedSecret();
+  assert.equal(first.halt && first.halt.code, 'configuration-incomplete', first.halt && first.halt.message);
+  assert.deepEqual(first.step.outcome.refused.map((r) => [r.kind, r.code, r.serviceCode]), [['environmentVariable', 'create-refused', '0x80072040']]);
+  assert.deepEqual(first.step.outcome.unknown, []);
+  assert.match(first.halt.message, /contoso_Key \(create-refused\) \(the service refused it \(0x80072040\): nothing was created or changed and nothing is left pending/);
+  const group = h.store.readGroup('environmentVariable', 'contoso_key');
+  assert.equal(group.pending, null, 'the attempt is released: no later build is held by it');
+  assert.equal(group.committed, null);
+  assert.deepEqual(variableRows(h), [0, 0]);
+  // No secret reference is written to the store or shown to the maker.
+  assert.ok(!fs.readFileSync(h.store.file, 'utf8').includes('vault-sample'), 'the store holds no Key Vault reference');
+  assert.ok(!first.halt.message.includes('vault-sample'));
+
+  allow();
+  const done = await pass(reopen(h), secretSpec(), secretValue());
+  assert.equal(done.halt, null, done.halt && `${done.halt.code}: ${done.halt.message}`);
+  assert.equal(done.sent.filter((r) => r.method === 'POST' && r.path.startsWith('/environmentvariabledefinitions')).length, 1, 'created once');
+  assert.deepEqual(variableRows(h), [1, 1]);
+  assert.ok(committed(h, 'environmentVariable', 'contoso_key'));
+  const rerun = await pass(reopen(h), secretSpec(), secretValue());
+  assert.equal(rerun.halt, null);
+  assert.deepEqual(rerun.sent, []);
+});
+
+test('a secret variable whose create the service refused no longer holds a build whose App Spec drops it', async () => {
+  const { h, first } = await refusedSecret();
+  assert.ok(first.halt);
+  const out = await pass(reopen(h), noConfig());
+  assert.equal(out.halt, null, out.halt && `${out.halt.code}: ${out.halt.message}`);
+  assert.deepEqual(out.sent, []);
+  assert.deepEqual(variableRows(h), [0, 0]);
+});
+
+test('a secret variable whose create answer was lost stays pending: never sent again, and dropped only under its exact retire approval', async () => {
+  let org = null;
+  let lose = true;
+  const h = await harness({ intercept: async (req) => {
+    if (!lose || !isVariableCreate(req)) return undefined;
+    lose = false;
+    await org.request({ url: `${org.origin}/api/data/v9.0${req.path}`, method: 'POST', headers: req.headers, body: JSON.stringify(req.body) });
+    return { statusCode: 503, body: { error: { code: '0x80040216', message: 'the answer was lost' } } };
+  } });
+  org = h.org;
+  const first = await pass(h, secretSpec(), secretValue());
+  assert.ok(first.halt);
+  assert.deepEqual(first.step.outcome.refused, [], 'a lost answer is never read as a refusal');
+  assert.ok(h.store.readGroup('environmentVariable', 'contoso_key').pending, 'the outcome is unknown: the attempt stays');
+  const landed = variableRows(h);
+  assert.equal(landed[0], 1, 'the definition landed');
+  const again = await pass(reopen(h), secretSpec(), { ...secretValue(), ...overwriteCopy('environmentVariable', 'contoso_key') });
+  assert.ok(again.halt);
+  assert.deepEqual(again.sent.filter(isVariableCreate), [], 'the create is not sent again');
+
+  // Dropped from the App Spec: the build stops, names the exact approval, and sends nothing.
+  const dropped = await pass(reopen(h), noConfig());
+  assert.equal(dropped.halt && dropped.halt.code, 'managed-settlement-pending', dropped.halt && dropped.halt.message);
+  assert.deepEqual(dropped.sent, []);
+  const flag = retireFlagOf(dropped.halt);
+  assert.match(flag, /^retire:environmentVariable:contoso_key@[0-9a-f-]{36}$/);
+  // An approval for another attempt of the same item retires nothing.
+  const other = await pass(retiring(h, [flag.replace(/@.*$/, '@00000000-0000-4000-8000-000000000009')], noConfig()), noConfig());
+  assert.equal(other.halt && other.halt.code, 'managed-settlement-pending');
+  assert.ok(h.store.readGroup('environmentVariable', 'contoso_key').pending);
+
+  const warned = [];
+  const out = await pass(retiring(h, [flag], noConfig()), noConfig(), { warn: (m) => warned.push(m) });
+  assert.equal(out.halt, null, out.halt && `${out.halt.code}: ${out.halt.message}`);
+  assert.deepEqual(out.sent, [], 'nothing is deleted or sent');
+  assert.equal(h.store.readGroup('environmentVariable', 'contoso_key').pending, null);
+  assert.deepEqual(variableRows(h), landed, 'the rows it may have created stay');
+  assert.ok(warned.some((m) => /no longer tracks the unfinished attempt for environmentVariable contoso_key.*as approved/.test(m)), warned.join('\n'));
+
+  // Declared again, the item is an unbound create whose derived id is taken: it stops, and nothing is created twice.
+  const back = await pass(reopen(h), secretSpec(), secretValue());
+  assert.equal(back.halt && back.halt.code, 'create-identity-conflict', back.halt && back.halt.message);
+  assert.equal(back.halt.phase, 'preflight');
+  assert.deepEqual(back.sent, []);
+  assert.deepEqual(variableRows(h), landed);
+});
+
+// A create the service refused under 2.26.0, which recorded no refusal (no notStarted count): the attempt is pending in
+// phase "sending" and only its own ids can complete it, so corrected settings alone still stop the build. The stop names
+// the supported way out, with the exact approval: remove the item, run with the approval (nothing deleted or sent), restore
+// it. The stores were written by the 2.26.0 modules (fixtures/managed-bindings-2.26-refused-secret.json says how).
+const LEGACY = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'managed-bindings-2.26-refused-secret.json'), 'utf8'));
+async function legacyRefused(which) {
+  const seed = LEGACY[which];
+  const h = await harness({ storeSeed: seed.store });
+  for (const row of seed.landed) {
+    const put = await h.org.request({ url: `${h.org.origin}/api/data/v9.0${row.path}`, method: 'POST', headers: { 'Content-Type': 'application/json', 'MSCRM.SolutionUniqueName': SOL }, body: JSON.stringify(row.body) });
+    assert.ok(put.statusCode < 300, String(put.statusCode));
+  }
+  const token = seed.store.attempts[0].token;
+  assert.equal(h.store.readGroup('environmentVariable', 'contoso_key').pending.token, token, 'the 2.26.0 store is read as written');
+  return { h, token, flag: `retire:environmentVariable:contoso_key@${token}` };
+}
+function assertLegacyStop(out, flag) {
+  assert.equal(out.halt && out.halt.code, 'create-completion-required', out.halt && out.halt.message);
+  assert.equal(out.halt.phase, 'preflight');
+  assert.deepEqual(out.sent, [], 'corrected settings alone send nothing for it');
+  assert.match(out.halt.message, /remove this item \(and its deployment-settings entry\) from the App Spec/);
+  assert.ok(out.halt.message.includes(`--authorize '${flag}'`), out.halt.message);
+  assert.match(out.halt.message, /then restore them and run again/);
+  assert.ok(!out.halt.message.includes('vault-sample'));
+}
+
+test('a secret create a 2.26.0 build left pending after the service refused it stops with the way out; removing it, retiring it and restoring it creates it once', async () => {
+  const { h, flag } = await legacyRefused('refused');
+  assertLegacyStop(await pass(reopen(h), secretSpec(), secretValue()), flag);
+
+  const retired = await pass(retiring(h, [flag], noConfig()), noConfig());
+  assert.equal(retired.halt, null, retired.halt && `${retired.halt.code}: ${retired.halt.message}`);
+  assert.deepEqual(retired.sent, [], 'nothing is deleted or sent');
+  assert.equal(h.store.readGroup('environmentVariable', 'contoso_key').pending, null);
+
+  const restored = await pass(reopen(h), secretSpec(), secretValue());
+  assert.equal(restored.halt, null, restored.halt && `${restored.halt.code}: ${restored.halt.message}`);
+  assert.equal(restored.sent.filter((r) => r.method === 'POST' && r.path.startsWith('/environmentvariabledefinitions')).length, 1, 'created once');
+  assert.deepEqual(variableRows(h), [1, 1]);
+  assert.equal(committed(h, 'environmentVariable', 'contoso_key').records[0].id, LEGACY.refused.store.attempts[0].root.id, 'at the same derived id');
+  assert.deepEqual((await pass(reopen(h), secretSpec(), secretValue())).sent, []);
+});
+
+test('a 2.26.0 pending secret create whose definition row landed: after the retirement the restored item stops on that row, and deleting it lets the build create the item', async () => {
+  const { h, flag } = await legacyRefused('valueRefused');
+  assert.deepEqual(variableRows(h), [1, 0]);
+  assertLegacyStop(await pass(reopen(h), secretSpec(), secretValue()), flag);
+
+  const retired = await pass(retiring(h, [flag], noConfig()), noConfig());
+  assert.equal(retired.halt, null, retired.halt && `${retired.halt.code}: ${retired.halt.message}`);
+  assert.deepEqual(retired.sent, []);
+  assert.deepEqual(variableRows(h), [1, 0], 'the row it made stays');
+
+  const id = LEGACY.valueRefused.store.attempts[0].root.id;
+  const back = await pass(reopen(h), secretSpec(), secretValue());
+  assert.equal(back.halt && back.halt.code, 'create-identity-conflict', back.halt && back.halt.message);
+  assert.equal(back.halt.phase, 'preflight');
+  assert.deepEqual(back.sent, []);
+  assert.ok(back.halt.message.includes(id), back.halt.message);
+  assert.match(back.halt.message, /delete that row in the environment, then run again/);
+
+  const gone = await h.org.request({ url: `${h.org.origin}/api/data/v9.0/environmentvariabledefinitions(${id})`, method: 'DELETE', headers: {} });
+  assert.ok(gone.statusCode < 300, String(gone.statusCode));
+  const done = await pass(reopen(h), secretSpec(), secretValue());
+  assert.equal(done.halt, null, done.halt && `${done.halt.code}: ${done.halt.message}`);
+  assert.deepEqual(variableRows(h), [1, 1]);
+  assert.equal(committed(h, 'environmentVariable', 'contoso_key').records[0].id, id);
+});
+
+test('the retire approval is read only for an item the App Spec no longer declares, and only in its exact shape', () => {
+  const flag = 'retire:environmentVariable:contoso_key@3dedb827-fb3f-4577-a6a2-ec73e634807e';
+  const ok = configurationAuthorizationKeys([flag], noConfig());
+  assert.deepEqual(ok.problems, []);
+  assert.deepEqual([...ok.retire], ['environmentVariable\u0000contoso_key\u00003dedb827-fb3f-4577-a6a2-ec73e634807e']);
+  const declared = configurationAuthorizationKeys([flag], secretSpec());
+  assert.deepEqual(declared.problems.map((p) => p.code), ['CONFIGURATION_RETIRE_DECLARED']);
+  assert.equal(declared.retire.size, 0);
+  for (const bad of ['retire:environmentVariable:contoso_key', 'retire:environmentVariable:contoso_key@not-a-token', 'retire:form:main@3dedb827-fb3f-4577-a6a2-ec73e634807e', 'retire::@3dedb827-fb3f-4577-a6a2-ec73e634807e']) {
+    const read = configurationAuthorizationKeys([bad], noConfig());
+    assert.deepEqual(read.problems.map((p) => p.code), ['CONFIGURATION_RETIRE_INVALID'], bad);
+    assert.equal(read.retire.size, 0, bad);
+  }
+});
+
+// The same refusal for every other protected kind: released in the same run, and the corrected App Spec creates it once.
+test('a plain variable, a connection reference, a Custom API and a rule whose create the service refused are released and created once by the rebuild', async () => {
+  const REF = { logicalName: 'contoso_sp', connectorId: DATA_SOURCE, name: 'SharePoint' };
+  const refSettings = (s) => ({ configurationBindings: readDeploymentBindings({ ConnectionReferences: [{ LogicalName: 'contoso_sp', ConnectionId: 'conn-one' }] }, s),
+    connections: async () => [{ connectionId: 'conn-one', connectorId: DATA_SOURCE }] });
+  const only = (over) => configSpec({ environmentVariables: [], customApis: [], duplicateDetectionRules: [], ...over });
+  const cases = [
+    ['environmentVariable', 'contoso_apibase', 'environmentvariabledefinitions', only({ environmentVariables: [{ schemaName: 'contoso_ApiBase', type: 'string', defaultValue: 'https://api.contoso.com' }] }), () => ({})],
+    ['connectionReference', 'contoso_sp', 'connectionreferences', only({ connectionReferences: [REF] }), refSettings],
+    ['customApi', 'contoso_calc', 'customapis', only({ customApis: [API] }), () => ({})],
+    ['duplicateRule', 'email', 'duplicaterules', only({ duplicateDetectionRules: [RULE] }), () => ({})],
+  ];
+  for (const [kind, key, table, spec, settings] of cases) {
+    let refuse = true;
+    const h = await harness({ intercept: ({ method, path }) => (refuse && method === 'POST' && path.split('?')[0] === `/${table}`
+      ? { statusCode: 400, body: { error: { code: '0x80040265', message: 'refused' } } } : undefined) });
+    const first = await pass(h, spec, settings(spec));
+    assert.equal(first.halt && first.halt.code, 'configuration-incomplete', `${kind}: ${first.halt && first.halt.message}`);
+    assert.deepEqual(first.step.outcome.refused.map((r) => [r.kind, r.code]), [[kind, 'create-refused']], kind);
+    assert.equal(h.store.readGroup(kind, key).pending, null, `${kind}: released`);
+    assert.equal(h.org.rows(table).length, 0, kind);
+    // Dropped, it holds nothing; declared again, it is created once.
+    assert.equal((await pass(reopen(h), noConfig())).halt, null, `${kind}: dropping it is not held`);
+    refuse = false;
+    const done = await pass(reopen(h), spec, settings(spec));
+    assert.equal(done.halt, null, `${kind}: ${done.halt && `${done.halt.code}: ${done.halt.message}`}`);
+    assert.equal(h.org.rows(table).length, 1, `${kind}: created once`);
+    assert.ok(committed(h, kind, key), kind);
+  }
+});
+test('the sweep lets go of an undeclared attempt the store proves never sent, with no approval; one that may have been sent stays', () => {
+  const R = require('./helpers/managed-rows.js');
+  const sealed = [
+    { kind: 'customApi', key: R.API_KEY, id: R.API, sentFields: ['uniquename'], sentSha256: R.H('7') },
+    { kind: 'customApiRequestParameter', key: R.REQ_KEY, id: R.REQ, sentFields: ['uniquename'], sentSha256: R.H('8') },
+  ];
+  const held = (store) => {
+    const [token] = store.prepareAttemptSet([R.apiPlan()]);
+    return store.markAttemptSetSending([{ token, expected: R.apiExpected() }], { claim: 'first', observed: true })[0];
+  };
+  const prepared = R.open(makeTempDir('cfg-sweep-'));
+  prepared.prepareAttemptSet([R.apiPlan()]);
+  assert.deepEqual(P.pendingSweep({ spec: noConfig(), store: prepared }), { halts: [], retired: [{ kind: 'customApi', key: R.API_KEY, how: 'unsent' }] });
+  assert.equal(prepared.readGroup('customApi', R.API_KEY).pending, null);
+
+  // Its one request refused unstarted, and the run stopped before it released the attempt.
+  const refused = R.open(makeTempDir('cfg-sweep-'));
+  const r = held(refused);
+  refused.sealRowDispatch({ ...r, rows: sealed });
+  refused.noteRowsNotStarted({ ...r, rows: sealed });
+  assert.deepEqual(P.pendingSweep({ spec: noConfig(), store: refused }), { halts: [], retired: [{ kind: 'customApi', key: R.API_KEY, how: 'not-started' }] });
+  assert.equal(refused.readGroup('customApi', R.API_KEY).pending, null);
+
+  const sent = R.open(makeTempDir('cfg-sweep-'));
+  const s = held(sent);
+  sent.sealRowDispatch({ ...s, rows: sealed });
+  const { halts, retired } = P.pendingSweep({ spec: noConfig(), store: sent });
+  assert.deepEqual(retired, []);
+  assert.deepEqual(halts.map((x) => [x.code, x.authorize]), [['managed-settlement-pending', [`retire:customApi:${R.API_KEY}@${s.token}`]]]);
+  assert.ok(sent.readGroup('customApi', R.API_KEY).pending, 'kept until approved');
+  // The approval names that attempt; under it the store stops tracking it.
+  assert.deepEqual(P.pendingSweep({ spec: noConfig(), store: sent, retirements: [`customApi\u0000${R.API_KEY}\u0000${s.token}`] }), { halts: [], retired: [{ kind: 'customApi', key: R.API_KEY, how: 'approved' }] });
+  assert.equal(sent.readGroup('customApi', R.API_KEY).pending, null);
 });

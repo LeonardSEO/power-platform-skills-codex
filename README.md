@@ -51,7 +51,7 @@ codex plugin list --marketplace power-platform-skills-codex --json
 
 | Plugin | Skills | Purpose |
 | --- | ---: | --- |
-| `power-pages` | 39 | Build and deploy Power Pages code sites |
+| `power-pages` | 40 | Build and deploy Power Pages code sites |
 | `model-apps` | 4 | Build generative pages for model-driven apps |
 | `mcp-apps` | 3 | Generate interactive MCP App widgets |
 | `canvas-apps` | 4 | Author Canvas Apps through the Canvas Authoring MCP server |
@@ -63,7 +63,7 @@ codex plugin list --marketplace power-platform-skills-codex --json
 | `process-intelligence` | 10 | Analyze Power Automate Process Mining data |
 | `dataverse` | 10 | Query and manage Dataverse data, schema, security, and solutions |
 
-**Total: 11 plugins and 144 skill definitions.**
+**Total: 11 plugins and 145 skill definitions.**
 
 The skill count includes five internal mobile implementation helpers. Those helpers
 are invoked through `mobile-app:add-native`, rather than exposed as separate portable skills.

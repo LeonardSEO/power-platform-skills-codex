@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "process-intelligence",
-  "version": "0.7.0+codex.9d26fde082b4",
+  "version": "0.7.0+codex.198d91b94abc",
   "description": "Analyze Power Automate Process Mining processes, bottlenecks, variants, cohorts and object-centric executions through MCP.",
   "author": {
     "name": "LeonardSEO",

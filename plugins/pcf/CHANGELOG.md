@@ -16,9 +16,13 @@ First preview release: ships the `/pcf:pcf` skill, matrix-pinned templates and r
 - Bundled SDK and HTTP client updated to model-apps 2.21.0 (SDK commit 0eef55f8c2d0). PCF still reads through them and publishes through PAC; removal of the SDK's unused PCF registration has no effect.
 - The PCF guide explains why calls after an early-return guard or in an `else` branch are reported, and shows the positive guard block to use instead.
 - An optional call with type arguments that is handed a context member, such as `factory?.<T>(context.device).captureImage()`, is now reported as a Pages call even when the factory returns its own object; call it without `?.` or keep the result in a local first.
+- `inventory`, `upgrade` and `ci-build` share one boolean-flag check; what each one refuses is unchanged.
+- The virtual templates' samples use Fluent v9 `Input` and `Button`.
 
 ### Fixed
 
+- When `pac pcf push` loses its publish to a SQL deadlock (1205), the publish is sent again, each re-send exactly once, and the result reports how many sends were made.
+- grid-customizer renders Choice cells with their formatted label.
 - `check-auth.js` no longer reports success for an identity that cannot read customizations (no security role in the environment); it fails with `no_customization_role` and names a role to ask for.
 - The push receipt (`pcf-receipt.json`) no longer carries an access token that a refused confirmation read quoted, and every file the SDK writes into a push's workspace goes through the same output guard as model-apps' scripts.
 - A large result is no longer cut short on Linux and macOS: `emitResult`, the printer of an uncaught error, `check-auth.js`, the result printers of `pcf-inventory.js`, `verify-pcf.js` and `lint-pcf.js`, every script's usage error and the write-safety hook's message make their writes blocking before the process exits. What is printed and every exit status are unchanged; Windows was never affected.
@@ -29,3 +33,5 @@ First preview release: ships the `/pcf:pcf` skill, matrix-pinned templates and r
 - A `.ts` file with hundreds of `<Type>value` casts is now analyzed instead of being treated as unparseable, which had reported every Pages call in it as unguarded.
 - A local object literal named like the context, such as `const ctx = { device: { captureImage() { return 1; } } }`, is no longer mistaken for the PCF context when only its own simple functions are called.
 - The pcf evals report a case with nothing graded as unscored, not passed; exit status unchanged.
+- New projects' dependency lock moves minimatch from 9.0.9 to 11.0.8 (GHSA-g3hv-75wg-m249).
+- Generated projects find their Jest tests when the project path contains a dot-folder, and run only the tests in the project's `__tests__` folder (#849).
