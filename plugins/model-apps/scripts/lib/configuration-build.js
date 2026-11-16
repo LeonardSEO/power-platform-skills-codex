@@ -57,19 +57,34 @@ function namedByPages(pages) {
 // Every stop before the build's first write: the same plan stops again, so it is RETRY.NEVER.
 const preflightHalt = (preflightCode, message) => new BuildHalt(message, { phase: 'preflight', code: preflightCode, recoverable: false, retry: RETRY.NEVER });
 
+// Why the sweep let an undeclared attempt go (pendingSweep `retired[].how`), as the build's notice says it.
+const RETIRED_WHY = {
+  unsent: 'it was never sent',
+  'not-started': 'the service refused it and nothing was created',
+  approved: 'as approved; rows it may have created stay in the environment, unmanaged',
+};
+
 /**
  * The binding store's own configuration debt (lib/configuration-protected.js pendingSweep, answered by the build's hookup
  * `opts.protectedConfiguration.sweep`), read before the build's first service change: an attempt an earlier build left
  * unfinished for an item this App Spec no longer declares stops the build here, with nothing sent. It runs whatever the
  * App Spec declares — sdk-build.js calls it directly for an App Spec that uses no configuration kind, and the runtime's
- * preflight calls it first otherwise — so omitting a declaration never bypasses its debt. No hookup, nothing to read.
+ * preflight calls it first otherwise — so omitting a declaration never bypasses its debt. An attempt the store let go there
+ * (proved never sent, or under the maker's `retire:` approval) does not stop the build; `opts.warn` names it. No hookup,
+ * nothing to read.
  */
 function sweepPendingConfiguration(spec, opts = {}) {
   const sweep = opts.protectedConfiguration && opts.protectedConfiguration.sweep;
   if (typeof sweep !== 'function') return { halts: [] };
-  const { halts } = sweep({ spec });
+  const { halts, retired = [] } = sweep({ spec });
+  // An undeclared attempt the store let go (proved never sent, or under the maker's retire approval) is named once, so a
+  // maker sees what the store stopped tracking.
+  if (typeof opts.warn === 'function') {
+    for (const r of retired) opts.warn(`configuration: the binding store no longer tracks the unfinished attempt for ${r.kind} ${r.key}, which this App Spec no longer declares (${RETIRED_WHY[r.how] || r.how})`);
+  }
   if (!halts.length) return { halts };
-  const others = halts.slice(1).map((h) => `${h.kind} ${h.key}`);
+  // Each further possibly-sent attempt keeps its own exact approval in the one stop, so one run can settle them all.
+  const others = halts.slice(1).map((h) => `${h.kind} ${h.key}${Array.isArray(h.authorize) && h.authorize.length ? ` (or stop tracking it with ${C.authorizeFlags(h.authorize)})` : ''}`);
   throw preflightHalt(halts[0].code, `${halts[0].kind} ${halts[0].key}: ${halts[0].message}${others.length ? ` Also held: ${others.join(', ')}.` : ''}`);
 }
 
@@ -181,9 +196,14 @@ function createConfigurationRuntime({ spec, sdk, provision, opts = {}, appUnique
       const others = halts.filter((h) => h !== first).map((h) => `${h.kind} ${h.key} (${h.code})`);
       // A row of an earlier, unfinished create that no answer proved this build's own is adopted only under the maker's
       // exact approval token, one per row (managed-create-context.js judgeRows), never wholesale.
-      const approvals = [...new Set(halts.flatMap((h) => h.approvals || []))];
+      const approvals = [...new Set(halts.filter((h) => !h.adoption).flatMap((h) => h.approvals || []))];
       const approve = approvals.length ? ` Its rows are bound only under these exact approvals, given after checking those rows are yours: ${approvals.map((t) => JSON.stringify(t)).join(', ')}.` : '';
-      throw fail(first.code, `${first.kind} ${first.key}: ${first.message}${others.length ? ` Also stopped: ${others.join(', ')}.` : ''}${approve}`);
+      // A namesake made before the opt-in (configuration-protected.js adoptionHalt) is adopted only under its own exact
+      // approvals, and they are printed for EVERY such item of the stop with what they approve — its kind, key and id,
+      // the id of each row (in the approvals themselves) and every field the build would then change — never a bare
+      // token for an item whose own sentence is not the one shown.
+      const adoptions = halts.filter((h) => h.adoption).map((h) => ` Adopt ${h.kind} ${h.key} at its id ${h.adoption.id} (the build would then change ${h.adoption.change}) only under these exact approvals, given after checking those rows are yours: ${h.adoption.approvals.map((t) => JSON.stringify(t)).join(', ')}.`).join('');
+      throw fail(first.code, `${first.kind} ${first.key}: ${first.message}${others.length ? ` Also stopped: ${others.join(', ')}.` : ''}${approve}${adoptions}`);
     },
     // Plan, apply and observe ONE phase's items. Returns {outcome, blocking, halt, plan}.
     async apply(phase) {
@@ -238,4 +258,4 @@ function createConfigurationRuntime({ spec, sdk, provision, opts = {}, appUnique
   };
 }
 
-module.exports = { createConfigurationRuntime, sweepPendingConfiguration };
+module.exports = { createConfigurationRuntime, sweepPendingConfiguration, namedByPages };

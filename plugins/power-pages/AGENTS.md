@@ -9,6 +9,22 @@ native metadata, Liquid, Bootstrap, and Design Studio-compatible content.
 
 Read `PLUGIN_DEVELOPMENT_GUIDE.md` for UX and reliability standards when creating new skills and agents.
 
+For skill-quality cases, document/ER graders, or evaluation results, read [`../../evals/README.md`](../../evals/README.md) in the repository checkout.
+Add offline Vally suites under `evals/power-pages/<skill>/` as individual skills are improved; coverage is incremental.
+Use synthetic fixtures and contained local artifacts; live environment access is outside these evaluations.
+Production plugin installs do not include the repository's evaluation runtime.
+
+## Template catalog previews
+
+SPA and non-SPA catalog entries use `responsivePreviews`: page records with `id`, `displayName`, `desktop`, and `mobile`.
+Preserve page identity and device pairs through artifact caching, the template browser, and creation-status rendering.
+For older SPA manifests, use `previewImages` only when `responsivePreviews` is absent; an explicit empty array stays empty.
+A SPA variant's own preview definition overrides its family's, including a legacy variant list.
+Inherit family previews only when the variant defines neither field.
+Keep this precedence in `scripts/lib/template-catalog.js`; create-site caches the effective variant previews before rendering and reuses them on the status page.
+The read-only browser shows each framework's effective previews in a labeled group within the family tab.
+The non-SPA experience-preview disclosure in `references/non-spa-preview.md` is separate and unchanged.
+
 ## Non-SPA creation and shared design quality
 
 `scripts/telemetry-config.js` delegates preference changes to the bundled shared CLI and adds the non-SPA creation disclosure.
@@ -336,6 +352,12 @@ Auto-triggered by the main conversation when relevant:
 
 User-invocable via `/power-pages:<skill-name>`:
 
+- `compare-site-configurations`: Read-only comparison of the Power Pages configuration in two sites, downloaded from explicit environments or supplied locally.
+  `SKILL.md` holds the steps; remote-site verification and download live in `references/remote-sites.md`, and explanation rules in `references/explain-differences.md`.
+  Keep the comparison logic, HTML renderer and VS Code JSON export in `skills/compare-site-configurations/scripts/compare-site-configurations.js`, with tests in its sibling `tests/` folder.
+  Preserve the upstream Local/Remote status direction, HTML renderer and export format (the extension's `IMetadataDiffExport` 1.0, so **Import Comparison** opens it).
+  Compare only PAC component folders and root-level `.yml` files; report other differences as `skipped`.
+  Reports and snapshots remain outside both sites; this skill does not update their usage settings.
 - `create-site`: Routes between two eight-phase workflows. The existing SPA path retains requirements
   discovery, early React/Vue/Angular/Astro scaffolding, component and design planning, implementation
   with live Playwright preview, experience brief, narrative blueprints, batched visual critique,

@@ -631,6 +631,79 @@ test('protected configuration through the build command: a create whose answer w
   assert.deepEqual(org.unexpected, []);
 });
 
+// #847: a create the service refused before carrying it out (a 400 with a Dataverse code) leaves nothing behind, so the
+// build releases its attempt: the item can be corrected and built again, or dropped, with no approval and no dead end.
+test('protected configuration through the build command: a Custom API create the service refused holds nothing, and the rebuild creates it once', async () => {
+  let refuse = true;
+  let sends = 0;
+  const org = commandOrg({ intercept: (req) => {
+    if (req.method !== 'POST' || req.path.split('?')[0] !== '/customapis') return undefined;
+    sends += 1;
+    return refuse ? { statusCode: 400, body: { error: { code: '0x80040265', message: 'refused' } } } : undefined;
+  } });
+  const first = await runCommand(protectedSpec(), { org });
+  assert.match(String(first.thrown && first.thrown.message), /customApi contoso_Calc \(create-refused\) \(the service refused it \(0x80040265\): nothing was created or changed and nothing is left pending/);
+  assert.equal(sends, 1);
+  assert.equal(org.rows('customapis').length, 0);
+  const store = () => openManagedBindings({ workspaceDir: path.join(first.appDir, '.maker-workspace'), environment: org.origin, appUniqueName: 'contoso_configprobe', solutionUniqueName: 'ContosoSol' });
+  assert.equal(store().readGroup('customApi', 'contoso_calc').pending, null);
+
+  const dropped = await runAgain(protectedSpec({ customApis: [] }), first);
+  assert.equal(dropped.thrown && dropped.thrown.message, undefined, 'dropping it is not held');
+  assert.equal(dropped.exitCode, 0, dropped.stderr.slice(-600));
+
+  refuse = false;
+  const done = await runAgain(protectedSpec(), first);
+  assert.equal(done.thrown && done.thrown.message, undefined);
+  assert.equal(done.exitCode, 0, done.stderr.slice(-600));
+  assert.equal(sends, 2, 'sent once more, by the build that declares it again');
+  assert.equal(org.rows('customapis').length, 1);
+  assert.ok(store().readGroup('customApi', 'contoso_calc').committed);
+  assert.deepEqual(org.unexpected, []);
+});
+
+test('protected configuration through the build command: a dropped item whose create answer was lost is let go only under its printed retire approval, and nothing is deleted', async () => {
+  let org = null;
+  let sends = 0;
+  let replaying = false;
+  org = commandOrg({ intercept: async (req) => {
+    if (replaying || req.method !== 'POST' || req.path.split('?')[0] !== '/customapis') return undefined;
+    sends += 1;
+    replaying = true;
+    try {
+      await org.request({ url: `${org.origin}/api/data/v9.0${req.path}`, method: 'POST', headers: req.headers, body: JSON.stringify(req.body) });
+    } finally {
+      replaying = false;
+    }
+    return { statusCode: 503, body: { error: { code: '0x80040216', message: 'the answer was lost' } } };
+  } });
+  const first = await runCommand(protectedSpec(), { org });
+  assert.match(String(first.thrown && first.thrown.message), /customApi contoso_Calc \(create-outcome-unknown\)/);
+  let mark = org.requests.length;
+  const held = await runAgain(protectedSpec({ customApis: [] }), first);
+  assert.equal(held.thrown && held.thrown.code, 'managed-settlement-pending', held.thrown && held.thrown.message);
+  assert.deepEqual(org.writes(mark), []);
+  const flag = /--authorize '(retire:[^']+)'/.exec(held.thrown.message);
+  assert.ok(flag, held.thrown.message);
+  // While the App Spec still declares the item, its build settles it: the approval is refused before anything is read.
+  mark = org.requests.length;
+  const declared = await runAgain(protectedSpec(), first, [...DATA, ...authorize([flag[1]])]);
+  assert.equal(declared.exitCode, 1, declared.stderr.slice(-600));
+  assert.match(`${declared.stderr} ${JSON.stringify(declared.payload)}`, /stops tracking a configuration item the spec still declares/);
+  assert.deepEqual(org.writes(mark), []);
+
+  mark = org.requests.length;
+  const done = await runAgain(protectedSpec({ customApis: [] }), first, [...DATA, ...authorize([flag[1]])]);
+  assert.equal(done.thrown && done.thrown.message, undefined, 'the approved run did not halt');
+  assert.equal(done.exitCode, 0, done.stderr.slice(-600));
+  assert.ok(!org.writes(mark).some((w) => /customapi/i.test(w)), 'nothing of the Custom API is sent or deleted');
+  assert.equal(org.rows('customapis').length, 1, 'the row it may have created stays');
+  assert.match(`${done.stderr} ${JSON.stringify(done.payload)}`, /no longer tracks the unfinished attempt for customApi contoso_calc, which this App Spec no longer declares \(as approved/);
+  assert.equal(sends, 1);
+  const store = openManagedBindings({ workspaceDir: path.join(first.appDir, '.maker-workspace'), environment: org.origin, appUniqueName: 'contoso_configprobe', solutionUniqueName: 'ContosoSol' });
+  assert.equal(store.readGroup('customApi', 'contoso_calc').pending, null);
+  assert.deepEqual(org.unexpected, []);
+});
 test('protected configuration through the build command: a later phase\u2019s transient failure runs the whole build again and the configuration rows stay where they are', async () => {
   let refused = 0;
   // The sample data's first create meets a customization lock, which the build retries whole; the second succeeds.
@@ -1189,6 +1262,40 @@ test('protected configuration through the build command: a first create whose na
   assert.deepEqual(first.org.unexpected, []);
 });
 
+// Opting in over two APIs made without it: one stop names both namesakes, each with its own id, the fields the build would then
+// change and its exact approvals, and those approvals given back on the command line adopt both and send only the printed edit.
+test('protected configuration through the build command: a stop over several namesakes shows each one\u2019s id and fields beside its approvals, and those approvals adopt them', async () => {
+  const twoApis = (description) => {
+    const spec = apiSpec();
+    spec.customApis.push({ ...structuredClone(spec.customApis[0]), uniqueName: 'contoso_Other', displayName: 'Other', description, isFunction: false, requestParameters: [], responseProperties: [] });
+    return spec;
+  };
+  const plain = twoApis('Maker text');
+  delete plain.configurationIdentity;
+  const made = await runCommand(plain);
+  succeeded(made, 'the ordinary create');
+  const idOf = (name) => made.org.rows('customapis').find((r) => r.uniquename === name).customapiid;
+  const mark = made.org.requests.length;
+  const stopped = await runCommand(twoApis('Replacement'), { org: made.org, appDir: made.appDir, argv: DATA });
+  assert.equal(stopped.thrown && stopped.thrown.code, 'create-identity-conflict', stopped.thrown && stopped.thrown.message);
+  assert.notEqual(stopped.exitCode, 0);
+  assert.deepEqual(made.org.writes(mark), [], 'nothing is written');
+  // The error main() throws is the one the command prints whole (its own top-level catch, emitResult).
+  const shown = stopped.thrown.message;
+  for (const [key, name, change] of [['contoso_calc', 'contoso_Calc', 'nothing in it'], ['contoso_other', 'contoso_Other', 'only these fields, /description']]) {
+    const sentence = `Adopt customApi ${key} at its id ${idOf(name)} (the build would then change ${change}) only under these exact approvals, given after checking those rows are yours: "adopt:customApi:${key}@${idOf(name)}`;
+    assert.ok(shown.includes(sentence), `${key}: ${shown.slice(-1500)}`);
+  }
+  const tokens = [...stopped.thrown.message.matchAll(/given after checking those rows are yours: ((?:"(?:[^"\\]|\\.)*"(?:, )?)+)\./g)].flatMap((m) => JSON.parse(`[${m[1]}]`));
+  assert.equal(tokens.length, 4, tokens.join(' '));
+  const before = made.org.requests.length;
+  const done = await runCommand(twoApis('Replacement'), { org: made.org, appDir: made.appDir, argv: [...DATA, ...authorize(tokens)] });
+  succeeded(done, 'the adoption');
+  assert.deepEqual(made.org.writes(before).filter((w) => /customapi/i.test(w)), [`PATCH /customapis(${idOf('contoso_Other')})`]);
+  assert.equal(made.org.rows('customapis').length, 2);
+  assert.equal(made.org.rows('customapis').find((r) => r.uniquename === 'contoso_Other').description, 'Replacement');
+  assert.deepEqual(made.org.unexpected, []);
+});
 test('protected configuration through the build command: a first create whose namesake query cannot be completed stops before the first write', async () => {
   let failing = false;
   const org = commandOrg({ intercept: (req) => (failing && req.method === 'GET' && /^\/customapis\?/.test(req.path) && /\$filter=uniquename/.test(decodeURIComponent(req.path))
